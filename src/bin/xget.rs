@@ -55,6 +55,9 @@ struct Cli {
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
+    /// A mirror URL for the same resource, tried when the primary fails a chunk (repeatable).
+    #[arg(long = "mirror", value_name = "URL")]
+    mirrors: Vec<String>,
     /// Checksum to verify the download with: none, md5, sha1, sha256, sha512, or blake3.
     #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
     checksum: Checksum,
@@ -97,7 +100,16 @@ enum ProgressMode {
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
-    let source = HttpSource::new(&cli.url, parse_headers(&cli.headers)?)?;
+    let headers = parse_headers(&cli.headers)?;
+    // The primary plus any --mirror URLs, tried in order on failure. With no mirrors this is just the
+    // primary, so there is one download path.
+    let primary = HttpSource::new(&cli.url, headers.clone())?;
+    let mirrors = cli
+        .mirrors
+        .iter()
+        .map(|url| HttpSource::new(url, headers.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let source = libxget::Mirrors::new(primary, mirrors);
     let mode = resolve_mode(&cli);
 
     // Probe once up front for the preamble and the output name; the download re-probes authoritatively.

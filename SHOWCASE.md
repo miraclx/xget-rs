@@ -26,7 +26,7 @@ list current as features land; fold the ✅ ones into the README before release.
 - Inactivity `--timeout`; a stalled chunk's retry resumes it. demo: ⬜ · readme: ⬜
 - Bounded memory; `--cache-size` is the read-ahead knob. demo: ⬜ · readme: ⬜
 - Pluggable `Source` (HTTP today; S3 and a bifrost peer planned). demo: ⬜ · readme: partial
-- Mirror / failover across sources (planned). demo: ⬜ · readme: ⬜
+- Mirror / failover across sources (`--mirror`), via a `Mirrors` Source. demo: ⬜ · readme: ⬜
 
 ## Presentation
 

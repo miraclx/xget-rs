@@ -17,16 +17,20 @@ use futures::stream::BoxStream;
 mod checksum;
 mod engine;
 mod http;
+mod mirror;
 mod plan;
 
 #[cfg(test)]
 mod http_tests;
+#[cfg(test)]
+mod mirror_tests;
 #[cfg(test)]
 mod plan_tests;
 
 pub use crate::checksum::{Checksum, UnknownChecksum};
 pub use crate::engine::{Report, download};
 pub use crate::http::HttpSource;
+pub use crate::mirror::Mirrors;
 pub use crate::plan::plan;
 
 /// How a [`download`] is tuned: parallelism, retries, which checksum to verify with, and an optional

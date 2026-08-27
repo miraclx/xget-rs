@@ -75,11 +75,6 @@ struct Cli {
     /// Fail a chunk if no data arrives for this many seconds, so its retry can resume it.
     #[arg(long, value_name = "SECS", value_parser = parse_timeout)]
     timeout: Option<Duration>,
-    /// Memory budget for bytes buffered ahead of writing, e.g. `32MiB`, `1GiB`, or a bare byte count.
-    /// Split across the chunks; larger lets them race further ahead of the hash. Trades memory for
-    /// smoother throughput.
-    #[arg(long, value_name = "SIZE", default_value = "32MiB", value_parser = parse_cache)]
-    cache_size: u64,
     /// Progress output: auto (a bar on a terminal, else plain lines), bar, plain, json, or none.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -165,7 +160,6 @@ async fn run() -> eyre::Result<()> {
         checksum,
         timeout: cli.timeout,
         resume: cli.resume,
-        cache: cli.cache_size,
     };
     let started = Instant::now();
     let report = libxget::download(&source, &output, options, &reporter).await?;
@@ -519,15 +513,6 @@ fn url_basename(url: &str) -> eyre::Result<String> {
         Some(name) => Ok(name.to_owned()),
         None => eyre::bail!("cannot infer a filename from {url}; give an output path"),
     }
-}
-
-/// Parse a byte size with xbytes, e.g. `32MiB`, `1GiB`, or `512KB`. A unit is required (xbytes rejects
-/// a bare number), which keeps the meaning unambiguous.
-fn parse_cache(value: &str) -> Result<u64, String> {
-    value
-        .parse::<ByteSize>()
-        .map(|size| size.byte_count() as u64)
-        .map_err(|error| error.to_string())
 }
 
 /// Parse an inactivity timeout given in seconds into a [`Duration`].

@@ -13,8 +13,6 @@ use core::time::Duration;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use xbytes::ByteSize;
-use xbytes::sizes::MEBI_BYTE;
 
 mod checksum;
 mod engine;
@@ -53,13 +51,9 @@ pub struct Options {
     /// Fail a read that stalls for this long, so a retry can resume the chunk; `None` waits forever.
     pub timeout: Option<Duration>,
     /// Resume an interrupted download: keep the bytes already in `output`, fetch only what remains, and
-    /// fold the existing prefix into the checksum by reading it back once (concurrently with the live
-    /// fetch, so it never stalls the download). Requires a range-capable source.
+    /// fold the existing prefix into the checksum during the in-order verify pass. Requires a
+    /// range-capable source.
     pub resume: bool,
-    /// The total bytes that may be buffered in memory across all chunks: bytes received but not yet
-    /// written. It is split evenly into a per-chunk budget, and a chunk that fills its share blocks
-    /// until the in-order reassembler catches up, so this is the memory ceiling of the transfer.
-    pub cache: u64,
 }
 
 impl Default for Options {
@@ -70,7 +64,6 @@ impl Default for Options {
             checksum: Checksum::Sha256,
             timeout: None,
             resume: false,
-            cache: ByteSize::of(32u64, MEBI_BYTE).byte_count() as u64,
         }
     }
 }

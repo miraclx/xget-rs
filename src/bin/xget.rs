@@ -17,14 +17,23 @@ use xprogress::{Bar, Color, DrawTarget, Style, Width};
 struct Cli {
     /// The URL to download.
     url: String,
-    /// Where to write the downloaded file.
-    output: PathBuf,
+    /// Where to write the file. If omitted or a directory, the name is taken from the URL.
+    output: Option<PathBuf>,
     /// Maximum number of concurrent chunk connections.
     #[arg(short = 'n', long, default_value_t = 5)]
     chunks: u32,
-    /// Number of retries for each chunk, resuming from its offset.
-    #[arg(short = 't', long, default_value_t = 10)]
+    /// Retries for each chunk, resuming from its offset. `inf` for unlimited.
+    #[arg(short = 't', long, default_value = "10", value_parser = parse_tries)]
     tries: u32,
+    /// Save the file under this directory prefix.
+    #[arg(short = 'D', long)]
+    directory_prefix: Option<PathBuf>,
+    /// Do not create missing directories.
+    #[arg(long)]
+    no_directories: bool,
+    /// Overwrite an existing output file.
+    #[arg(short = 'f', long)]
+    overwrite: bool,
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
@@ -36,11 +45,12 @@ struct Cli {
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
+    let output = resolve_output(&cli)?;
     let source = HttpSource::new(&cli.url, parse_headers(&cli.headers)?)?;
     let progress = BarProgress::new();
     let report = libxget::download(
         &source,
-        &cli.output,
+        &output,
         cli.chunks,
         cli.tries,
         cli.checksum,
@@ -68,6 +78,57 @@ fn parse_headers(raw: &[String]) -> eyre::Result<HeaderMap> {
         );
     }
     Ok(headers)
+}
+
+/// Resolve where to write: an explicit file, a name inside an explicit directory, or a name inferred
+/// from the URL (under `--directory-prefix`). Refuses to clobber an existing file without `-f`, and
+/// creates missing parents unless `--no-directories`.
+fn resolve_output(cli: &Cli) -> eyre::Result<PathBuf> {
+    let path = match &cli.output {
+        Some(dir) if dir.is_dir() => dir.join(url_basename(&cli.url)?),
+        Some(file) => file.to_path_buf(),
+        None => {
+            let name = url_basename(&cli.url)?;
+            match &cli.directory_prefix {
+                Some(prefix) => prefix.join(name),
+                None => PathBuf::from(name),
+            }
+        }
+    };
+    if path.exists() && !cli.overwrite {
+        eyre::bail!("{} already exists (use -f to overwrite)", path.display());
+    }
+    if !cli.no_directories {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+    }
+    Ok(path)
+}
+
+/// The last path segment of the URL, for naming a downloaded file.
+fn url_basename(url: &str) -> eyre::Result<String> {
+    let parsed = reqwest::Url::parse(url)?;
+    let name = parsed
+        .path_segments()
+        .and_then(Iterator::last)
+        .filter(|segment| !segment.is_empty());
+    match name {
+        Some(name) => Ok(name.to_owned()),
+        None => eyre::bail!("cannot infer a filename from {url}; give an output path"),
+    }
+}
+
+/// Parse a retry count, accepting `inf`/`infinite` as unlimited.
+fn parse_tries(value: &str) -> Result<u32, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "inf" | "infinite" => Ok(u32::MAX),
+        _ => value
+            .parse()
+            .map_err(|_| format!("expected a number or `inf`, got `{value}`")),
+    }
 }
 
 /// A live segmented progress bar: one xprogress segment per chunk, with an xbytes size, speed, and ETA

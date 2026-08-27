@@ -1,0 +1,36 @@
+# A local test rig for xget: an HTTP body server, an S3-compatible store, and a fault-injecting proxy
+# in front of both. Bring it up with ./up.sh and exercise it with ./scenarios.sh.
+name: xget-harness
+
+services:
+  # Arbitrary-size bodies with range support (/range/N), throttled trickle (/drip), and delays
+  # (/delay/N) for timeout tests.
+  httpbin:
+    image: mccutchen/go-httpbin:latest
+    # Lift the 1 MB default body cap and the 10s duration cap so /range can serve large, slow bodies.
+    environment:
+      MAX_BODY_SIZE: "2147483648"
+      MAX_DURATION: "300s"
+    ports: ["8080:8080"]
+
+  # An S3-compatible store for the s3:// source.
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000"]
+
+  # A fault-injecting TCP proxy. 8666 -> httpbin, 8667 -> minio. Toxics (bandwidth, latency, resets,
+  # timeouts) are added and removed per scenario over the control API on 8474.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:latest
+    command: ["-host=0.0.0.0", "-config=/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/toxiproxy.json:ro
+    ports:
+      - "8474:8474"
+      - "8666:8666"
+      - "8667:8667"
+    depends_on: [httpbin, minio]

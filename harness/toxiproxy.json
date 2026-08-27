@@ -1,0 +1,4 @@
+[
+  { "name": "httpbin", "listen": "0.0.0.0:8666", "upstream": "httpbin:8080", "enabled": true },
+  { "name": "minio", "listen": "0.0.0.0:8667", "upstream": "minio:9000", "enabled": true }
+]

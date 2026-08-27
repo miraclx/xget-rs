@@ -48,7 +48,11 @@ pub async fn download<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
-    let (file, start, prefix) = open_output(output, &probe, &options).await?;
+    // Write to a sibling `.part` and only rename it into place once the length and hash gates pass, so
+    // an interrupted download never leaves a truncated file masquerading as complete. The `.part` is
+    // also what a `--continue` resume picks up.
+    let part = part_path(output);
+    let (file, start, prefix) = open_output(&part, &probe, &options).await?;
 
     let hash = if start > 0 || probe.supports_ranges {
         // A resume, or a fresh range-capable fetch: plan `[start, total)` into parallel chunks.
@@ -57,11 +61,20 @@ pub async fn download<S: Source, P: Progress>(
         fetch_whole(source, probe.length, options, file, progress).await?
     };
 
+    tokio::fs::rename(&part, output).await.map_err(io)?;
     progress.finish();
     Ok(Report {
         length: probe.length,
         hash,
     })
+}
+
+/// The sibling `.part` path a download writes to before it is renamed into place: the output name with
+/// `.part` appended, so a multi-part extension like `.tar.gz` is preserved.
+fn part_path(output: &Path) -> std::path::PathBuf {
+    let mut name = output.as_os_str().to_owned();
+    name.push(".part");
+    std::path::PathBuf::from(name)
 }
 
 /// Open the output for writing and work out where the download should start. A fresh download truncates

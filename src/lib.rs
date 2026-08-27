@@ -54,10 +54,10 @@ pub struct Options {
     /// fold the existing prefix into the checksum by reading it back once (concurrently with the live
     /// fetch, so it never stalls the download). Requires a range-capable source.
     pub resume: bool,
-    /// How many chunks each parallel fetch may read ahead before it blocks on the in-order reassembler.
-    /// Larger lets a fast chunk race ahead of a slow early one at the cost of `parts * cache` buffered
-    /// chunks of memory. Clamped to at least one.
-    pub cache: usize,
+    /// The total bytes that may be buffered in memory across all chunks: bytes received but not yet
+    /// written. It is split evenly into a per-chunk budget, and a chunk that fills its share blocks
+    /// until the in-order reassembler catches up, so this is the memory ceiling of the transfer.
+    pub cache: u64,
 }
 
 impl Default for Options {
@@ -68,7 +68,7 @@ impl Default for Options {
             checksum: Checksum::Sha256,
             timeout: None,
             resume: false,
-            cache: 64,
+            cache: 32 * 1024 * 1024,
         }
     }
 }

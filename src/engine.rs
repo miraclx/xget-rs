@@ -1,7 +1,8 @@
 //! The download engine: probe, plan, fetch chunks in parallel, reassemble in order, hash while writing.
 //!
-//! The pipeline is one-shot. Parallel chunks stream into bounded per-chunk channels; a single
-//! reassembler drains them in order and both hashes and writes each byte in the same pass. The live
+//! The pipeline is one-shot. Parallel chunks stream into per-chunk channels, each with its own byte
+//! budget that bounds how far ahead it may buffer; a single reassembler drains them in order and both
+//! hashes and writes each byte in the same pass, releasing budget as it goes. The live
 //! download is never read back: the digest is computed as the resource is written, not over the
 //! finished file. A source that cannot serve ranges is fetched as one stream instead of parallel
 //! chunks. The one exception is resuming: the bytes already on disk are read once to seed the hasher,
@@ -9,15 +10,47 @@
 
 use core::time::Duration;
 use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::plan::plan_range;
 use crate::{ByteRange, Checksum, Error, Options, Progress, Source};
+
+/// A buffered chunk in transit, carrying the memory permit for its bytes; dropping the permit after the
+/// bytes are written returns that much room to the chunk's budget, which is what applies backpressure.
+type Buffered = (Bytes, OwnedSemaphorePermit);
+
+/// Where a chunk's fetch sends its buffers: the channel to the reassembler and the byte budget that
+/// bounds how far it may run ahead. The two always travel together.
+struct Sink {
+    tx: mpsc::UnboundedSender<Buffered>,
+    budget: Arc<Semaphore>,
+}
+
+impl Sink {
+    /// Reserve room for `len` bytes then hand them to the reassembler, keeping the permit alive with the
+    /// bytes so the room is only freed once they are written.
+    async fn send(&self, chunk: Bytes) -> Result<(), Error> {
+        let len = chunk.len() as u64;
+        let want = len.clamp(1, u64::from(u32::MAX)) as u32;
+        let permit = Arc::clone(&self.budget)
+            .acquire_many_owned(want)
+            .await
+            .map_err(|_| detail("memory budget closed"))?;
+        self.tx
+            .send((chunk, permit))
+            .map_err(|_| detail("reassembler stopped receiving"))
+    }
+}
+
+/// The smallest per-chunk memory budget, and so the largest single buffer that can ever be admitted.
+/// Network reads are far smaller, so a buffer always fits and a chunk can never deadlock on its budget.
+const MIN_CHUNK_BUDGET: u64 = 4 * 1024 * 1024;
 
 /// The bytes already present in the output when resuming: a read handle positioned at the start and the
 /// number of bytes to fold into the checksum before hashing anything new.
@@ -139,24 +172,29 @@ async fn fetch_ranged<S: Source, P: Progress>(
     let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
     progress.start(&sizes);
 
-    // One bounded channel per chunk. The chunk fetches fill them in parallel; the reassembler drains
-    // them in order, so the bytes leave this stage in resource order.
-    let cache = options.cache.max(1);
-    let mut senders = Vec::with_capacity(ranges.len());
+    // One channel per chunk with its own byte budget. The chunk fetches fill them in parallel; the
+    // reassembler drains them in order, so the bytes leave this stage in resource order. The budget is
+    // per chunk, not shared, so a late chunk buffering ahead can never starve the frontier chunk the
+    // reassembler is waiting on. The total memory ceiling is `parts * per_chunk`, about `cache`.
+    let per_chunk = (options.cache / ranges.len().max(1) as u64).max(MIN_CHUNK_BUDGET);
+    let mut sinks = Vec::with_capacity(ranges.len());
     let mut receivers = Vec::with_capacity(ranges.len());
     for _ in &ranges {
-        let (tx, rx) = mpsc::channel::<Bytes>(cache);
-        senders.push(tx);
+        let (tx, rx) = mpsc::unbounded_channel::<Buffered>();
         receivers.push(rx);
+        sinks.push(Sink {
+            tx,
+            budget: Arc::new(Semaphore::new(per_chunk as usize)),
+        });
     }
 
     // Structured concurrency on one task: the source's futures are not `Send`. The fetchers feed the
     // channels while the reassembler drains them, hashing and writing in a single pass.
     let mut fetchers: FuturesUnordered<_> = ranges
         .into_iter()
-        .zip(senders)
+        .zip(sinks)
         .enumerate()
-        .map(|(index, (range, tx))| fetch_into(source, index, range, tx, options, progress))
+        .map(|(index, (range, sink))| fetch_into(source, index, range, sink, options, progress))
         .collect();
     let drive = async {
         while let Some(result) = fetchers.next().await {
@@ -182,8 +220,12 @@ async fn fetch_whole<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<Option<String>, Error> {
     progress.start(&[total]);
-    let (tx, rx) = mpsc::channel::<Bytes>(options.cache.max(1));
-    let fetch = fetch_all_into(source, tx, options.timeout, progress);
+    let (tx, rx) = mpsc::unbounded_channel::<Buffered>();
+    let sink = Sink {
+        tx,
+        budget: Arc::new(Semaphore::new(options.cache.max(MIN_CHUNK_BUDGET) as usize)),
+    };
+    let fetch = fetch_all_into(source, sink, options.timeout, progress);
     let (fetched, hashed) = tokio::join!(
         fetch,
         reassemble(vec![rx], file, total, options.checksum, None, progress)
@@ -196,16 +238,14 @@ async fn fetch_whole<S: Source, P: Progress>(
 /// without ranges cannot be resumed, so an error mid-stream fails the download.
 async fn fetch_all_into<S: Source, P: Progress>(
     source: &S,
-    tx: mpsc::Sender<Bytes>,
+    sink: Sink,
     timeout: Option<Duration>,
     progress: &P,
 ) -> Result<(), Error> {
     let mut stream = source.fetch(None).await?;
     while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
         let len = chunk.len() as u64;
-        tx.send(chunk)
-            .await
-            .map_err(|_| detail("reassembler stopped receiving"))?;
+        sink.send(chunk).await?;
         progress.received(0, len);
     }
     Ok(())
@@ -233,7 +273,7 @@ async fn fetch_into<S: Source, P: Progress>(
     source: &S,
     index: usize,
     range: ByteRange,
-    tx: mpsc::Sender<Bytes>,
+    sink: Sink,
     options: Options,
     progress: &P,
 ) -> Result<(), Error> {
@@ -252,7 +292,7 @@ async fn fetch_into<S: Source, P: Progress>(
             source,
             index,
             range.end,
-            &tx,
+            &sink,
             &mut offset,
             options.timeout,
             progress,
@@ -281,12 +321,13 @@ async fn fetch_into<S: Source, P: Progress>(
 
 /// Stream the range `[*offset, end)` into the channel, advancing `offset` and reporting `progress` as
 /// bytes are sent. On a mid-stream error `offset` reflects how far it got, so the caller can resume.
-/// The bounded channel applies backpressure, so a fast chunk cannot outrun the reassembler.
+/// Each buffer reserves room from the chunk's `budget` first, so a fast chunk cannot outrun the
+/// reassembler by more than its budget.
 async fn stream_into<S: Source, P: Progress>(
     source: &S,
     index: usize,
     end: u64,
-    tx: &mpsc::Sender<Bytes>,
+    sink: &Sink,
     offset: &mut u64,
     timeout: Option<Duration>,
     progress: &P,
@@ -302,9 +343,7 @@ async fn stream_into<S: Source, P: Progress>(
         if *offset + len > end {
             return Err(detail("source sent more bytes than the requested range"));
         }
-        tx.send(chunk)
-            .await
-            .map_err(|_| detail("reassembler stopped receiving"))?;
+        sink.send(chunk).await?;
         *offset += len;
         progress.received(index, len);
     }
@@ -319,7 +358,7 @@ async fn stream_into<S: Source, P: Progress>(
 /// into the bounded channels, so the disk read overlaps the live download rather than blocking it. The
 /// hasher still consumes prefix-then-new in order, which a single digest requires.
 async fn reassemble<P: Progress>(
-    receivers: Vec<mpsc::Receiver<Bytes>>,
+    receivers: Vec<mpsc::UnboundedReceiver<Buffered>>,
     mut file: tokio::fs::File,
     total: u64,
     checksum: Checksum,
@@ -353,7 +392,7 @@ async fn reassemble<P: Progress>(
     }
 
     for (index, mut receiver) in receivers.into_iter().enumerate() {
-        while let Some(bytes) = receiver.recv().await {
+        while let Some((bytes, permit)) = receiver.recv().await {
             let len = bytes.len() as u64;
             if let Some(hasher) = hasher.as_mut() {
                 hasher.update(&bytes);
@@ -361,6 +400,8 @@ async fn reassemble<P: Progress>(
             file.write_all(&bytes).await.map_err(io)?;
             written += len;
             progress.wrote(index, len);
+            // The bytes are written, so return their room to the chunk's budget for the next buffer.
+            drop(permit);
         }
     }
     file.flush().await.map_err(io)?;

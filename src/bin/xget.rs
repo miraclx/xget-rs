@@ -74,9 +74,11 @@ struct Cli {
     /// Fail a chunk if no data arrives for this many seconds, so its retry can resume it.
     #[arg(long, value_name = "SECS")]
     timeout: Option<f64>,
-    /// Buffers each chunk may read ahead of the reassembler; trades memory for smoother throughput.
-    #[arg(long, value_name = "N", default_value_t = 64)]
-    cache_size: usize,
+    /// Memory budget for bytes buffered ahead of writing, e.g. `32MiB`, `1GiB`, or a bare byte count.
+    /// Split across the chunks; larger lets them race further ahead of the hash. Trades memory for
+    /// smoother throughput.
+    #[arg(long, value_name = "SIZE", default_value = "32MiB", value_parser = parse_size)]
+    cache_size: u64,
     /// Progress output: auto (a bar on a terminal, else plain lines), bar, plain, json, or none.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -103,8 +105,17 @@ enum ProgressMode {
     None,
 }
 
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("xget: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+/// Run the download, returning any error for `main` to print. Kept apart so a failure surfaces as one
+/// concise line rather than the default multi-line debug report with a source location.
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
+async fn run() -> eyre::Result<()> {
     // Load a .env from the working directory if present, so credentials (e.g. for an s3:// URL) can
     // live there instead of being exported by hand. A missing file is not an error.
     let _ = dotenvy::dotenv();
@@ -507,6 +518,37 @@ fn url_basename(url: &str) -> eyre::Result<String> {
         Some(name) => Ok(name.to_owned()),
         None => eyre::bail!("cannot infer a filename from {url}; give an output path"),
     }
+}
+
+/// Parse a byte size like `512MiB`, `1GiB`, `1000000`, or `512K`. IEC suffixes (`KiB`/`MiB`/`GiB`/
+/// `TiB`, and a bare `K`/`M`/`G`/`T`) are powers of 1024; SI suffixes (`KB`/`MB`/`GB`/`TB`) powers of
+/// 1000; no suffix is bytes.
+fn parse_size(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    let split = trimmed
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split);
+    let number: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size: `{value}`"))?;
+    if !number.is_finite() || number < 0.0 {
+        return Err(format!("invalid size: `{value}`"));
+    }
+    let factor = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kib" => 1024.0,
+        "m" | "mib" => 1024.0_f64.powi(2),
+        "g" | "gib" => 1024.0_f64.powi(3),
+        "t" | "tib" => 1024.0_f64.powi(4),
+        "kb" => 1000.0,
+        "mb" => 1000.0_f64.powi(2),
+        "gb" => 1000.0_f64.powi(3),
+        "tb" => 1000.0_f64.powi(4),
+        other => return Err(format!("unknown size unit `{other}` in `{value}`")),
+    };
+    Ok((number * factor) as u64)
 }
 
 /// Parse a retry count, accepting `inf`/`infinite` as unlimited.

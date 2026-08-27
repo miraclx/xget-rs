@@ -25,7 +25,8 @@ list current as features land; fold the ✅ ones into the README before release.
 - Configurable checksum: none / md5 / sha1 / sha256 / sha512 / blake3 (the hash theia/iris speak).
   demo: ⬜ · readme: ⬜
 - Inactivity `--timeout`; a stalled chunk's retry resumes it. demo: ⬜ · readme: ⬜
-- Bounded memory; `--cache-size` is the read-ahead knob. demo: ⬜ · readme: ⬜
+- Bounded memory; `--cache-size` is a byte budget (`32MiB` default, e.g. `512MiB`) split per chunk.
+  demo: ⬜ · readme: ⬜
 - Pluggable `Source` (HTTP, plus S3 behind the `s3` feature; a bifrost peer planned). S3 signs when
   credentials resolve and goes anonymous when they do not (no flag), reads a workdir `.env`, and works
   against any S3-compatible store (R2, MinIO, Backblaze) via `--endpoint-url`. Verified end-to-end

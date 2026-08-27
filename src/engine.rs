@@ -3,21 +3,24 @@
 //! A range-capable resource is planned into contiguous chunks that download in parallel, each written
 //! straight to its own offset in a preallocated sparse file. There is no in-memory reassembly and no
 //! cross-chunk backpressure, so every connection streams continuously. A single verifier then reads the
-//! file back from offset zero, hashing the contiguous, hole-free prefix as each chunk completes: that
-//! prefix is what a returned digest certifies. So `received` marks bytes written anywhere in the file
-//! (how much is downloaded) and `wrote` marks the verified prefix from zero (how much is exact). A
-//! resume re-hashes the bytes already on disk as part of that same in-order pass. A source that cannot
+//! file back from offset zero, hashing the contiguous, hole-free prefix as it grows: it follows the
+//! earliest unfinished chunk, so the verified frontier advances the moment bytes fill in, not in
+//! whole-chunk jumps. That prefix is what a returned digest certifies. So `received` marks bytes written
+//! anywhere in the file (how much is downloaded) and `wrote` marks the verified prefix from zero (how
+//! much is exact). A resume folds the bytes already on disk into that same pass. A source that cannot
 //! serve ranges is fetched as one stream, hashed inline as it is written.
 
+use core::cell::{Cell, RefCell};
 use core::time::Duration;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::sync::oneshot;
+use tokio::sync::Notify;
 
 use crate::checksum::Hasher;
 use crate::plan::plan_range;
@@ -118,9 +121,10 @@ async fn allocate(part: &Path, total: u64, start: u64) -> Result<(), Error> {
     Ok(())
 }
 
-/// Fetch `[start, total)` as parallel chunks scattered into `part`, verified in order. The fetchers
-/// write to their own offsets while a verifier reads the file back from zero, hashing each chunk's
-/// region as it completes.
+/// Fetch `[start, total)` as parallel chunks scattered into `part`, verified continuously. The fetchers
+/// write to their own offsets and report how far each has reached; the verifier reads the file back
+/// from zero and hashes the contiguous, hole-free prefix as it grows, so the verified frontier follows
+/// the earliest unfinished chunk rather than jumping a whole chunk at a time.
 async fn fetch_scatter<S: Source, P: Progress>(
     source: &S,
     part: &Path,
@@ -133,32 +137,32 @@ async fn fetch_scatter<S: Source, P: Progress>(
     let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
     progress.start(&sizes);
 
-    // One completion signal per chunk. A fetcher fires it once its whole region is on disk; the
-    // verifier waits on them in order before reading each region back.
-    let mut senders = Vec::with_capacity(ranges.len());
-    let mut receivers = Vec::with_capacity(ranges.len());
-    for _ in &ranges {
-        let (tx, rx) = oneshot::channel::<()>();
-        senders.push(tx);
-        receivers.push(rx);
-    }
+    let shared = Rc::new(Shared {
+        received: RefCell::new(vec![0u64; ranges.len()]),
+        notify: Notify::new(),
+        failed: Cell::new(false),
+    });
 
     // Structured concurrency on one task: the source's futures are not `Send`. The fetchers scatter
-    // into the file while the verifier reads it back in order and hashes.
+    // into the file and nudge the shared state while the verifier reads the contiguous prefix and hashes.
     let mut fetchers: FuturesUnordered<_> = ranges
         .iter()
         .copied()
-        .zip(senders)
         .enumerate()
-        .map(|(index, (range, done))| {
-            scatter_one(source, part, index, range, options, progress, done)
-        })
+        .map(|(index, range)| scatter_one(source, part, index, range, options, &shared, progress))
         .collect();
     let drive = async {
+        let mut outcome = Ok(());
         while let Some(result) = fetchers.next().await {
-            result?;
+            if let Err(error) = result {
+                shared.failed.set(true);
+                outcome = Err(error);
+                break;
+            }
         }
-        Ok::<(), Error>(())
+        // Wake the verifier for its final pass (or so it sees the failure).
+        shared.notify.notify_one();
+        outcome
     };
 
     let (fetched, hashed) = tokio::join!(
@@ -167,7 +171,7 @@ async fn fetch_scatter<S: Source, P: Progress>(
             part,
             start,
             &ranges,
-            receivers,
+            &shared,
             options.checksum,
             total,
             progress
@@ -177,23 +181,80 @@ async fn fetch_scatter<S: Source, P: Progress>(
     hashed
 }
 
-/// Download one chunk's range into `part` at its offset, resuming from where it dropped with backoff,
-/// and signal completion once the whole region is written. Each chunk holds its own file handle, so
-/// concurrent writes to different offsets never contend.
+/// State a scatter download shares between its fetchers and its verifier: how many bytes each chunk has
+/// received, a nudge when that changes, and whether a chunk has permanently failed.
+struct Shared {
+    received: RefCell<Vec<u64>>,
+    notify: Notify,
+    failed: Cell<bool>,
+}
+
+/// One chunk's write target: its own file handle, its range, and the shared state it reports into.
+struct Sink<'a> {
+    index: usize,
+    range: ByteRange,
+    file: File,
+    shared: &'a Rc<Shared>,
+}
+
+impl Sink<'_> {
+    /// Stream `[*offset, range.end)` from `source` into the file at that offset, advancing `offset`,
+    /// recording each write into the shared received count, and nudging the verifier. On a mid-stream
+    /// error `offset` reflects how far it got, so the caller can seek back and resume.
+    async fn fill<S: Source, P: Progress>(
+        &mut self,
+        source: &S,
+        offset: &mut u64,
+        timeout: Option<Duration>,
+        progress: &P,
+    ) -> Result<(), Error> {
+        self.file.seek(SeekFrom::Start(*offset)).await.map_err(io)?;
+        let mut stream = source
+            .fetch(Some(ByteRange {
+                start: *offset,
+                end: self.range.end,
+            }))
+            .await?;
+        while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
+            let len = chunk.len() as u64;
+            if *offset + len > self.range.end {
+                return Err(detail("source sent more bytes than the requested range"));
+            }
+            self.file.write_all(&chunk).await.map_err(io)?;
+            // Flush before recording, so the bytes are visible to the verifier's separate read handle
+            // (a buffered write would otherwise let it read a stale hole and hash the wrong bytes).
+            self.file.flush().await.map_err(io)?;
+            *offset += len;
+            self.shared.received.borrow_mut()[self.index] = *offset - self.range.start;
+            self.shared.notify.notify_one();
+            progress.received(self.index, len);
+        }
+        Ok(())
+    }
+}
+
+/// Download one chunk's range into `part` at its offset, resuming from where it dropped with backoff.
+/// Each chunk holds its own file handle, so concurrent writes to different offsets never contend.
 async fn scatter_one<S: Source, P: Progress>(
     source: &S,
     part: &Path,
     index: usize,
     range: ByteRange,
     options: Options,
+    shared: &Rc<Shared>,
     progress: &P,
-    done: oneshot::Sender<()>,
 ) -> Result<(), Error> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .open(part)
         .await
         .map_err(io)?;
+    let mut sink = Sink {
+        index,
+        range,
+        file,
+        shared,
+    };
     let mut offset = range.start;
     let mut last_error = None;
     for attempt in 0..=options.retries {
@@ -203,16 +264,9 @@ async fn scatter_one<S: Source, P: Progress>(
         if attempt > 0 {
             tokio::time::sleep(backoff(attempt)).await;
         }
-        match write_range(
-            source,
-            index,
-            &mut file,
-            &mut offset,
-            range.end,
-            options.timeout,
-            progress,
-        )
-        .await
+        match sink
+            .fill(source, &mut offset, options.timeout, progress)
+            .await
         {
             Ok(()) => {}
             Err(error) => last_error = Some(error),
@@ -225,52 +279,18 @@ async fn scatter_one<S: Source, P: Progress>(
             received,
         }));
     }
-    file.flush().await.map_err(io)?;
-    // The region is durable; let the verifier read it. A gone verifier just means the download failed
-    // elsewhere, so the error is ignored here.
-    let _ = done.send(());
     Ok(())
 }
 
-/// Stream `[*offset, end)` from the source into `file` at that offset, advancing `offset` and reporting
-/// `received` as bytes land. On a mid-stream error `offset` reflects how far it got, so the caller can
-/// seek back and resume.
-async fn write_range<S: Source, P: Progress>(
-    source: &S,
-    index: usize,
-    file: &mut File,
-    offset: &mut u64,
-    end: u64,
-    timeout: Option<Duration>,
-    progress: &P,
-) -> Result<(), Error> {
-    file.seek(SeekFrom::Start(*offset)).await.map_err(io)?;
-    let mut stream = source
-        .fetch(Some(ByteRange {
-            start: *offset,
-            end,
-        }))
-        .await?;
-    while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
-        let len = chunk.len() as u64;
-        if *offset + len > end {
-            return Err(detail("source sent more bytes than the requested range"));
-        }
-        file.write_all(&chunk).await.map_err(io)?;
-        *offset += len;
-        progress.received(index, len);
-    }
-    Ok(())
-}
-
-/// Read `part` back from offset zero and hash it in order: the resumed prefix first, then each chunk's
-/// region once that chunk signals it is fully written. Reports `wrote` as the verified prefix grows and
-/// gates the total length, so the returned digest certifies the whole file.
+/// Read `part` back from offset zero and hash the contiguous, hole-free prefix as it grows: the resumed
+/// prefix first, then bytes as the earliest unfinished chunk receives them. Reports `wrote` per chunk so
+/// the verified frontier advances continuously, and gates the total length so the digest certifies the
+/// whole file.
 async fn verify<P: Progress>(
     part: &Path,
     start: u64,
     ranges: &[ByteRange],
-    receivers: Vec<oneshot::Receiver<()>>,
+    shared: &Rc<Shared>,
     checksum: Checksum,
     total: u64,
     progress: &P,
@@ -278,46 +298,60 @@ async fn verify<P: Progress>(
     let mut hasher = checksum.hasher();
     let mut reader = File::open(part).await.map_err(io)?;
     let mut buffer = vec![0u8; 128 * 1024];
-    let mut written = 0u64;
 
-    // The resumed prefix is already on disk; fold it in first (no progress: it is not a planned chunk).
-    hash_region(&mut reader, &mut hasher, start, None, &mut buffer, progress).await?;
-    written += start;
+    // The resumed prefix is already on disk; fold it in first (it is not a planned chunk, so no report).
+    read_into(&mut reader, &mut hasher, start, &mut buffer).await?;
+    let mut hashed = start;
 
-    // Each chunk's region, in order, once the chunk has written all of it.
-    for (index, (range, done)) in ranges.iter().zip(receivers).enumerate() {
-        done.await
-            .map_err(|_| detail("a chunk failed before it could be verified"))?;
-        hash_region(
-            &mut reader,
-            &mut hasher,
-            range.len(),
-            Some(index),
-            &mut buffer,
-            progress,
-        )
-        .await?;
-        written += range.len();
-    }
-
-    if written != total {
-        return Err(Error::LengthMismatch {
-            expected: total,
-            received: written,
-        });
+    loop {
+        if shared.failed.get() {
+            return Err(detail("a chunk failed before it could be verified"));
+        }
+        let frontier = start + contiguous_run(&shared.received.borrow(), ranges);
+        while hashed < frontier {
+            // Read no further than the current chunk's end, so each read is one chunk's bytes to report.
+            let index = chunk_of(ranges, hashed);
+            let want = (frontier - hashed).min(ranges[index].end - hashed);
+            let before = hashed;
+            read_into(&mut reader, &mut hasher, want, &mut buffer).await?;
+            progress.wrote(index, want);
+            hashed = before + want;
+        }
+        if hashed >= total {
+            break;
+        }
+        shared.notify.notified().await;
     }
     Ok(hasher.map(|hasher| hasher.finalize_hex()))
 }
 
-/// Read exactly `count` bytes from `reader` in order, folding them into `hasher` and, when `report` is
-/// `Some(index)`, reporting them as `wrote` for that chunk so the verified prefix advances on screen.
-async fn hash_region<P: Progress>(
+/// The number of contiguous bytes downloaded from the plan's start: every leading fully-received chunk,
+/// plus the partial bytes of the first chunk that is not yet complete.
+fn contiguous_run(received: &[u64], ranges: &[ByteRange]) -> u64 {
+    let mut run = 0;
+    for (got, range) in received.iter().zip(ranges) {
+        run += got;
+        if *got < range.len() {
+            break;
+        }
+    }
+    run
+}
+
+/// The index of the chunk whose range contains file offset `offset` (which is at or past the plan start).
+fn chunk_of(ranges: &[ByteRange], offset: u64) -> usize {
+    ranges
+        .iter()
+        .position(|range| offset < range.end)
+        .unwrap_or(ranges.len().saturating_sub(1))
+}
+
+/// Read exactly `count` bytes from `reader` in order and fold them into `hasher`.
+async fn read_into(
     reader: &mut File,
     hasher: &mut Option<Box<dyn Hasher>>,
     count: u64,
-    report: Option<usize>,
     buffer: &mut [u8],
-    progress: &P,
 ) -> Result<(), Error> {
     let mut remaining = count;
     while remaining > 0 {
@@ -331,9 +365,6 @@ async fn hash_region<P: Progress>(
         }
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(&buffer[..read]);
-        }
-        if let Some(index) = report {
-            progress.wrote(index, read as u64);
         }
         remaining -= read as u64;
     }

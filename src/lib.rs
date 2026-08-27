@@ -74,6 +74,21 @@ pub trait Source {
     async fn fetch(&self, range: ByteRange) -> Result<ByteStream, Error>;
 }
 
+/// Reports download progress. The engine calls [`Progress::start`] once with the planned chunk sizes,
+/// then [`Progress::advance`] as each chunk's bytes arrive, then [`Progress::finish`]. Every method
+/// takes `&self` and defaults to nothing, so a caller opts in only to what it wants and passes `()` for
+/// none. The engine drives these on a single task, so an implementation need not be `Sync`.
+pub trait Progress {
+    /// The planned chunk sizes, in order, before fetching begins.
+    fn start(&self, _chunks: &[u64]) {}
+    /// `bytes` more bytes arrived for chunk `index`.
+    fn advance(&self, _index: usize, _bytes: u64) {}
+    /// The download finished.
+    fn finish(&self) {}
+}
+
+impl Progress for () {}
+
 /// A fetch error. The variants name the failure modes that must never pass silently: a source that
 /// ignores a range, a length that does not match, or a transport failure carried by its source.
 #[derive(Debug, thiserror::Error)]

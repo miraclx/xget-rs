@@ -20,6 +20,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
+xbytes = { path = "../xbytes-rs" }
+xprogress = { path = "../xprogress-rs" }
 
 [lints.rust]
 unused_must_use = "deny"

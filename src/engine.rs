@@ -14,7 +14,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 
-use crate::{ByteRange, Error, Source, plan};
+use crate::{ByteRange, Error, Progress, Source, plan};
 
 /// Buffers a chunk may hold before its fetch blocks on the reassembler. Peak memory is roughly
 /// `parts * CHUNK_BUFFER` byte buffers, so parallelism cannot grow memory without bound.
@@ -30,16 +30,18 @@ pub struct Report {
 }
 
 /// Download the resource behind `source` into `output`, fetching up to `parts` chunks in parallel and
-/// retrying a dropped chunk up to `retries` times, and return its verified length and SHA-256.
+/// retrying a dropped chunk up to `retries` times, reporting to `progress`, and return its verified
+/// length and SHA-256.
 ///
 /// Chunks stream through in order and are hashed as they are written, in a single pass. Every chunk's
 /// range is validated, a retry resumes from where it dropped, and the total length is gated, so the
 /// returned digest certifies the resource rather than whatever bytes happened to arrive.
-pub async fn download<S: Source>(
+pub async fn download<S: Source, P: Progress>(
     source: &S,
     output: &Path,
     parts: u32,
     retries: u32,
+    progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
     if !probe.supports_ranges && probe.length > 0 {
@@ -48,6 +50,8 @@ pub async fn download<S: Source>(
         ));
     }
     let ranges = plan(probe.length, parts);
+    let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
+    progress.start(&sizes);
 
     // One bounded channel per chunk. The chunk fetches fill them in parallel; the reassembler drains
     // them in order, so the bytes leave this stage in resource order.
@@ -66,7 +70,8 @@ pub async fn download<S: Source>(
     let mut fetchers: FuturesUnordered<_> = ranges
         .into_iter()
         .zip(senders)
-        .map(|(range, tx)| fetch_into(source, range, tx, retries))
+        .enumerate()
+        .map(|(index, (range, tx))| fetch_into(source, index, range, tx, retries, progress))
         .collect();
     let fetch_all = async {
         while let Some(result) = fetchers.next().await {
@@ -78,6 +83,7 @@ pub async fn download<S: Source>(
     let (fetched, hashed) = tokio::join!(fetch_all, reassemble(receivers, file, probe.length));
     fetched?;
     let sha256 = hashed?;
+    progress.finish();
     Ok(Report {
         length: probe.length,
         sha256,
@@ -87,11 +93,13 @@ pub async fn download<S: Source>(
 /// Fetch one chunk into its channel, resuming from its current offset with backoff if the connection
 /// drops, and asserting it ultimately delivered exactly its range. Dropping the sender at the end
 /// closes the channel, which signals the reassembler the chunk is complete.
-async fn fetch_into<S: Source>(
+async fn fetch_into<S: Source, P: Progress>(
     source: &S,
+    index: usize,
     range: ByteRange,
     tx: mpsc::Sender<Bytes>,
     retries: u32,
+    progress: &P,
 ) -> Result<(), Error> {
     let mut offset = range.start;
     let mut last_error = None;
@@ -104,7 +112,7 @@ async fn fetch_into<S: Source>(
         }
         // Resume the remaining bytes; the source validates the resumed range starts at `offset`, so a
         // retry can neither duplicate nor gap bytes.
-        match stream_into(source, offset, range.end, &tx, &mut offset).await {
+        match stream_into(source, index, offset, range.end, &tx, &mut offset, progress).await {
             Ok(()) => {}
             Err(error) => last_error = Some(error),
         }
@@ -125,15 +133,17 @@ async fn fetch_into<S: Source>(
     Ok(())
 }
 
-/// Stream the range `[start, end)` into the channel, advancing `offset` as bytes are sent. On a
-/// mid-stream error `offset` reflects how far it got, so the caller can resume from there. The bounded
-/// channel applies backpressure, so a fast chunk cannot outrun the reassembler.
-async fn stream_into<S: Source>(
+/// Stream the range `[start, end)` into the channel, advancing `offset` and reporting `progress` as
+/// bytes are sent. On a mid-stream error `offset` reflects how far it got, so the caller can resume.
+/// The bounded channel applies backpressure, so a fast chunk cannot outrun the reassembler.
+async fn stream_into<S: Source, P: Progress>(
     source: &S,
+    index: usize,
     start: u64,
     end: u64,
     tx: &mpsc::Sender<Bytes>,
     offset: &mut u64,
+    progress: &P,
 ) -> Result<(), Error> {
     let mut stream = source.fetch(ByteRange { start, end }).await?;
     while let Some(chunk) = stream.next().await {
@@ -146,6 +156,7 @@ async fn stream_into<S: Source>(
             .await
             .map_err(|_| detail("reassembler stopped receiving"))?;
         *offset += len;
+        progress.advance(index, len);
     }
     Ok(())
 }

@@ -9,12 +9,12 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | ------- | ------ | ----- |
 | chunked parallel range GET | ✅ | `plan` + structured concurrency |
 | resume a dropped chunk from offset | ✅ | validated `Content-Range`, backoff |
-| one-shot streaming (hash while writing) | ✅ | ordered reassembly over bounded channels |
+| scatter to a sparse file + in-order verify | ✅ | positioned writes; verifier hashes the hole-free prefix |
 | range-not-honored / length gates | ✅ | typed `RangeNotHonored` / `LengthMismatch` |
-| bounded memory (no StreamCache) | ✅ | `parts * cache` buffers, `--cache-size` |
-| single-stream fetch for non-range sources | ✅ | fetch_all, one stream, still hashed |
-| configurable checksum algorithm | ✅ | none/md5/sha1/sha256/sha512 |
-| resume a partial FILE across runs (`-c`) | ✅ | fetches the remainder; prefix re-hashed once, concurrently |
+| no memory buffering (no StreamCache) | ✅ | positioned writes, so parallelism is unbounded |
+| single-stream fetch for non-range sources | ✅ | one stream, hashed inline |
+| configurable checksum algorithm | ✅ | none/md5/sha1/sha256/sha512/blake3 |
+| resume a partial FILE across runs (`-c`) | ✅ | fetches the remainder; prefix folded into the verify pass |
 | start from offset (`-i, --start-pos`) | ⬜ | |
 | inactivity timeout (`--timeout`) | ✅ | per-read; a ranged chunk's retry resumes it |
 | pluggable sources (S3, bifrost peer) | 🟡 | `Source` seam exists; only HTTP impl |
@@ -34,7 +34,6 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512 |
 | `--timeout <secs>` | ✅ | inactivity timeout |
 | `-c, --continue` | ✅ | resume a partial file |
-| `--cache-size <N>` | ✅ | per-chunk read-ahead buffers |
 | `--start-pos` | ⬜ | `-c` covers the real resume case |
 
 ## Progress
@@ -49,6 +48,7 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 
 ## Deliberately different (➖)
 
-- No `StreamCache` / `--show-cache`: the JS cache is replaced by bounded per-chunk channels, so memory
-  is `parts * cache` by construction. `--cache-size` maps to that per-chunk bound (default 64) rather
-  than a global byte budget.
+- No `StreamCache` / `--cache-size` / `--show-cache`: chunks are written straight to their offsets in a
+  sparse file, so nothing is buffered in memory and there is no cache to size. Verification is a single
+  in-order read-back of the file (giving up the JS "never touch the disk twice" for unbounded
+  parallelism and connections that never idle).

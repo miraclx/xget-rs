@@ -9,6 +9,8 @@
 //! tomorrow. The engine is written once and works over any source that can report a length and serve a
 //! byte range; a source that cannot serve ranges is fetched as a single stream.
 
+use core::time::Duration;
+
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
@@ -26,6 +28,32 @@ pub use crate::checksum::{Checksum, UnknownChecksum};
 pub use crate::engine::{Report, download};
 pub use crate::http::HttpSource;
 pub use crate::plan::plan;
+
+/// How a [`download`] is tuned: parallelism, retries, which checksum to verify with, and an optional
+/// inactivity timeout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Options {
+    /// Maximum number of chunks fetched in parallel. A source that cannot serve ranges ignores this and
+    /// is fetched as one stream.
+    pub parts: u32,
+    /// Retries for a dropped chunk, each resuming from the offset it reached.
+    pub retries: u32,
+    /// The checksum algorithm to verify the download with, or [`Checksum::None`] to skip it.
+    pub checksum: Checksum,
+    /// Fail a read that stalls for this long, so a retry can resume the chunk; `None` waits forever.
+    pub timeout: Option<Duration>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            parts: 5,
+            retries: 10,
+            checksum: Checksum::Sha256,
+            timeout: None,
+        }
+    }
+}
 
 /// A half-open byte range `[start, end)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

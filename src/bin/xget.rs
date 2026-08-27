@@ -41,6 +41,9 @@ struct Cli {
     /// Checksum to verify the download with: none, md5, sha1, sha256, or sha512.
     #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
     checksum: Checksum,
+    /// Fail a chunk if no data arrives for this many seconds, so its retry can resume it.
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<f64>,
     /// Progress output: auto (a bar on a terminal, else plain lines), bar, plain, json, or none.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -73,15 +76,13 @@ async fn main() -> eyre::Result<()> {
     let output = resolve_output(&cli)?;
     let source = HttpSource::new(&cli.url, parse_headers(&cli.headers)?)?;
     let reporter = Reporter::new(resolve_mode(&cli), cli.raw_sizes);
-    let report = libxget::download(
-        &source,
-        &output,
-        cli.chunks,
-        cli.tries,
-        cli.checksum,
-        &reporter,
-    )
-    .await?;
+    let options = libxget::Options {
+        parts: cli.chunks,
+        retries: cli.tries,
+        checksum: cli.checksum,
+        timeout: cli.timeout.map(Duration::from_secs_f64),
+    };
+    let report = libxget::download(&source, &output, options, &reporter).await?;
     let size = fmt_size(report.length, cli.raw_sizes);
     match report.hash {
         Some(hash) => println!("{}:{hash}  {size}", cli.checksum),

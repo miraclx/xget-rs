@@ -16,7 +16,7 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | configurable checksum algorithm | ✅ | none/md5/sha1/sha256/sha512 |
 | resume a partial FILE across runs (`-c`) | ⬜ | different from per-chunk retry |
 | start from offset (`-i, --start-pos`) | ⬜ | |
-| inactivity timeout (`--timeout`) | ⬜ | |
+| inactivity timeout (`--timeout`) | ✅ | per-read; a ranged chunk's retry resumes it |
 | pluggable sources (S3, bifrost peer) | 🟡 | `Source` seam exists; only HTTP impl |
 
 ## CLI (`xget`)
@@ -32,7 +32,8 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | `--progress <bar\|plain\|json\|none>`, `--no-bar` | ✅ | auto-detects a TTY |
 | `--raw-sizes` | ✅ | raw byte counts |
 | `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512 |
-| `--continue`, `--start-pos`, `--timeout`, `--cache-size` | ⬜ | see engine |
+| `--timeout <secs>` | ✅ | inactivity timeout |
+| `--continue`, `--start-pos`, `--cache-size` | ⬜ | see engine |
 
 ## Progress
 

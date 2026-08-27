@@ -14,7 +14,7 @@ use futures::stream::FuturesUnordered;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 
-use crate::{ByteRange, Checksum, Error, Progress, Source, plan};
+use crate::{ByteRange, Checksum, Error, Options, Progress, Source, plan};
 
 /// Buffers a chunk may read ahead before its fetch blocks on the reassembler. This is the
 /// memory-versus-parallelism knob (the JS `--cache-size`): larger lets a chunk download further ahead
@@ -31,9 +31,8 @@ pub struct Report {
     pub hash: Option<String>,
 }
 
-/// Download the resource behind `source` into `output`, fetching up to `parts` chunks in parallel and
-/// retrying a dropped chunk up to `retries` times, reporting to `progress`, and return its verified
-/// length and checksum.
+/// Download the resource behind `source` into `output` per `options`, reporting to `progress`, and
+/// return its verified length and checksum.
 ///
 /// A range-capable resource is fetched in parallel chunks, hashed as they are written in a single pass;
 /// one that is not is fetched as a single stream. Every chunk's range is validated, a retry resumes
@@ -41,27 +40,16 @@ pub struct Report {
 pub async fn download<S: Source, P: Progress>(
     source: &S,
     output: &Path,
-    parts: u32,
-    retries: u32,
-    checksum: Checksum,
+    options: Options,
     progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
     let file = tokio::fs::File::create(output).await.map_err(io)?;
 
     let hash = if probe.supports_ranges {
-        fetch_ranged(
-            source,
-            probe.length,
-            parts,
-            retries,
-            checksum,
-            file,
-            progress,
-        )
-        .await?
+        fetch_ranged(source, probe.length, options, file, progress).await?
     } else {
-        fetch_whole(source, probe.length, checksum, file, progress).await?
+        fetch_whole(source, probe.length, options, file, progress).await?
     };
 
     progress.finish();
@@ -75,13 +63,11 @@ pub async fn download<S: Source, P: Progress>(
 async fn fetch_ranged<S: Source, P: Progress>(
     source: &S,
     total: u64,
-    parts: u32,
-    retries: u32,
-    checksum: Checksum,
+    options: Options,
     file: tokio::fs::File,
     progress: &P,
 ) -> Result<Option<String>, Error> {
-    let ranges = plan(total, parts);
+    let ranges = plan(total, options.parts);
     let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
     progress.start(&sizes);
 
@@ -101,7 +87,7 @@ async fn fetch_ranged<S: Source, P: Progress>(
         .into_iter()
         .zip(senders)
         .enumerate()
-        .map(|(index, (range, tx))| fetch_into(source, index, range, tx, retries, progress))
+        .map(|(index, (range, tx))| fetch_into(source, index, range, tx, options, progress))
         .collect();
     let drive = async {
         while let Some(result) = fetchers.next().await {
@@ -110,7 +96,8 @@ async fn fetch_ranged<S: Source, P: Progress>(
         Ok::<(), Error>(())
     };
 
-    let (fetched, hashed) = tokio::join!(drive, reassemble(receivers, file, total, checksum));
+    let (fetched, hashed) =
+        tokio::join!(drive, reassemble(receivers, file, total, options.checksum));
     fetched?;
     hashed
 }
@@ -119,14 +106,15 @@ async fn fetch_ranged<S: Source, P: Progress>(
 async fn fetch_whole<S: Source, P: Progress>(
     source: &S,
     total: u64,
-    checksum: Checksum,
+    options: Options,
     file: tokio::fs::File,
     progress: &P,
 ) -> Result<Option<String>, Error> {
     progress.start(&[total]);
     let (tx, rx) = mpsc::channel::<Bytes>(CHUNK_BUFFER);
-    let fetch = fetch_all_into(source, tx, progress);
-    let (fetched, hashed) = tokio::join!(fetch, reassemble(vec![rx], file, total, checksum));
+    let fetch = fetch_all_into(source, tx, options.timeout, progress);
+    let (fetched, hashed) =
+        tokio::join!(fetch, reassemble(vec![rx], file, total, options.checksum));
     fetched?;
     hashed
 }
@@ -136,11 +124,11 @@ async fn fetch_whole<S: Source, P: Progress>(
 async fn fetch_all_into<S: Source, P: Progress>(
     source: &S,
     tx: mpsc::Sender<Bytes>,
+    timeout: Option<Duration>,
     progress: &P,
 ) -> Result<(), Error> {
     let mut stream = source.fetch_all().await?;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+    while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
         let len = chunk.len() as u64;
         tx.send(chunk)
             .await
@@ -148,6 +136,21 @@ async fn fetch_all_into<S: Source, P: Progress>(
         progress.advance(0, len);
     }
     Ok(())
+}
+
+/// Read the next chunk from a stream, failing with a typed error if none arrives within `timeout`. A
+/// timeout on a ranged chunk is caught by its retry loop, which resumes from where it stalled.
+async fn next_chunk(
+    stream: &mut crate::ByteStream,
+    timeout: Option<Duration>,
+) -> Result<Option<Bytes>, Error> {
+    let next = match timeout {
+        Some(limit) => tokio::time::timeout(limit, stream.next())
+            .await
+            .map_err(|_| detail("timed out waiting for data"))?,
+        None => stream.next().await,
+    };
+    next.transpose()
 }
 
 /// Fetch one chunk into its channel, resuming from its current offset with backoff if the connection
@@ -158,12 +161,12 @@ async fn fetch_into<S: Source, P: Progress>(
     index: usize,
     range: ByteRange,
     tx: mpsc::Sender<Bytes>,
-    retries: u32,
+    options: Options,
     progress: &P,
 ) -> Result<(), Error> {
     let mut offset = range.start;
     let mut last_error = None;
-    for attempt in 0..=retries {
+    for attempt in 0..=options.retries {
         if offset >= range.end {
             break;
         }
@@ -172,7 +175,17 @@ async fn fetch_into<S: Source, P: Progress>(
         }
         // Resume the remaining bytes; the source validates the resumed range starts at `offset`, so a
         // retry can neither duplicate nor gap bytes.
-        match stream_into(source, index, offset, range.end, &tx, &mut offset, progress).await {
+        match stream_into(
+            source,
+            index,
+            range.end,
+            &tx,
+            &mut offset,
+            options.timeout,
+            progress,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(error) => last_error = Some(error),
         }
@@ -193,21 +206,25 @@ async fn fetch_into<S: Source, P: Progress>(
     Ok(())
 }
 
-/// Stream the range `[start, end)` into the channel, advancing `offset` and reporting `progress` as
+/// Stream the range `[*offset, end)` into the channel, advancing `offset` and reporting `progress` as
 /// bytes are sent. On a mid-stream error `offset` reflects how far it got, so the caller can resume.
 /// The bounded channel applies backpressure, so a fast chunk cannot outrun the reassembler.
 async fn stream_into<S: Source, P: Progress>(
     source: &S,
     index: usize,
-    start: u64,
     end: u64,
     tx: &mpsc::Sender<Bytes>,
     offset: &mut u64,
+    timeout: Option<Duration>,
     progress: &P,
 ) -> Result<(), Error> {
-    let mut stream = source.fetch(ByteRange { start, end }).await?;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+    let mut stream = source
+        .fetch(ByteRange {
+            start: *offset,
+            end,
+        })
+        .await?;
+    while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
         let len = chunk.len() as u64;
         if *offset + len > end {
             return Err(detail("source sent more bytes than the requested range"));

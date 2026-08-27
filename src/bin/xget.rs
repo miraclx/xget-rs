@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
-use libxget::{Checksum, HttpSource, Probe, Progress, Source as _};
+use libxget::{
+    ByteRange, ByteStream, Checksum, Error, HttpSource, Mirrors, Probe, Progress, Source,
+};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use xbytes::prelude::*;
 use xprogress::{Bar, Color, DrawTarget, Style};
@@ -58,6 +60,10 @@ struct Cli {
     /// A mirror URL for the same resource, tried when the primary fails a chunk (repeatable).
     #[arg(long = "mirror", value_name = "URL")]
     mirrors: Vec<String>,
+    /// Endpoint for an `s3://` URL, so an S3-compatible store (R2, MinIO, Backblaze) works. Ignored
+    /// for HTTP URLs.
+    #[arg(long, value_name = "URL")]
+    endpoint_url: Option<String>,
     /// Checksum to verify the download with: none, md5, sha1, sha256, sha512, or blake3.
     #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
     checksum: Checksum,
@@ -101,15 +107,7 @@ enum ProgressMode {
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
     let headers = parse_headers(&cli.headers)?;
-    // The primary plus any --mirror URLs, tried in order on failure. With no mirrors this is just the
-    // primary, so there is one download path.
-    let primary = HttpSource::new(&cli.url, headers.clone())?;
-    let mirrors = cli
-        .mirrors
-        .iter()
-        .map(|url| HttpSource::new(url, headers.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let source = libxget::Mirrors::new(primary, mirrors);
+    let source = build_source(&cli, &headers).await?;
     let mode = resolve_mode(&cli);
 
     // Probe once up front for the preamble and the output name; the download re-probes authoritatively.
@@ -157,6 +155,72 @@ async fn main() -> eyre::Result<()> {
 
     summary(mode, &cli, checksum, &report, started.elapsed());
     Ok(())
+}
+
+/// The byte source for this run, chosen from the URL scheme. `Source` is not object-safe (it has async
+/// methods), so a `dyn Source` is impossible; this enum dispatches to whichever concrete source the URL
+/// selected while still being one type the engine can be generic over.
+enum AnySource {
+    /// An HTTP(S) URL, with any `--mirror` URLs tried in order on failure.
+    Http(Mirrors<HttpSource>),
+    /// An object in an S3 (or S3-compatible) bucket.
+    #[cfg(feature = "s3")]
+    S3(libxget::S3Source),
+}
+
+impl Source for AnySource {
+    async fn probe(&self) -> Result<Probe, Error> {
+        match self {
+            Self::Http(source) => source.probe().await,
+            #[cfg(feature = "s3")]
+            Self::S3(source) => source.probe().await,
+        }
+    }
+
+    async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
+        match self {
+            Self::Http(source) => source.fetch(range).await,
+            #[cfg(feature = "s3")]
+            Self::S3(source) => source.fetch(range).await,
+        }
+    }
+}
+
+/// Build the source for `cli.url`: an `s3://bucket/key` object when the scheme is `s3`, otherwise the
+/// HTTP primary plus any `--mirror` URLs tried in order on failure. Mirrors are HTTP-only; an `s3://`
+/// URL ignores them.
+async fn build_source(cli: &Cli, headers: &HeaderMap) -> eyre::Result<AnySource> {
+    if let Some(rest) = cli.url.strip_prefix("s3://") {
+        return build_s3_source(rest, cli.endpoint_url.clone()).await;
+    }
+    // The primary plus any --mirror URLs, tried in order on failure. With no mirrors this is just the
+    // primary, so there is one download path.
+    let primary = HttpSource::new(&cli.url, headers.clone())?;
+    let mirrors = cli
+        .mirrors
+        .iter()
+        .map(|url| HttpSource::new(url, headers.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AnySource::Http(Mirrors::new(primary, mirrors)))
+}
+
+/// Build an S3 source from the part of an `s3://` URL after the scheme: the first path segment is the
+/// bucket and the rest is the key. Only available when built with `--features s3`.
+#[cfg(feature = "s3")]
+async fn build_s3_source(rest: &str, endpoint_url: Option<String>) -> eyre::Result<AnySource> {
+    let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
+    if bucket.is_empty() || key.is_empty() {
+        eyre::bail!("s3 URL must be s3://bucket/key");
+    }
+    let source = libxget::S3Source::new(bucket, key, endpoint_url).await;
+    Ok(AnySource::S3(source))
+}
+
+/// Reject an `s3://` URL when the `s3` feature was not compiled in, so the failure names the fix rather
+/// than the URL falling through to the HTTP path and failing obscurely.
+#[cfg(not(feature = "s3"))]
+async fn build_s3_source(_rest: &str, _endpoint_url: Option<String>) -> eyre::Result<AnySource> {
+    eyre::bail!("s3:// requires building with --features s3")
 }
 
 /// An `--expect` value: either a checksum given inline, or a URL to a checksum file to fetch. Both

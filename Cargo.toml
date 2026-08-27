@@ -10,7 +10,12 @@ license = "MIT OR Apache-2.0"
 keywords = ["download", "http", "range", "resume", "parallel"]
 categories = ["network-programming", "asynchronous"]
 
+[features]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio-util"]
+
 [dependencies]
+aws-config = { version = "1.8", optional = true }
+aws-sdk-s3 = { version = "1.96", optional = true }
 blake3 = "1.8.7"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -24,6 +29,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
+tokio-util = { version = "0.7", optional = true, features = ["io"] }
 xbytes = { path = "../xbytes-rs" }
 xprogress = { path = "../xprogress-rs" }
 

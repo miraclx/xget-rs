@@ -25,7 +25,8 @@ list current as features land; fold the ✅ ones into the README before release.
   demo: ⬜ · readme: ⬜
 - Inactivity `--timeout`; a stalled chunk's retry resumes it. demo: ⬜ · readme: ⬜
 - Bounded memory; `--cache-size` is the read-ahead knob. demo: ⬜ · readme: ⬜
-- Pluggable `Source` (HTTP today; S3 and a bifrost peer planned). demo: ⬜ · readme: partial
+- Pluggable `Source` (HTTP, plus S3 behind the `s3` feature; a bifrost peer planned). S3 works against
+  any S3-compatible store (R2, MinIO, Backblaze) via `--endpoint-url`. demo: ⬜ · readme: partial
 - Mirror / failover across sources (`--mirror`), via a `Mirrors` Source. demo: ⬜ · readme: ⬜
 
 ## Presentation

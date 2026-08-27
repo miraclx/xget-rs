@@ -19,6 +19,8 @@ mod engine;
 mod http;
 mod mirror;
 mod plan;
+#[cfg(feature = "s3")]
+mod s3;
 
 #[cfg(test)]
 mod http_tests;
@@ -32,6 +34,8 @@ pub use crate::engine::{Report, download};
 pub use crate::http::HttpSource;
 pub use crate::mirror::Mirrors;
 pub use crate::plan::plan;
+#[cfg(feature = "s3")]
+pub use crate::s3::S3Source;
 
 /// How a [`download`] is tuned: parallelism, retries, which checksum to verify with, and an optional
 /// inactivity timeout.

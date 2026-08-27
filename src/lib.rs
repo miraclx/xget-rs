@@ -42,6 +42,10 @@ pub struct Options {
     pub checksum: Checksum,
     /// Fail a read that stalls for this long, so a retry can resume the chunk; `None` waits forever.
     pub timeout: Option<Duration>,
+    /// Resume an interrupted download: keep the bytes already in `output`, fetch only what remains, and
+    /// fold the existing prefix into the checksum by reading it back once (concurrently with the live
+    /// fetch, so it never stalls the download). Requires a range-capable source.
+    pub resume: bool,
 }
 
 impl Default for Options {
@@ -51,6 +55,7 @@ impl Default for Options {
             retries: 10,
             checksum: Checksum::Sha256,
             timeout: None,
+            resume: false,
         }
     }
 }

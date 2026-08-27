@@ -1,9 +1,11 @@
 //! The download engine: probe, plan, fetch chunks in parallel, reassemble in order, hash while writing.
 //!
 //! The pipeline is one-shot. Parallel chunks stream into bounded per-chunk channels; a single
-//! reassembler drains them in order and both hashes and writes each byte in the same pass. Nothing is
-//! read back: the digest is computed as the resource is written, not over the finished file. A source
-//! that cannot serve ranges is fetched as one stream instead of parallel chunks.
+//! reassembler drains them in order and both hashes and writes each byte in the same pass. The live
+//! download is never read back: the digest is computed as the resource is written, not over the
+//! finished file. A source that cannot serve ranges is fetched as one stream instead of parallel
+//! chunks. The one exception is resuming: the bytes already on disk are read once to seed the hasher,
+//! concurrently with the live fetch so the read overlaps the download rather than blocking it.
 
 use core::time::Duration;
 use std::path::Path;
@@ -11,10 +13,18 @@ use std::path::Path;
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 
-use crate::{ByteRange, Checksum, Error, Options, Progress, Source, plan};
+use crate::plan::plan_range;
+use crate::{ByteRange, Checksum, Error, Options, Progress, Source};
+
+/// The bytes already present in the output when resuming: a read handle positioned at the start and the
+/// number of bytes to fold into the checksum before hashing anything new.
+struct Prefix {
+    reader: tokio::fs::File,
+    len: u64,
+}
 
 /// Buffers a chunk may read ahead before its fetch blocks on the reassembler. This is the
 /// memory-versus-parallelism knob (the JS `--cache-size`): larger lets a chunk download further ahead
@@ -44,10 +54,11 @@ pub async fn download<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
-    let file = tokio::fs::File::create(output).await.map_err(io)?;
+    let (file, start, prefix) = open_output(output, &probe, &options).await?;
 
-    let hash = if probe.supports_ranges {
-        fetch_ranged(source, probe.length, options, file, progress).await?
+    let hash = if start > 0 || probe.supports_ranges {
+        // A resume, or a fresh range-capable fetch: plan `[start, total)` into parallel chunks.
+        fetch_ranged(source, start, probe.length, options, file, prefix, progress).await?
     } else {
         fetch_whole(source, probe.length, options, file, progress).await?
     };
@@ -59,15 +70,65 @@ pub async fn download<S: Source, P: Progress>(
     })
 }
 
-/// Fetch a range-capable resource as `parts` parallel chunks, reassembled and hashed in order.
+/// Open the output for writing and work out where the download should start. A fresh download truncates
+/// the file and starts at zero; a resume keeps what is there, appends the rest, and returns a [`Prefix`]
+/// handle so the existing bytes can be folded into the checksum.
+async fn open_output(
+    output: &Path,
+    probe: &crate::Probe,
+    options: &Options,
+) -> Result<(tokio::fs::File, u64, Option<Prefix>), Error> {
+    let existing = if options.resume {
+        tokio::fs::metadata(output)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    if existing == 0 {
+        let file = tokio::fs::File::create(output).await.map_err(io)?;
+        return Ok((file, 0, None));
+    }
+    if existing > probe.length {
+        return Err(detail(
+            "existing file is larger than the resource; refusing to resume",
+        ));
+    }
+    if !probe.supports_ranges {
+        return Err(detail(
+            "cannot resume: the source does not support byte ranges",
+        ));
+    }
+    let file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(output)
+        .await
+        .map_err(io)?;
+    let reader = tokio::fs::File::open(output).await.map_err(io)?;
+    Ok((
+        file,
+        existing,
+        Some(Prefix {
+            reader,
+            len: existing,
+        }),
+    ))
+}
+
+/// Fetch a range-capable resource's `[start, total)` bytes as `parts` parallel chunks, reassembled and
+/// hashed in order after any resumed `prefix`.
 async fn fetch_ranged<S: Source, P: Progress>(
     source: &S,
+    start: u64,
     total: u64,
     options: Options,
     file: tokio::fs::File,
+    prefix: Option<Prefix>,
     progress: &P,
 ) -> Result<Option<String>, Error> {
-    let ranges = plan(total, options.parts);
+    let ranges = plan_range(start, total, options.parts);
     let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
     progress.start(&sizes);
 
@@ -96,8 +157,10 @@ async fn fetch_ranged<S: Source, P: Progress>(
         Ok::<(), Error>(())
     };
 
-    let (fetched, hashed) =
-        tokio::join!(drive, reassemble(receivers, file, total, options.checksum));
+    let (fetched, hashed) = tokio::join!(
+        drive,
+        reassemble(receivers, file, total, options.checksum, prefix)
+    );
     fetched?;
     hashed
 }
@@ -113,8 +176,10 @@ async fn fetch_whole<S: Source, P: Progress>(
     progress.start(&[total]);
     let (tx, rx) = mpsc::channel::<Bytes>(CHUNK_BUFFER);
     let fetch = fetch_all_into(source, tx, options.timeout, progress);
-    let (fetched, hashed) =
-        tokio::join!(fetch, reassemble(vec![rx], file, total, options.checksum));
+    let (fetched, hashed) = tokio::join!(
+        fetch,
+        reassemble(vec![rx], file, total, options.checksum, None)
+    );
     fetched?;
     hashed
 }
@@ -238,16 +303,46 @@ async fn stream_into<S: Source, P: Progress>(
     Ok(())
 }
 
-/// Drain the per-chunk channels in order, hashing and writing each byte in one pass, and return the
-/// hex checksum. Gates the total length so a short assembly is an error, not a certified bad file.
+/// Fold the resumed `prefix` into the hasher, then drain the per-chunk channels in order, hashing and
+/// writing each new byte in one pass, and return the hex checksum. Gates the total length so a short
+/// assembly is an error, not a certified bad file.
+///
+/// Reading the prefix happens here while the fetchers are already pulling new bytes from the network
+/// into the bounded channels, so the disk read overlaps the live download rather than blocking it. The
+/// hasher still consumes prefix-then-new in order, which a single digest requires.
 async fn reassemble(
     receivers: Vec<mpsc::Receiver<Bytes>>,
     mut file: tokio::fs::File,
     total: u64,
     checksum: Checksum,
+    prefix: Option<Prefix>,
 ) -> Result<Option<String>, Error> {
     let mut hasher = checksum.hasher();
     let mut written = 0u64;
+
+    if let Some(mut prefix) = prefix {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut remaining = prefix.len;
+        while remaining > 0 {
+            let want = remaining.min(buffer.len() as u64) as usize;
+            let read = prefix.reader.read(&mut buffer[..want]).await.map_err(io)?;
+            if read == 0 {
+                break;
+            }
+            if let Some(hasher) = hasher.as_mut() {
+                hasher.update(&buffer[..read]);
+            }
+            written += read as u64;
+            remaining -= read as u64;
+        }
+        if written != prefix.len {
+            return Err(Error::LengthMismatch {
+                expected: prefix.len,
+                received: written,
+            });
+        }
+    }
+
     for mut receiver in receivers {
         while let Some(bytes) = receiver.recv().await {
             if let Some(hasher) = hasher.as_mut() {

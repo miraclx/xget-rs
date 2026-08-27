@@ -35,6 +35,9 @@ struct Cli {
     /// Overwrite an existing output file.
     #[arg(short = 'f', long)]
     overwrite: bool,
+    /// Resume a partial download: keep the existing file, fetch only what remains, still verified.
+    #[arg(short = 'c', long = "continue")]
+    resume: bool,
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
@@ -81,6 +84,7 @@ async fn main() -> eyre::Result<()> {
         retries: cli.tries,
         checksum: cli.checksum,
         timeout: cli.timeout.map(Duration::from_secs_f64),
+        resume: cli.resume,
     };
     let report = libxget::download(&source, &output, options, &reporter).await?;
     let size = fmt_size(report.length, cli.raw_sizes);
@@ -147,8 +151,11 @@ fn resolve_output(cli: &Cli) -> eyre::Result<PathBuf> {
             }
         }
     };
-    if path.exists() && !cli.overwrite {
-        eyre::bail!("{} already exists (use -f to overwrite)", path.display());
+    if path.exists() && !cli.overwrite && !cli.resume {
+        eyre::bail!(
+            "{} already exists (use -f to overwrite or -c to resume)",
+            path.display()
+        );
     }
     if !cli.no_directories {
         if let Some(parent) = path.parent() {

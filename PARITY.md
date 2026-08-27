@@ -14,7 +14,7 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | bounded memory (no StreamCache) | ✅ | `parts * CHUNK_BUFFER` buffers |
 | single-stream fetch for non-range sources | ✅ | fetch_all, one stream, still hashed |
 | configurable checksum algorithm | ✅ | none/md5/sha1/sha256/sha512 |
-| resume a partial FILE across runs (`-c`) | ⬜ | different from per-chunk retry |
+| resume a partial FILE across runs (`-c`) | ✅ | fetches the remainder; prefix re-hashed once, concurrently |
 | start from offset (`-i, --start-pos`) | ⬜ | |
 | inactivity timeout (`--timeout`) | ✅ | per-read; a ranged chunk's retry resumes it |
 | pluggable sources (S3, bifrost peer) | 🟡 | `Source` seam exists; only HTTP impl |
@@ -33,7 +33,8 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | `--raw-sizes` | ✅ | raw byte counts |
 | `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512 |
 | `--timeout <secs>` | ✅ | inactivity timeout |
-| `--continue`, `--start-pos`, `--cache-size` | ⬜ | see engine |
+| `-c, --continue` | ✅ | resume a partial file |
+| `--start-pos`, `--cache-size` | ⬜ | see engine |
 
 ## Progress
 

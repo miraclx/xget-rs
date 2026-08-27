@@ -8,6 +8,15 @@ use crate::ByteRange;
 /// a zero-length resource plans to no chunks.
 #[must_use]
 pub fn plan(length: u64, parts: u32) -> Vec<ByteRange> {
+    plan_range(0, length, parts)
+}
+
+/// Tile `[start, end)` into up to `parts` contiguous chunks, the same way [`plan`] tiles a whole
+/// resource. Used to plan only the bytes a resumed download still needs. An empty or inverted range
+/// plans to no chunks.
+#[must_use]
+pub fn plan_range(start: u64, end: u64, parts: u32) -> Vec<ByteRange> {
+    let length = end.saturating_sub(start);
     if length == 0 {
         return Vec::new();
     }
@@ -15,14 +24,14 @@ pub fn plan(length: u64, parts: u32) -> Vec<ByteRange> {
     let base = length / parts;
     let extra = length % parts;
     let mut ranges = Vec::with_capacity(parts as usize);
-    let mut start = 0;
+    let mut offset = start;
     for index in 0..parts {
         let size = base + u64::from(index < extra);
         ranges.push(ByteRange {
-            start,
-            end: start + size,
+            start: offset,
+            end: offset + size,
         });
-        start += size;
+        offset += size;
     }
     ranges
 }

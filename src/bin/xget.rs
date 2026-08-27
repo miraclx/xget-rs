@@ -3,14 +3,22 @@
 use core::cell::RefCell;
 use core::time::Duration;
 use std::io::IsTerminal as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
-use libxget::{Checksum, HttpSource, Progress, Source as _};
+use libxget::{Checksum, HttpSource, Probe, Progress, Source as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use xbytes::prelude::*;
 use xprogress::{Bar, Color, DrawTarget, Style, Width};
+
+// ANSI colors for the live readout. Each code has zero display width, so it never affects the bar's
+// own width accounting; it only tints the text that follows the bar.
+const GREEN: &str = "\x1b[32m";
+const CYAN: &str = "\x1b[36m";
+const YELLOW: &str = "\x1b[33m";
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
 
 /// Download a URL in parallel chunks, verify it, and print its SHA-256.
 #[derive(Parser)]
@@ -80,8 +88,16 @@ enum ProgressMode {
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
     let source = HttpSource::new(&cli.url, parse_headers(&cli.headers)?)?;
-    let output = resolve_output(&cli, &source).await?;
-    let reporter = Reporter::new(resolve_mode(&cli), cli.raw_sizes);
+    let mode = resolve_mode(&cli);
+
+    // Probe once up front for the preamble and the output name; the download re-probes authoritatively.
+    let probe = source.probe().await.ok();
+    let output = resolve_output(&cli, probe.as_ref())?;
+    if mode == ProgressMode::Bar {
+        preamble(&cli, probe.as_ref(), &output);
+    }
+
+    let reporter = Reporter::new(mode, cli.raw_sizes);
     let options = libxget::Options {
         parts: cli.chunks,
         retries: cli.tries,
@@ -90,13 +106,48 @@ async fn main() -> eyre::Result<()> {
         resume: cli.resume,
         cache: cli.cache_size,
     };
+    let started = Instant::now();
     let report = libxget::download(&source, &output, options, &reporter).await?;
-    let size = fmt_size(report.length, cli.raw_sizes);
-    match report.hash {
-        Some(hash) => println!("{}:{hash}  {size}", cli.checksum),
-        None => println!("{size}"),
-    }
+    summary(mode, &cli, &report, started.elapsed());
     Ok(())
+}
+
+/// Print the block shown before a live bar: the URL, how many chunks, the length and media type, and
+/// where the file is being written.
+fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path) {
+    eprintln!("{DIM}URL:{RESET} {}", cli.url);
+    let chunks = match probe {
+        Some(probe) if probe.supports_ranges => {
+            libxget::plan(probe.length, cli.chunks).len().max(1)
+        }
+        Some(_) => 1,
+        None => cli.chunks as usize,
+    };
+    eprintln!("{DIM}Chunks:{RESET} {chunks}");
+    match probe {
+        Some(probe) => {
+            let size = fmt_size(probe.length, cli.raw_sizes);
+            match &probe.content_type {
+                Some(kind) => eprintln!("{DIM}Length:{RESET} {size} [{kind}]"),
+                None => eprintln!("{DIM}Length:{RESET} {size}"),
+            }
+        }
+        None => eprintln!("{DIM}Length:{RESET} unknown"),
+    }
+    eprintln!("{DIM}Saving:{RESET} '{}'", output.display());
+}
+
+/// Print the closing summary: how much was fetched in how long, and the verified checksum if one was
+/// requested. Skipped for `json` (which emits an `end` event instead).
+fn summary(mode: ProgressMode, cli: &Cli, report: &libxget::Report, elapsed: Duration) {
+    if mode == ProgressMode::Json {
+        return;
+    }
+    let size = fmt_size(report.length, cli.raw_sizes);
+    println!("Downloaded {size} in {}", fmt_elapsed(elapsed));
+    if let Some(hash) = &report.hash {
+        println!("Hash({}): {hash}", cli.checksum);
+    }
 }
 
 /// Resolve the effective progress mode: `auto` becomes a bar on a terminal and plain lines otherwise,
@@ -125,6 +176,22 @@ fn fmt_size(bytes: u64, raw: bool) -> String {
     }
 }
 
+/// A compact wall-clock duration for the closing summary: `1h2m`, `3m4s`, or `4.29s`.
+fn fmt_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds >= 3600.0 {
+        format!(
+            "{}h{}m",
+            (seconds / 3600.0) as u64,
+            (seconds % 3600.0 / 60.0) as u64
+        )
+    } else if seconds >= 60.0 {
+        format!("{}m{:.0}s", (seconds / 60.0) as u64, seconds % 60.0)
+    } else {
+        format!("{seconds:.2}s")
+    }
+}
+
 /// Parse repeated `Name: Value` header arguments into a [`HeaderMap`].
 fn parse_headers(raw: &[String]) -> eyre::Result<HeaderMap> {
     let mut headers = HeaderMap::new();
@@ -143,12 +210,12 @@ fn parse_headers(raw: &[String]) -> eyre::Result<HeaderMap> {
 /// Resolve where to write: an explicit file, a name inside an explicit directory, or a name inferred
 /// from the resource (its `Content-Disposition`, else the URL) under `--directory-prefix`. Refuses to
 /// clobber an existing file without `-f`, and creates missing parents unless `--no-directories`.
-async fn resolve_output(cli: &Cli, source: &HttpSource) -> eyre::Result<PathBuf> {
+fn resolve_output(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<PathBuf> {
     let path = match &cli.output {
-        Some(dir) if dir.is_dir() => dir.join(infer_name(cli, source).await?),
+        Some(dir) if dir.is_dir() => dir.join(infer_name(cli, probe)?),
         Some(file) => file.to_path_buf(),
         None => {
-            let name = infer_name(cli, source).await?;
+            let name = infer_name(cli, probe)?;
             match &cli.directory_prefix {
                 Some(prefix) => prefix.join(name),
                 None => PathBuf::from(name),
@@ -171,14 +238,11 @@ async fn resolve_output(cli: &Cli, source: &HttpSource) -> eyre::Result<PathBuf>
     Ok(path)
 }
 
-/// Infer an output filename: the resource's `Content-Disposition` if the server offers one, otherwise
-/// the URL's last path segment. Probing for the header is best-effort; if it fails, the real error
-/// surfaces later when the download itself probes.
-async fn infer_name(cli: &Cli, source: &HttpSource) -> eyre::Result<String> {
-    if let Ok(probe) = source.probe().await {
-        if let Some(name) = probe.filename {
-            return Ok(name);
-        }
+/// Infer an output filename: the resource's `Content-Disposition` if the server offered one in the
+/// probe, otherwise the URL's last path segment.
+fn infer_name(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<String> {
+    if let Some(name) = probe.and_then(|probe| probe.filename.clone()) {
+        return Ok(name);
     }
     url_basename(&cli.url)
 }
@@ -317,6 +381,26 @@ impl Meter {
             .checked_div(self.total)
             .unwrap_or(0)
     }
+
+    /// Percent complete as a fraction, `0.0` when the total is unknown.
+    fn percent_f64(&self) -> f64 {
+        if self.total > 0 {
+            self.done as f64 * 100.0 / self.total as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// The ETA as a `MM:SS` clock (minutes may exceed 59 for a long transfer).
+    fn eta_clock(&self) -> String {
+        let eta = self.eta();
+        format!("{:02}:{:02}", eta / 60, eta % 60)
+    }
+
+    /// Milliseconds since the transfer started.
+    fn elapsed_ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
 }
 
 /// A single updating text line: `done / total (pct%)  speed  eta`, drawn in place on stderr and
@@ -336,12 +420,12 @@ impl PlainProgress {
 
     fn line(&self, meter: &Meter) -> String {
         format!(
-            "\r\x1b[K{} / {} ({}%)  {}/s  eta {}",
+            "\r\x1b[K{:>5.1}%  {}/{}  {}/s  ETA {}",
+            meter.percent_f64(),
             fmt_size(meter.done, self.raw),
             fmt_size(meter.total, self.raw),
-            meter.percent(),
             fmt_size(meter.rate(), self.raw),
-            format_eta(meter.eta()),
+            meter.eta_clock(),
         )
     }
 }
@@ -386,22 +470,17 @@ impl JsonProgress {
 
 impl Progress for JsonProgress {
     fn start(&self, chunks: &[u64]) {
-        let meter = Meter::new(chunks.iter().sum());
-        eprintln!(
-            r#"{{"event":"start","total":{},"chunks":{}}}"#,
-            meter.total,
-            chunks.len()
-        );
-        *self.meter.borrow_mut() = Some(meter);
+        *self.meter.borrow_mut() = Some(Meter::new(chunks.iter().sum()));
     }
 
     fn advance(&self, _index: usize, bytes: u64) {
         if let Some(meter) = self.meter.borrow_mut().as_mut() {
             if meter.advance(bytes, Duration::from_millis(200)) {
                 eprintln!(
-                    r#"{{"event":"progress","done":{},"total":{},"rate":{},"eta":{}}}"#,
+                    r#"{{"event":"progress","bytes":{},"total":{},"percent":{:.1},"speed":{},"eta":{}}}"#,
                     meter.done,
                     meter.total,
+                    meter.percent_f64(),
                     meter.rate(),
                     meter.eta()
                 );
@@ -412,8 +491,10 @@ impl Progress for JsonProgress {
     fn finish(&self) {
         if let Some(meter) = self.meter.borrow().as_ref() {
             eprintln!(
-                r#"{{"event":"done","total":{},"done":{}}}"#,
-                meter.total, meter.done
+                r#"{{"event":"end","bytes":{},"total":{},"elapsed":{}}}"#,
+                meter.done,
+                meter.total,
+                meter.elapsed_ms()
             );
         }
     }
@@ -483,15 +564,17 @@ impl Progress for BarProgress {
     }
 }
 
-/// Compose the bar with a `done / total  speed  eta` readout.
+/// Compose the bar with a colored `pct%  speed  eta  done/total` readout.
 fn frame(live: &Live) -> String {
+    let meter = &live.meter;
     format!(
-        "[{}] {} / {}  {}/s  eta {}",
-        live.bar.render(live.width),
-        fmt_size(live.meter.done, live.raw),
-        fmt_size(live.meter.total, live.raw),
-        fmt_size(live.meter.rate(), live.raw),
-        format_eta(live.meter.eta()),
+        "[{bar}] {GREEN}{pct:>3}%{RESET}  {CYAN}{speed}/s{RESET}  {YELLOW}{eta}{RESET}  {done}/{total}",
+        bar = live.bar.render(live.width),
+        pct = meter.percent(),
+        speed = fmt_size(meter.rate(), live.raw),
+        eta = format_eta(meter.eta()),
+        done = fmt_size(meter.done, live.raw),
+        total = fmt_size(meter.total, live.raw),
     )
 }
 

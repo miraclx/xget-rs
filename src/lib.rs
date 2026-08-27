@@ -97,6 +97,8 @@ pub struct Probe {
     /// A filename the source suggests for the resource (from an HTTP `Content-Disposition`), if any and
     /// after stripping any path components. A caller may use it to name the output.
     pub filename: Option<String>,
+    /// The resource's media type (from an HTTP `Content-Type`), if the source reports one.
+    pub content_type: Option<String>,
 }
 
 /// A stream of byte chunks from a source, or a fetch error.

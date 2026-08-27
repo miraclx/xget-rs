@@ -1,7 +1,7 @@
 //! An HTTP [`Source`]: probe with a length request, fetch validated byte ranges.
 
 use futures::StreamExt as _;
-use reqwest::header::{CONTENT_DISPOSITION, CONTENT_RANGE, RANGE};
+use reqwest::header::{CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 
 use crate::{ByteRange, ByteStream, Error, Probe, Source};
 
@@ -40,6 +40,12 @@ impl Source for HttpSource {
             .get(CONTENT_DISPOSITION)
             .and_then(|value| value.to_str().ok())
             .and_then(content_disposition_name);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
+            .filter(|value| !value.is_empty());
 
         if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
             let length = response
@@ -52,6 +58,7 @@ impl Source for HttpSource {
                 length,
                 supports_ranges: true,
                 filename,
+                content_type,
             });
         }
         if response.status().is_success() {
@@ -62,6 +69,7 @@ impl Source for HttpSource {
                 length,
                 supports_ranges: false,
                 filename,
+                content_type,
             });
         }
         Err(detail(&format!(

@@ -723,7 +723,7 @@ impl Progress for PlainProgress {
         *self.meter.borrow_mut() = Some(meter);
     }
 
-    fn wrote(&self, _index: usize, bytes: u64) {
+    fn received(&self, _index: usize, bytes: u64) {
         if let Some(meter) = self.meter.borrow_mut().as_mut() {
             if meter.advance(bytes, Duration::from_millis(200)) {
                 eprint!("{}", self.line(meter));
@@ -758,7 +758,7 @@ impl Progress for JsonProgress {
         *self.meter.borrow_mut() = Some(Meter::new(chunks.iter().sum()));
     }
 
-    fn wrote(&self, _index: usize, bytes: u64) {
+    fn received(&self, _index: usize, bytes: u64) {
         if let Some(meter) = self.meter.borrow_mut().as_mut() {
             if meter.advance(bytes, Duration::from_millis(200)) {
                 eprintln!(
@@ -856,8 +856,10 @@ impl Progress for BarProgress {
 
     fn received(&self, index: usize, bytes: u64) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
-            // Downloaded but not yet verified: buffered-ahead (lead) on this chunk's segment.
+            // Downloaded but not yet verified: buffered-ahead (lead) on this chunk's segment. The
+            // readout tracks download progress, so the meter counts received bytes.
             live.bar.advance_lead(index, bytes);
+            live.meter.add(bytes);
             if live.meter.ready(Duration::from_millis(60)) {
                 redraw(live);
             }
@@ -869,7 +871,6 @@ impl Progress for BarProgress {
             // Verified in order: confirmed (done) on this chunk's segment; the aggregate's contiguous
             // prefix is the sum of the segments' done, so it follows for free.
             live.bar.advance(index, bytes);
-            live.meter.add(bytes);
             if live.meter.ready(Duration::from_millis(60)) {
                 redraw(live);
             }

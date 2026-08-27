@@ -1,15 +1,24 @@
-//! The download engine: probe, plan, fetch chunks in parallel with range validation, resume, verify.
+//! The download engine: probe, plan, fetch chunks in parallel, reassemble in order, hash while writing.
+//!
+//! The pipeline is one-shot. Parallel chunks stream into bounded per-chunk channels; a single
+//! reassembler drains them in order and both hashes and writes each byte in the same pass. Nothing is
+//! read back: the digest is computed as the resource is written, not over the finished file.
 
 use core::time::Duration;
 use std::path::Path;
-use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use sha2::{Digest as _, Sha256};
-use tokio::io::AsyncReadExt as _;
+use tokio::io::AsyncWriteExt as _;
+use tokio::sync::mpsc;
 
 use crate::{ByteRange, Error, Source, plan};
+
+/// Buffers a chunk may hold before its fetch blocks on the reassembler. Peak memory is roughly
+/// `parts * CHUNK_BUFFER` byte buffers, so parallelism cannot grow memory without bound.
+const CHUNK_BUFFER: usize = 8;
 
 /// The outcome of a completed download.
 #[derive(Clone, Debug)]
@@ -23,8 +32,8 @@ pub struct Report {
 /// Download the resource behind `source` into `output`, fetching up to `parts` chunks in parallel and
 /// retrying a dropped chunk up to `retries` times, and return its verified length and SHA-256.
 ///
-/// Every chunk's range is validated by the source, a retry resumes from where it dropped, each chunk
-/// asserts it delivered exactly its bytes, and the hash is computed over the written file, so the
+/// Chunks stream through in order and are hashed as they are written, in a single pass. Every chunk's
+/// range is validated, a retry resumes from where it dropped, and the total length is gated, so the
 /// returned digest certifies the resource rather than whatever bytes happened to arrive.
 pub async fn download<S: Source>(
     source: &S,
@@ -40,36 +49,48 @@ pub async fn download<S: Source>(
     }
     let ranges = plan(probe.length, parts);
 
-    let file = tokio::fs::File::create(output).await.map_err(io)?;
-    file.set_len(probe.length).await.map_err(io)?;
-    let file = Arc::new(file.into_std().await);
-
-    // Structured concurrency: the source's futures are not `Send`, so chunks are driven together on
-    // this task rather than spawned. Each writes its own file region, so there is no shared cursor.
-    let mut chunks: FuturesUnordered<_> = ranges
-        .into_iter()
-        .map(|range| fetch_chunk(source, range, Arc::clone(&file), retries))
-        .collect();
-    while let Some(result) = chunks.next().await {
-        result?;
+    // One bounded channel per chunk. The chunk fetches fill them in parallel; the reassembler drains
+    // them in order, so the bytes leave this stage in resource order.
+    let mut senders = Vec::with_capacity(ranges.len());
+    let mut receivers = Vec::with_capacity(ranges.len());
+    for _ in &ranges {
+        let (tx, rx) = mpsc::channel::<Bytes>(CHUNK_BUFFER);
+        senders.push(tx);
+        receivers.push(rx);
     }
 
-    // Every positioned write was awaited above, so the bytes are in the OS by now and reading the file
-    // back hashes exactly what we wrote.
-    let sha256 = hash_file(output).await?;
+    let file = tokio::fs::File::create(output).await.map_err(io)?;
+
+    // Structured concurrency on one task: the source's futures are not `Send`. The fetchers feed the
+    // channels while the reassembler drains them, hashing and writing in a single pass.
+    let mut fetchers: FuturesUnordered<_> = ranges
+        .into_iter()
+        .zip(senders)
+        .map(|(range, tx)| fetch_into(source, range, tx, retries))
+        .collect();
+    let fetch_all = async {
+        while let Some(result) = fetchers.next().await {
+            result?;
+        }
+        Ok::<(), Error>(())
+    };
+
+    let (fetched, hashed) = tokio::join!(fetch_all, reassemble(receivers, file, probe.length));
+    fetched?;
+    let sha256 = hashed?;
     Ok(Report {
         length: probe.length,
         sha256,
     })
 }
 
-/// Fetch one chunk, resuming from its current offset with backoff if the connection drops, and
-/// asserting it ultimately delivered exactly its range so a short or long chunk is an
-/// [`Error::LengthMismatch`], never silent corruption.
-async fn fetch_chunk<S: Source>(
+/// Fetch one chunk into its channel, resuming from its current offset with backoff if the connection
+/// drops, and asserting it ultimately delivered exactly its range. Dropping the sender at the end
+/// closes the channel, which signals the reassembler the chunk is complete.
+async fn fetch_into<S: Source>(
     source: &S,
     range: ByteRange,
-    file: Arc<std::fs::File>,
+    tx: mpsc::Sender<Bytes>,
     retries: u32,
 ) -> Result<(), Error> {
     let mut offset = range.start;
@@ -83,7 +104,7 @@ async fn fetch_chunk<S: Source>(
         }
         // Resume the remaining bytes; the source validates the resumed range starts at `offset`, so a
         // retry can neither duplicate nor gap bytes.
-        match stream_range(source, offset, range.end, &file, &mut offset).await {
+        match stream_into(source, offset, range.end, &tx, &mut offset).await {
             Ok(()) => {}
             Err(error) => last_error = Some(error),
         }
@@ -104,17 +125,16 @@ async fn fetch_chunk<S: Source>(
     Ok(())
 }
 
-/// Stream the range `[start, end)` to the file at its offsets, advancing `offset` as bytes are written.
-/// On a mid-stream error `offset` reflects how far it got, so the caller can resume from there.
-async fn stream_range<S: Source>(
+/// Stream the range `[start, end)` into the channel, advancing `offset` as bytes are sent. On a
+/// mid-stream error `offset` reflects how far it got, so the caller can resume from there. The bounded
+/// channel applies backpressure, so a fast chunk cannot outrun the reassembler.
+async fn stream_into<S: Source>(
     source: &S,
     start: u64,
     end: u64,
-    file: &Arc<std::fs::File>,
+    tx: &mpsc::Sender<Bytes>,
     offset: &mut u64,
 ) -> Result<(), Error> {
-    use std::os::unix::fs::FileExt as _;
-
     let mut stream = source.fetch(ByteRange { start, end }).await?;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -122,15 +142,38 @@ async fn stream_range<S: Source>(
         if *offset + len > end {
             return Err(detail("source sent more bytes than the requested range"));
         }
-        let at = *offset;
-        let file = Arc::clone(file);
-        tokio::task::spawn_blocking(move || file.write_all_at(&chunk, at))
+        tx.send(chunk)
             .await
-            .map_err(join)?
-            .map_err(io)?;
+            .map_err(|_| detail("reassembler stopped receiving"))?;
         *offset += len;
     }
     Ok(())
+}
+
+/// Drain the per-chunk channels in order, hashing and writing each byte in one pass, and return the
+/// hex SHA-256. Gates the total length so a short assembly is an error, not a certified bad file.
+async fn reassemble(
+    receivers: Vec<mpsc::Receiver<Bytes>>,
+    mut file: tokio::fs::File,
+    total: u64,
+) -> Result<String, Error> {
+    let mut hasher = Sha256::new();
+    let mut written = 0u64;
+    for mut receiver in receivers {
+        while let Some(bytes) = receiver.recv().await {
+            hasher.update(&bytes);
+            file.write_all(&bytes).await.map_err(io)?;
+            written += bytes.len() as u64;
+        }
+    }
+    file.flush().await.map_err(io)?;
+    if written != total {
+        return Err(Error::LengthMismatch {
+            expected: total,
+            received: written,
+        });
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Exponential backoff before a retry, capped at a few seconds.
@@ -138,26 +181,7 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(100u64.saturating_mul(1u64 << attempt.min(6)))
 }
 
-/// Read `path` back and compute its SHA-256, hex-encoded.
-async fn hash_file(path: &Path) -> Result<String, Error> {
-    let mut file = tokio::fs::File::open(path).await.map_err(io)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).await.map_err(io)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
 fn io(error: std::io::Error) -> Error {
-    Error::Transport(Box::new(error))
-}
-
-fn join(error: tokio::task::JoinError) -> Error {
     Error::Transport(Box::new(error))
 }
 

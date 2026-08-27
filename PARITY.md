@@ -29,8 +29,8 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | output filename inference | 🟡 | URL basename; Content-Disposition TODO |
 | `-D, --directory-prefix`, `--no-directories` | ✅ | |
 | `-f, --overwrite` | ✅ | refuses to clobber without `-f`; `--force-append` TODO |
-| `--progress <bar|plain|json|none>`, `--no-bar` | 🟡 | bar only |
-| `--raw-sizes` | ⬜ | human sizes only |
+| `--progress <bar\|plain\|json\|none>`, `--no-bar` | ✅ | auto-detects a TTY |
+| `--raw-sizes` | ✅ | raw byte counts |
 | `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512 |
 | `--continue`, `--start-pos`, `--timeout`, `--cache-size` | ⬜ | see engine |
 
@@ -42,7 +42,7 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | human size readout (done / total) | ✅ | xbytes |
 | speed and ETA | ✅ | rolling readout |
 | per-chunk detail / labels | ⬜ | |
-| plain / json output modes | ⬜ | |
+| plain / json output modes | ✅ | `--progress plain\|json`, throttled |
 
 ## Deliberately different (➖)
 

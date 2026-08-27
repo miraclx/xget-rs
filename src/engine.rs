@@ -16,9 +16,11 @@ use tokio::sync::mpsc;
 
 use crate::{ByteRange, Error, Progress, Source, plan};
 
-/// Buffers a chunk may hold before its fetch blocks on the reassembler. Peak memory is roughly
-/// `parts * CHUNK_BUFFER` byte buffers, so parallelism cannot grow memory without bound.
-const CHUNK_BUFFER: usize = 8;
+/// Buffers a chunk may read ahead before its fetch blocks on the reassembler. This is the
+/// memory-versus-parallelism knob (the JS `--cache-size`): larger lets a chunk download further ahead
+/// of the in-order reassembler, so a slow early chunk head-of-line-blocks the others less, at the cost
+/// of `parts * CHUNK_BUFFER` buffered chunks of memory. TODO: expose as `--cache-size`.
+const CHUNK_BUFFER: usize = 64;
 
 /// The outcome of a completed download.
 #[derive(Clone, Debug)]

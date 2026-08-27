@@ -12,13 +12,15 @@ pub struct HttpSource {
 }
 
 impl HttpSource {
-    /// Build a source for `url`, sharing one connection pool across every chunk.
-    pub fn new(url: &str) -> Result<Self, Error> {
+    /// Build a source for `url`, sharing one connection pool across every chunk. `headers` are sent
+    /// with every request.
+    pub fn new(url: &str, headers: reqwest::header::HeaderMap) -> Result<Self, Error> {
         let url = reqwest::Url::parse(url).map_err(transport)?;
-        Ok(Self {
-            client: reqwest::Client::new(),
-            url,
-        })
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .map_err(transport)?;
+        Ok(Self { client, url })
     }
 }
 

@@ -42,6 +42,13 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 xbytes = { path = "../xbytes-rs" }
 xprogress = { path = "../xprogress-rs" }
 
+[dev-dependencies]
+# An in-process mock HTTP server for the HttpSource integration tests: it lets a test answer a range
+# request with a real 206 and Content-Range (or deliberately ignore the range) so the source's own
+# validation is exercised over a real loopback socket, with no live network. The engine's own paths
+# are covered by a fake Source and need no server.
+wiremock = "0.6"
+
 [lints.rust]
 unused_must_use = "deny"
 

@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on any warning, so a doc or build warning is a red build.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Formatting is checked with nightly rustfmt, because rustfmt.toml uses nightly-only options
+  # (group_imports, imports_granularity). It is the only step that needs nightly.
+  fmt:
+    name: rustfmt (nightly)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rustfmt
+    - run: cargo +nightly fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    # The pinned toolchain from rust-toolchain.toml (1.97.1) with clippy.
+    - uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+    - name: clippy (default features)
+      run: cargo clippy --all-targets -- -D warnings
+    - name: clippy (s3 feature)
+      run: cargo clippy --all-targets --features s3 -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.97.1
+    - uses: Swatinem/rust-cache@v2
+    - name: test (default features, all targets + doctests)
+      run: cargo test --all-targets && cargo test --doc
+    # The s3 code paths compile and their tests run without any live AWS. Build and test them so the
+    # feature does not rot; the integration tests here use a fake Source and an in-process mock server,
+    # never a live network.
+    - name: test (s3 feature)
+      run: cargo test --all-targets --features s3
+
+# Note: the docker harness under harness/ (go-httpbin + minio + toxiproxy) is a manual dev tool for
+# fault-injection and real-object-store testing. It needs containers and is intentionally not run in
+# CI; the Rust integration tests above cover the engine and HttpSource without any of that.

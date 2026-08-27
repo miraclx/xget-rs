@@ -49,9 +49,21 @@ rc=$?
 toxi_reset
 if [ $rc -ne 0 ]; then echo "  PASS  timed out as expected (exit $rc)"; else echo "  FAIL  expected a timeout failure"; fails=$((fails+1)); fi
 
-echo "== resume across runs (-c): interrupt, then continue =="
-head -c 9000000 /tmp/h-ref.bin > /tmp/h-cont.bin.part      # a partial from a prior run
-$XGET "$HTTP/$RANGE" /tmp/h-cont.bin -c -n 5 --progress none >/dev/null 2>&1
+echo "== resume across runs (-c): kill a live download, then continue =="
+rm -f /tmp/h-cont.bin*
+toxi_add httpbin '{"type":"bandwidth","attributes":{"rate":300},"stream":"downstream"}'
+$XGET "$TOXI/$RANGE" /tmp/h-cont.bin -f -n 8 --progress none >/dev/null 2>&1 &
+pid=$!
+sleep 3
+kill -9 "$pid" 2>/dev/null
+wait 2>/dev/null
+toxi_reset
+if [ -f /tmp/h-cont.bin.part ] && [ -f /tmp/h-cont.bin.part.st ]; then
+  echo "  PASS  interrupt left a .part and control file"
+else
+  echo "  FAIL  interrupt left no resumable state"; fails=$((fails+1))
+fi
+$XGET "$HTTP/$RANGE" /tmp/h-cont.bin -c -n 8 --progress none >/dev/null 2>&1
 ok $? "resume completed"
 check "resumed bytes match reference" "$REF" "$(sha /tmp/h-cont.bin)"
 

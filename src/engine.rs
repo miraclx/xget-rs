@@ -24,7 +24,7 @@ use tokio::sync::Notify;
 
 use crate::checksum::Hasher;
 use crate::plan::plan_range;
-use crate::{ByteRange, Checksum, Error, Options, Progress, Source};
+use crate::{ByteRange, Checksum, Error, Options, Progress, Source, control};
 
 /// The outcome of a completed download.
 #[derive(Clone, Debug)]
@@ -54,9 +54,12 @@ pub async fn download<S: Source, P: Progress>(
     let part = part_path(output);
 
     let hash = if probe.supports_ranges {
-        let start = resume_offset(&part, probe.length, options.resume).await?;
-        allocate(&part, probe.length, start).await?;
-        fetch_scatter(source, &part, start, probe.length, options, progress).await?
+        let plan = resume_plan(&part, probe.length, &options).await?;
+        allocate(&part, probe.length, !plan.resumed).await?;
+        if !plan.resumed {
+            control::begin(&part, probe.length, plan.parts, plan.start).await?;
+        }
+        fetch_scatter(source, &part, probe.length, &plan, options, progress).await?
     } else {
         if options.resume && file_len(&part).await > 0 {
             return Err(detail(
@@ -67,6 +70,7 @@ pub async fn download<S: Source, P: Progress>(
     };
 
     tokio::fs::rename(&part, output).await.map_err(io)?;
+    control::remove(&part).await;
     progress.finish();
     Ok(Report {
         length: probe.length,
@@ -82,19 +86,53 @@ fn part_path(output: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Where a resumed download should start: the length already on disk, or zero for a fresh download.
-/// Refuses a partial larger than the resource.
-async fn resume_offset(part: &Path, total: u64, resume: bool) -> Result<u64, Error> {
-    if !resume {
-        return Ok(0);
+/// How a scatter download starts: at a prefix offset, split into `parts` chunks, with some chunks
+/// already on disk from a previous run.
+struct ResumePlan {
+    /// The byte offset the chunk plan starts at.
+    start: u64,
+    /// How many chunks to split the remaining range into.
+    parts: u32,
+    /// Chunk indices already fully written on a previous run.
+    completed: Vec<usize>,
+    /// Whether this continues an existing `.part` (so it must not be truncated).
+    resumed: bool,
+}
+
+/// Work out how a download starts. Fresh, it is the whole resource in `options.parts` chunks. Resuming,
+/// the control file beside the `.part` says how far it got; a `.part` with no control file cannot be
+/// safely resumed (its holes are unknown), so it is an error rather than a corrupt result.
+async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<ResumePlan, Error> {
+    if !options.resume {
+        return Ok(ResumePlan {
+            start: 0,
+            parts: options.parts,
+            completed: Vec::new(),
+            resumed: false,
+        });
     }
-    let existing = file_len(part).await;
-    if existing > total {
-        return Err(detail(
-            "existing file is larger than the resource; refusing to resume",
-        ));
+    if let Some(control) = control::read(part).await
+        && control.total == total
+    {
+        return Ok(ResumePlan {
+            start: control.start,
+            parts: control.parts,
+            completed: control.completed,
+            resumed: true,
+        });
     }
-    Ok(existing)
+    if file_len(part).await == 0 {
+        Ok(ResumePlan {
+            start: 0,
+            parts: options.parts,
+            completed: Vec::new(),
+            resumed: false,
+        })
+    } else {
+        Err(detail(
+            "cannot resume: no saved state for this partial (delete the .part to start over)",
+        ))
+    }
 }
 
 /// The size of `part`, or zero if it does not exist.
@@ -106,9 +144,9 @@ async fn file_len(part: &Path) -> u64 {
 }
 
 /// Preallocate `part` to `total` bytes as a sparse file so every chunk offset exists to be written. A
-/// fresh download (`start == 0`) truncates first; a resume keeps the bytes already there and extends.
-async fn allocate(part: &Path, total: u64, start: u64) -> Result<(), Error> {
-    let file = if start == 0 {
+/// `fresh` download truncates first; a resume keeps the bytes already there and extends.
+async fn allocate(part: &Path, total: u64, fresh: bool) -> Result<(), Error> {
+    let file = if fresh {
         File::create(part).await.map_err(io)?
     } else {
         OpenOptions::new()
@@ -128,17 +166,27 @@ async fn allocate(part: &Path, total: u64, start: u64) -> Result<(), Error> {
 async fn fetch_scatter<S: Source, P: Progress>(
     source: &S,
     part: &Path,
-    start: u64,
     total: u64,
+    plan: &ResumePlan,
     options: Options,
     progress: &P,
 ) -> Result<Option<String>, Error> {
-    let ranges = plan_range(start, total, options.parts);
+    let start = plan.start;
+    let completed = &plan.completed;
+    let ranges = plan_range(start, total, plan.parts);
     let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
     progress.start(&sizes);
 
+    // Chunks already on disk from a previous run start full, so the verifier counts them and reads them
+    // back, and their fetch is skipped.
+    let mut received = vec![0u64; ranges.len()];
+    for &index in completed {
+        if let Some(range) = ranges.get(index) {
+            received[index] = range.len();
+        }
+    }
     let shared = Rc::new(Shared {
-        received: RefCell::new(vec![0u64; ranges.len()]),
+        received: RefCell::new(received),
         notify: Notify::new(),
         failed: Cell::new(false),
     });
@@ -149,7 +197,17 @@ async fn fetch_scatter<S: Source, P: Progress>(
         .iter()
         .copied()
         .enumerate()
-        .map(|(index, range)| scatter_one(source, part, index, range, options, &shared, progress))
+        .map(|(index, range)| {
+            let done = completed.contains(&index);
+            let shared = Rc::clone(&shared);
+            async move {
+                if done {
+                    Ok(())
+                } else {
+                    scatter_one(source, part, index, range, options, &shared, progress).await
+                }
+            }
+        })
         .collect();
     let drive = async {
         let mut outcome = Ok(());
@@ -279,6 +337,8 @@ async fn scatter_one<S: Source, P: Progress>(
             received,
         }));
     }
+    // Record the whole chunk as on disk, so a later run can skip it.
+    control::mark_done(part, index).await?;
     Ok(())
 }
 

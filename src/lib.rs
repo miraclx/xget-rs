@@ -15,6 +15,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 
 mod checksum;
+mod control;
 mod engine;
 mod http;
 mod mirror;

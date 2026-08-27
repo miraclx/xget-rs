@@ -35,6 +35,8 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
 tokio-util = { version = "0.7", optional = true, features = ["io"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 # Sibling crates from the same rewrite effort.
 xbytes = { path = "../xbytes-rs" }

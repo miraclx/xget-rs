@@ -53,8 +53,22 @@ pub async fn download<S: Source, P: Progress>(
     // also what a `--continue` resume picks up.
     let part = part_path(output);
 
+    tracing::debug!(
+        length = probe.length,
+        supports_ranges = probe.supports_ranges,
+        content_type = probe.content_type.as_deref(),
+        "probed resource"
+    );
+
     let hash = if probe.supports_ranges {
         let plan = resume_plan(&part, probe.length, &options).await?;
+        tracing::debug!(
+            start = plan.start,
+            parts = plan.parts,
+            already_done = plan.completed.len(),
+            resumed = plan.resumed,
+            "planned download"
+        );
         allocate(&part, probe.length, !plan.resumed).await?;
         if !plan.resumed {
             control::begin(&part, probe.length, plan.parts, plan.start).await?;
@@ -315,6 +329,12 @@ async fn scatter_one<S: Source, P: Progress>(
     };
     let mut offset = range.start;
     let mut last_error = None;
+    tracing::debug!(
+        chunk = index,
+        start = range.start,
+        end = range.end,
+        "opening chunk"
+    );
     for attempt in 0..=options.retries {
         if offset >= range.end {
             break;
@@ -327,7 +347,10 @@ async fn scatter_one<S: Source, P: Progress>(
             .await
         {
             Ok(()) => {}
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                tracing::warn!(chunk = index, attempt, resume_from = offset, error = %error, "chunk failed, retrying");
+                last_error = Some(error);
+            }
         }
     }
     let received = offset - range.start;
@@ -337,6 +360,7 @@ async fn scatter_one<S: Source, P: Progress>(
             received,
         }));
     }
+    tracing::debug!(chunk = index, "chunk complete");
     // Record the whole chunk as on disk, so a later run can skip it.
     control::mark_done(part, index).await?;
     Ok(())

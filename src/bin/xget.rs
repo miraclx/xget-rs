@@ -84,6 +84,28 @@ struct Cli {
     /// Report raw byte counts instead of human-readable sizes.
     #[arg(long)]
     raw_sizes: bool,
+    /// Verbose diagnostics on stderr: `-v` for chunk ranges, retries, and errors as they happen; `-vv`
+    /// for more. Off by default.
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+
+/// Turn on diagnostic tracing to stderr at a level chosen by `-v` count. Off when zero, so a normal run
+/// emits nothing. `RUST_LOG` overrides the level if set.
+fn init_tracing(verbose: u8) {
+    if verbose == 0 {
+        return;
+    }
+    let level = if verbose == 1 { "debug" } else { "trace" };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(format!("libxget={level},xget={level}"))
+    });
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time()
+        .init();
 }
 
 /// How to report progress while downloading.
@@ -116,6 +138,7 @@ async fn run() -> eyre::Result<()> {
     // live there instead of being exported by hand. A missing file is not an error.
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
+    init_tracing(cli.verbose);
     let headers = parse_headers(&cli.headers)?;
     let source = build_source(&cli, &headers).await?;
     let mode = resolve_mode(&cli);

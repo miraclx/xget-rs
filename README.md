@@ -14,9 +14,10 @@ offset, reassembles them in order, gates on the exact length, and streams the by
 reported digest is trustworthy. A source that ignores a range, or a length that does not match, is a
 typed error, never a silent bad file.
 
-The byte source is pluggable behind the `Source` trait: HTTP range GET today, S3 or a theia/bifrost
-peer (parallel verified download by public key) tomorrow. The parallel-resume-verify engine is written
-once and works over any of them; a source that cannot serve ranges is fetched as a single stream.
+The byte source is pluggable behind the `Source` trait: HTTP range GET, and S3 (behind the `s3`
+feature, for any S3-compatible store via `--endpoint-url`); a theia/bifrost peer (verified download by
+public key) is next. The parallel-resume-verify engine is written once and works over any of them; a
+source that cannot serve ranges is fetched as a single stream.
 
 ## Status
 

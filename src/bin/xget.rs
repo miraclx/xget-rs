@@ -107,8 +107,12 @@ async fn main() -> eyre::Result<()> {
         preamble(&cli, probe.as_ref(), &output);
     }
 
-    // A bare `--expect` hex uses the -s algorithm; an `algo:hex` form pins the algorithm itself.
-    let expected = cli.expect.as_deref().map(parse_expect).transpose()?;
+    // `--expect` is a literal digest or a URL to a checksum file; resolve it (fetching the sidecar if
+    // needed) to an optional pinned algorithm and the expected hex.
+    let expected = match cli.expect.as_deref() {
+        Some(value) => Some(resolve_expect(parse_expect(value)?).await?),
+        None => None,
+    };
     let checksum = match &expected {
         Some((Some(algo), _)) => *algo,
         Some((None, _)) if matches!(cli.checksum, Checksum::None) => {
@@ -143,12 +147,84 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Parse an `--expect` value into an optional pinned algorithm and the lowercase hex digest.
-fn parse_expect(value: &str) -> eyre::Result<(Option<Checksum>, String)> {
-    match value.split_once(':') {
-        Some((algo, hex)) => Ok((Some(algo.parse()?), hex.to_ascii_lowercase())),
-        None => Ok((None, value.to_ascii_lowercase())),
+/// An `--expect` value: either a checksum given inline, or a URL to a checksum file to fetch. Both
+/// carry an optional pinned algorithm (from an `algo:` prefix inline, or the sidecar's extension).
+enum Expect {
+    /// A digest given on the command line.
+    Literal {
+        /// The algorithm, if pinned by an `algo:` prefix.
+        algo: Option<Checksum>,
+        /// The expected lowercase hex digest.
+        hex: String,
+    },
+    /// A URL to a checksum file, as published beside many releases (`file.tar.gz.sha256`).
+    Sidecar {
+        /// The algorithm, if inferred from the URL's extension.
+        algo: Option<Checksum>,
+        /// The checksum file's URL.
+        url: String,
+    },
+}
+
+/// Parse an `--expect` value: a URL (contains `://`) becomes a [`Expect::Sidecar`] with the algorithm
+/// inferred from its extension; otherwise an `algo:hex` or bare `hex` [`Expect::Literal`].
+fn parse_expect(value: &str) -> eyre::Result<Expect> {
+    if value.contains("://") {
+        return Ok(Expect::Sidecar {
+            algo: algo_from_extension(value),
+            url: value.to_owned(),
+        });
     }
+    match value.split_once(':') {
+        Some((algo, hex)) => Ok(Expect::Literal {
+            algo: Some(algo.parse()?),
+            hex: hex.to_ascii_lowercase(),
+        }),
+        None => Ok(Expect::Literal {
+            algo: None,
+            hex: value.to_ascii_lowercase(),
+        }),
+    }
+}
+
+/// Resolve an [`Expect`] to a pinned algorithm and the expected hex, fetching and parsing a checksum
+/// file if the value was a URL. A checksum file's first hex-looking token is taken, so both a bare
+/// digest and the usual `<hex>  <filename>` line both work.
+async fn resolve_expect(expect: Expect) -> eyre::Result<(Option<Checksum>, String)> {
+    match expect {
+        Expect::Literal { algo, hex } => Ok((algo, hex)),
+        Expect::Sidecar { algo, url } => {
+            let body = reqwest::get(&url).await?.error_for_status()?.text().await?;
+            let hex = body
+                .split_whitespace()
+                .find(|token| is_hex_digest(token))
+                .ok_or_else(|| eyre::eyre!("no checksum found at {url}"))?
+                .to_ascii_lowercase();
+            Ok((algo, hex))
+        }
+    }
+}
+
+/// Infer a checksum algorithm from a checksum file's extension, e.g. `.sha256` or `.sha256sum`.
+fn algo_from_extension(url: &str) -> Option<Checksum> {
+    let lower = url.to_ascii_lowercase();
+    let matches = |suffixes: &[&str]| suffixes.iter().any(|suffix| lower.ends_with(suffix));
+    if matches(&[".sha256", ".sha256sum"]) {
+        Some(Checksum::Sha256)
+    } else if matches(&[".sha512", ".sha512sum"]) {
+        Some(Checksum::Sha512)
+    } else if matches(&[".sha1", ".sha1sum"]) {
+        Some(Checksum::Sha1)
+    } else if matches(&[".md5", ".md5sum"]) {
+        Some(Checksum::Md5)
+    } else {
+        None
+    }
+}
+
+/// Whether `token` is a hex string of a checksum's length (md5, sha1, sha256, or sha512).
+fn is_hex_digest(token: &str) -> bool {
+    matches!(token.len(), 32 | 40 | 64 | 128) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Print the block shown before a live bar: the URL, how many chunks, the length and media type, and

@@ -5,6 +5,8 @@ A chunked, parallel, resumable, verified fetch engine over a pluggable byte sour
 > Early. A Rust rewrite of the NodeJS [`libxget`](https://github.com/miraclx/libxget-js), built so it
 > can never hand back a corrupt file with a valid-looking hash.
 
+![xget fetching a file in parallel chunks](media/download.gif)
+
 ## What it is
 
 libxget plans a resource into chunks, fetches them in parallel, resumes a dropped chunk from its

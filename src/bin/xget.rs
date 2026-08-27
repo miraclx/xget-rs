@@ -22,9 +22,9 @@ const BAR_MAX: u16 = 48;
 
 // ANSI colors for the live readout. Each code has zero display width, so it never affects the bar's
 // own width accounting; it only tints the text that follows the bar.
-const GREEN: &str = "\x1b[32m";
-const CYAN: &str = "\x1b[36m";
-const YELLOW: &str = "\x1b[33m";
+const GREEN: &str = "\x1b[1;32m";
+const CYAN: &str = "\x1b[1;36m";
+const YELLOW: &str = "\x1b[1;33m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
@@ -729,7 +729,12 @@ struct BarProgress {
 }
 
 struct Live {
-    bar: Bar,
+    /// One segment per chunk, filled by each chunk's received bytes: the per-chunk download progress,
+    /// which advances in parallel.
+    chunks: Bar,
+    /// A single-segment bar for the whole transfer: done is bytes written and verified, lead is bytes
+    /// received, so its two-tone shows how far the download runs ahead of the in-order verify.
+    aggregate: Bar,
     target: DrawTarget,
     width: u16,
     multi: bool,
@@ -761,7 +766,9 @@ impl Progress for BarProgress {
             .with_blank('┅')
             .with_separator('┆')
             .with_color(Color::Cyan);
-        let bar = Bar::new(chunks.iter().copied()).with_style(style);
+        let total: u64 = chunks.iter().sum();
+        let chunk_bar = Bar::new(chunks.iter().copied()).with_style(style.clone());
+        let aggregate = Bar::new([total]).with_style(style);
         let target = DrawTarget::from_env();
         // Fill the space beside the stats, but never past a fraction of the screen, so the bar scales
         // with the terminal up to a cap and only shrinks past that when the stats would clip.
@@ -771,12 +778,13 @@ impl Progress for BarProgress {
         let width = cap.min(columns.saturating_sub(reserve)).max(8);
         let mut slot = self.inner.borrow_mut();
         *slot = Some(Live {
-            bar,
+            chunks: chunk_bar,
+            aggregate,
             target,
             width,
             multi,
             prev_lines: 0,
-            meter: Meter::new(chunks.iter().sum()),
+            meter: Meter::new(total),
             raw: self.raw,
         });
         if let Some(live) = slot.as_mut() {
@@ -786,16 +794,19 @@ impl Progress for BarProgress {
 
     fn received(&self, index: usize, bytes: u64) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
-            live.bar.advance_lead(index, bytes);
+            // Each chunk's own download progress, and the aggregate's received-ahead marker.
+            live.chunks.advance(index, bytes);
+            live.aggregate.advance_lead(0, bytes);
             if live.meter.ready(Duration::from_millis(60)) {
                 redraw(live);
             }
         }
     }
 
-    fn wrote(&self, index: usize, bytes: u64) {
+    fn wrote(&self, _index: usize, bytes: u64) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
-            live.bar.advance(index, bytes);
+            // Writing and hashing is in order, so it advances only the aggregate's verified frontier.
+            live.aggregate.advance(0, bytes);
             live.meter.add(bytes);
             if live.meter.ready(Duration::from_millis(60)) {
                 redraw(live);
@@ -833,13 +844,13 @@ fn frame(live: &Live) -> String {
     if live.multi {
         format!(
             "  {DIM}┏{RESET} {} {DIM}┓{RESET}  {rate}\n  {DIM}┗{RESET} {} {DIM}┛{RESET}  {done}/{total}",
-            live.bar.render_aggregate(live.width),
-            live.bar.render(live.width),
+            live.aggregate.render(live.width),
+            live.chunks.render(live.width),
         )
     } else {
         format!(
             "  {DIM}[{RESET}{}{DIM}]{RESET}  {rate}  {done}/{total}",
-            live.bar.render_aggregate(live.width),
+            live.aggregate.render(live.width),
         )
     }
 }

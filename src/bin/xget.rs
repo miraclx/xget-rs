@@ -72,12 +72,12 @@ struct Cli {
     #[arg(long, value_name = "[ALGO:]HEX")]
     expect: Option<String>,
     /// Fail a chunk if no data arrives for this many seconds, so its retry can resume it.
-    #[arg(long, value_name = "SECS")]
-    timeout: Option<f64>,
+    #[arg(long, value_name = "SECS", value_parser = parse_timeout)]
+    timeout: Option<Duration>,
     /// Memory budget for bytes buffered ahead of writing, e.g. `32MiB`, `1GiB`, or a bare byte count.
     /// Split across the chunks; larger lets them race further ahead of the hash. Trades memory for
     /// smoother throughput.
-    #[arg(long, value_name = "SIZE", default_value = "32MiB", value_parser = parse_size)]
+    #[arg(long, value_name = "SIZE", default_value = "32MiB", value_parser = parse_cache)]
     cache_size: u64,
     /// Progress output: auto (a bar on a terminal, else plain lines), bar, plain, json, or none.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
@@ -162,7 +162,7 @@ async fn run() -> eyre::Result<()> {
         parts: cli.chunks,
         retries: cli.tries,
         checksum,
-        timeout: cli.timeout.map(Duration::from_secs_f64),
+        timeout: cli.timeout,
         resume: cli.resume,
         cache: cli.cache_size,
     };
@@ -520,35 +520,24 @@ fn url_basename(url: &str) -> eyre::Result<String> {
     }
 }
 
-/// Parse a byte size like `512MiB`, `1GiB`, `1000000`, or `512K`. IEC suffixes (`KiB`/`MiB`/`GiB`/
-/// `TiB`, and a bare `K`/`M`/`G`/`T`) are powers of 1024; SI suffixes (`KB`/`MB`/`GB`/`TB`) powers of
-/// 1000; no suffix is bytes.
-fn parse_size(value: &str) -> Result<u64, String> {
-    let trimmed = value.trim();
-    let split = trimmed
-        .find(|c: char| c.is_ascii_alphabetic())
-        .unwrap_or(trimmed.len());
-    let (number, unit) = trimmed.split_at(split);
-    let number: f64 = number
-        .trim()
+/// Parse a byte size with xbytes, e.g. `32MiB`, `1GiB`, or `512KB`. A unit is required (xbytes rejects
+/// a bare number), which keeps the meaning unambiguous.
+fn parse_cache(value: &str) -> Result<u64, String> {
+    value
+        .parse::<ByteSize>()
+        .map(|size| size.byte_count() as u64)
+        .map_err(|error| error.to_string())
+}
+
+/// Parse an inactivity timeout given in seconds into a [`Duration`].
+fn parse_timeout(value: &str) -> Result<Duration, String> {
+    let seconds: f64 = value
         .parse()
-        .map_err(|_| format!("invalid size: `{value}`"))?;
-    if !number.is_finite() || number < 0.0 {
-        return Err(format!("invalid size: `{value}`"));
+        .map_err(|_| format!("invalid seconds: `{value}`"))?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(format!("invalid seconds: `{value}`"));
     }
-    let factor = match unit.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1.0,
-        "k" | "kib" => 1024.0,
-        "m" | "mib" => 1024.0_f64.powi(2),
-        "g" | "gib" => 1024.0_f64.powi(3),
-        "t" | "tib" => 1024.0_f64.powi(4),
-        "kb" => 1000.0,
-        "mb" => 1000.0_f64.powi(2),
-        "gb" => 1000.0_f64.powi(3),
-        "tb" => 1000.0_f64.powi(4),
-        other => return Err(format!("unknown size unit `{other}` in `{value}`")),
-    };
-    Ok((number * factor) as u64)
+    Ok(Duration::from_secs_f64(seconds))
 }
 
 /// Parse a retry count, accepting `inf`/`infinite` as unlimited.

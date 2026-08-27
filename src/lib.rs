@@ -13,6 +13,8 @@ use core::time::Duration;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use xbytes::ByteSize;
+use xbytes::sizes::all::MEBI_BYTE;
 
 mod checksum;
 mod engine;
@@ -68,7 +70,7 @@ impl Default for Options {
             checksum: Checksum::Sha256,
             timeout: None,
             resume: false,
-            cache: 32 * 1024 * 1024,
+            cache: ByteSize::of(32u64, MEBI_BYTE).byte_count() as u64,
         }
     }
 }

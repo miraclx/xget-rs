@@ -17,6 +17,8 @@ use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use xbytes::ByteSize;
+use xbytes::sizes::all::MEBI_BYTE;
 
 use crate::plan::plan_range;
 use crate::{ByteRange, Checksum, Error, Options, Progress, Source};
@@ -50,7 +52,9 @@ impl Sink {
 
 /// The smallest per-chunk memory budget, and so the largest single buffer that can ever be admitted.
 /// Network reads are far smaller, so a buffer always fits and a chunk can never deadlock on its budget.
-const MIN_CHUNK_BUDGET: u64 = 4 * 1024 * 1024;
+fn min_chunk_budget() -> u64 {
+    ByteSize::of(4u64, MEBI_BYTE).byte_count() as u64
+}
 
 /// The bytes already present in the output when resuming: a read handle positioned at the start and the
 /// number of bytes to fold into the checksum before hashing anything new.
@@ -176,7 +180,7 @@ async fn fetch_ranged<S: Source, P: Progress>(
     // reassembler drains them in order, so the bytes leave this stage in resource order. The budget is
     // per chunk, not shared, so a late chunk buffering ahead can never starve the frontier chunk the
     // reassembler is waiting on. The total memory ceiling is `parts * per_chunk`, about `cache`.
-    let per_chunk = (options.cache / ranges.len().max(1) as u64).max(MIN_CHUNK_BUDGET);
+    let per_chunk = (options.cache / ranges.len().max(1) as u64).max(min_chunk_budget());
     let mut sinks = Vec::with_capacity(ranges.len());
     let mut receivers = Vec::with_capacity(ranges.len());
     for _ in &ranges {
@@ -223,7 +227,9 @@ async fn fetch_whole<S: Source, P: Progress>(
     let (tx, rx) = mpsc::unbounded_channel::<Buffered>();
     let sink = Sink {
         tx,
-        budget: Arc::new(Semaphore::new(options.cache.max(MIN_CHUNK_BUDGET) as usize)),
+        budget: Arc::new(Semaphore::new(
+            options.cache.max(min_chunk_budget()) as usize
+        )),
     };
     let fetch = fetch_all_into(source, sink, options.timeout, progress);
     let (fetched, hashed) = tokio::join!(

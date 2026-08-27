@@ -1592,6 +1592,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 name = "libxget"
 version = "0.1.0"
 dependencies = [
+ "anstyle",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
@@ -3147,6 +3148,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 name = "xprogress"
 version = "0.1.0"
 dependencies = [
+ "anstyle",
  "terminal_size",
  "unicode-width",
 ]

@@ -16,7 +16,7 @@ use xbytes::ByteSize;
 use xbytes::sizes::BYTE;
 
 use crate::expect::{Expect, parse_expect, resolve_expect};
-use crate::progress::{DIM, RESET, Reporter};
+use crate::progress::{DIM, Reporter};
 
 /// Download a URL in parallel chunks, verify it, and print its SHA-256.
 #[derive(Parser)]
@@ -155,7 +155,11 @@ async fn run() -> eyre::Result<()> {
         && let Some((algo, hex)) = probe.as_ref().and_then(|probe| probe.checksum.clone())
     {
         if mode != ProgressMode::Json {
-            eprintln!("{DIM}Verifying against the source's stored {algo} checksum{RESET}");
+            eprintln!(
+                "{}Verifying against the source's stored {algo} checksum{}",
+                DIM.render(),
+                DIM.render_reset()
+            );
         }
         expected = Some((Some(algo), hex));
     }
@@ -261,7 +265,7 @@ async fn build_s3_source(_rest: &str, _endpoint_url: Option<String>) -> eyre::Re
 /// Print the block shown before a live bar: the URL, how many chunks, the length and media type, and
 /// where the file is being written.
 fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path) {
-    eprintln!("{DIM}URL:{RESET} {}", cli.url);
+    eprintln!("{}URL:{} {}", DIM.render(), DIM.render_reset(), cli.url);
     let chunks = match probe {
         Some(probe) if probe.supports_ranges => {
             libxget::plan(probe.length, cli.chunks).len().max(1)
@@ -269,18 +273,27 @@ fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path) {
         Some(_) => 1,
         None => cli.chunks as usize,
     };
-    eprintln!("{DIM}Chunks:{RESET} {chunks}");
+    eprintln!("{}Chunks:{} {chunks}", DIM.render(), DIM.render_reset());
     match probe {
         Some(probe) => {
             let size = fmt_size(probe.length, cli.raw_sizes);
             match &probe.content_type {
-                Some(kind) => eprintln!("{DIM}Length:{RESET} {size} [{kind}]"),
-                None => eprintln!("{DIM}Length:{RESET} {size}"),
+                Some(kind) => eprintln!(
+                    "{}Length:{} {size} [{kind}]",
+                    DIM.render(),
+                    DIM.render_reset()
+                ),
+                None => eprintln!("{}Length:{} {size}", DIM.render(), DIM.render_reset()),
             }
         }
-        None => eprintln!("{DIM}Length:{RESET} unknown"),
+        None => eprintln!("{}Length:{} unknown", DIM.render(), DIM.render_reset()),
     }
-    eprintln!("{DIM}Saving:{RESET} '{}'", output.display());
+    eprintln!(
+        "{}Saving:{} '{}'",
+        DIM.render(),
+        DIM.render_reset(),
+        output.display()
+    );
 }
 
 /// Print the closing summary: how much was fetched in how long, and the verified checksum if one was

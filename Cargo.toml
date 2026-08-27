@@ -16,6 +16,7 @@ aws-credential-types = ["dep:aws-credential-types"]
 aws-smithy-types = ["dep:aws-smithy-types"]
 
 [dependencies]
+anstyle = "1"
 aws-config = { version = "1.8", optional = true }
 aws-credential-types = { version = "1.2.10", optional = true }
 aws-sdk-s3 = { version = "1.96", optional = true }

@@ -3,7 +3,7 @@ use core::time::Duration;
 use std::time::Instant;
 
 use libxget::Progress;
-use xprogress::{Bar, Color, DrawTarget, Style};
+use xprogress::{AnsiColor, Bar, DrawTarget, Style};
 
 use crate::speedometer::Speedometer;
 use crate::{ProgressMode, fmt_size};
@@ -14,13 +14,18 @@ const BAR_MAX_PCT: u16 = 40;
 /// The bar never grows past this many cells, however wide the terminal, keeping the stats in focus.
 const BAR_MAX: u16 = 48;
 
-// ANSI colors for the live readout. Each code has zero display width, so it never affects the bar's
-// own width accounting; it only tints the text that follows the bar.
-const GREEN: &str = "\x1b[1;32m";
-const BLUE: &str = "\x1b[1;94m";
-const YELLOW: &str = "\x1b[1;33m";
-pub(crate) const DIM: &str = "\x1b[2m";
-pub(crate) const RESET: &str = "\x1b[0m";
+// Styles for the live readout text. anstyle renders each with its own reset, and the codes have zero
+// display width, so they never affect the bar's own width accounting.
+const GREEN: anstyle::Style = anstyle::Style::new()
+    .fg_color(Some(anstyle::Color::Ansi(AnsiColor::Green)))
+    .bold();
+const BLUE: anstyle::Style = anstyle::Style::new()
+    .fg_color(Some(anstyle::Color::Ansi(AnsiColor::BrightBlue)))
+    .bold();
+const YELLOW: anstyle::Style = anstyle::Style::new()
+    .fg_color(Some(anstyle::Color::Ansi(AnsiColor::Yellow)))
+    .bold();
+pub(crate) const DIM: anstyle::Style = anstyle::Style::new().dimmed();
 
 /// The chosen progress reporter, dispatching to whichever mode was selected. Every variant reports the
 /// same download; they differ only in how they render it.
@@ -344,9 +349,9 @@ impl Progress for BarProgress {
             .with_blank('━')
             .with_header('╸')
             .with_separator('┆')
-            .with_color(Color::BrightCyan)
-            .with_lead_color(Color::Cyan)
-            .with_blank_color(Color::BrightBlack);
+            .with_color(AnsiColor::BrightCyan)
+            .with_lead_color(AnsiColor::Cyan)
+            .with_blank_color(AnsiColor::BrightBlack);
         let total: u64 = chunks.iter().sum();
         let bar = Bar::new(chunks.iter().copied()).with_style(style);
         let target = DrawTarget::from_env();
@@ -435,18 +440,38 @@ fn frame(live: &Live) -> String {
     let eta = format_eta(meter.eta());
     let done = fmt_size(meter.done, live.raw);
     let total = fmt_size(meter.total, live.raw);
-    let rate = format!("{GREEN}{pct:>3}%{RESET}  {BLUE}{speed}/s{RESET}  {YELLOW}{eta}{RESET}");
-    let size = format!("{GREEN}{done}/{total}{RESET}");
+    let rate = format!(
+        "{}{pct:>3}%{}  {}{speed}/s{}  {}{eta}{}",
+        GREEN.render(),
+        GREEN.render_reset(),
+        BLUE.render(),
+        BLUE.render_reset(),
+        YELLOW.render(),
+        YELLOW.render_reset(),
+    );
+    let size = format!("{}{done}/{total}{}", GREEN.render(), GREEN.render_reset());
     if live.multi {
         format!(
-            "  {DIM}┏{RESET} {} {DIM}┓{RESET}  {rate}\n  {DIM}┗{RESET} {} {DIM}┛{RESET}  {size}",
+            "  {}┏{} {} {}┓{}  {rate}\n  {}┗{} {} {}┛{}  {size}",
+            DIM.render(),
+            DIM.render_reset(),
             live.bar.render_aggregate(live.width),
+            DIM.render(),
+            DIM.render_reset(),
+            DIM.render(),
+            DIM.render_reset(),
             live.bar.render(live.width),
+            DIM.render(),
+            DIM.render_reset(),
         )
     } else {
         format!(
-            "  {DIM}[{RESET}{}{DIM}]{RESET}  {rate}  {size}",
+            "  {}[{}{}{}]{}  {rate}  {size}",
+            DIM.render(),
+            DIM.render_reset(),
             live.bar.render_aggregate(live.width),
+            DIM.render(),
+            DIM.render_reset(),
         )
     }
 }

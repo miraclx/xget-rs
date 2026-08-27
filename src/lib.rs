@@ -87,13 +87,16 @@ impl ByteRange {
 }
 
 /// What a [`Source`] reports about a resource before fetching.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Probe {
     /// Total length in bytes.
     pub length: u64,
     /// Whether the source can serve byte ranges, and so be fetched in parallel chunks. When false the
     /// engine fetches the whole resource as a single stream.
     pub supports_ranges: bool,
+    /// A filename the source suggests for the resource (from an HTTP `Content-Disposition`), if any and
+    /// after stripping any path components. A caller may use it to name the output.
+    pub filename: Option<String>,
 }
 
 /// A stream of byte chunks from a source, or a fetch error.
@@ -109,13 +112,12 @@ pub trait Source {
     /// Probe the resource for its length and range support.
     async fn probe(&self) -> Result<Probe, Error>;
 
-    /// Fetch the given byte range as a stream. The engine requires the returned bytes to cover exactly
-    /// `range`; a source that serves a different range is rejected.
-    async fn fetch(&self, range: ByteRange) -> Result<ByteStream, Error>;
-
-    /// Fetch the whole resource as a single stream, used when [`Probe::supports_ranges`] is false and
-    /// the resource cannot be split into parallel chunks.
-    async fn fetch_all(&self) -> Result<ByteStream, Error>;
+    /// Fetch a byte range as a stream, or the whole resource when `range` is `None`.
+    ///
+    /// A `Some(range)` fetch must be honored exactly: the engine rejects a source that serves different
+    /// bytes, which is what makes a parallel chunked download trustworthy. A `None` fetch is the whole
+    /// resource in one stream, used when [`Probe::supports_ranges`] is false.
+    async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error>;
 }
 
 /// Reports download progress. The engine calls [`Progress::start`] once with the planned chunk sizes,

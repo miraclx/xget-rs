@@ -187,7 +187,7 @@ async fn fetch_all_into<S: Source, P: Progress>(
     timeout: Option<Duration>,
     progress: &P,
 ) -> Result<(), Error> {
-    let mut stream = source.fetch_all().await?;
+    let mut stream = source.fetch(None).await?;
     while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
         let len = chunk.len() as u64;
         tx.send(chunk)
@@ -279,10 +279,10 @@ async fn stream_into<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<(), Error> {
     let mut stream = source
-        .fetch(ByteRange {
+        .fetch(Some(ByteRange {
             start: *offset,
             end,
-        })
+        }))
         .await?;
     while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
         let len = chunk.len() as u64;

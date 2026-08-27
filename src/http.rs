@@ -1,7 +1,7 @@
 //! An HTTP [`Source`]: probe with a length request, fetch validated byte ranges.
 
 use futures::StreamExt as _;
-use reqwest::header::{CONTENT_RANGE, RANGE};
+use reqwest::header::{CONTENT_DISPOSITION, CONTENT_RANGE, RANGE};
 
 use crate::{ByteRange, ByteStream, Error, Probe, Source};
 
@@ -35,16 +35,23 @@ impl Source for HttpSource {
             .await
             .map_err(transport)?;
 
+        let filename = response
+            .headers()
+            .get(CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(content_disposition_name);
+
         if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            let header = response
+            let length = response
                 .headers()
                 .get(CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
                 .and_then(content_range_total)
                 .ok_or_else(|| detail("206 without a parseable Content-Range total"))?;
             return Ok(Probe {
-                length: header,
+                length,
                 supports_ranges: true,
+                filename,
             });
         }
         if response.status().is_success() {
@@ -54,6 +61,7 @@ impl Source for HttpSource {
             return Ok(Probe {
                 length,
                 supports_ranges: false,
+                filename,
             });
         }
         Err(detail(&format!(
@@ -62,51 +70,40 @@ impl Source for HttpSource {
         )))
     }
 
-    async fn fetch(&self, range: ByteRange) -> Result<ByteStream, Error> {
-        // HTTP ranges are inclusive on both ends; our ByteRange end is exclusive.
-        let header = format!("bytes={}-{}", range.start, range.end - 1);
-        let response = self
-            .client
-            .get(self.url.clone())
-            .header(RANGE, header)
-            .send()
-            .await
-            .map_err(transport)?;
-
-        // A 200 here means the server ignored the range and is sending the whole body: reject it rather
-        // than splice whole-file bytes into the middle of a chunk.
-        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(Error::RangeNotHonored { requested: range });
+    async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
+        let mut request = self.client.get(self.url.clone());
+        if let Some(range) = range {
+            // HTTP ranges are inclusive on both ends; our ByteRange end is exclusive.
+            request = request.header(RANGE, format!("bytes={}-{}", range.start, range.end - 1));
         }
-        let start = response
-            .headers()
-            .get(CONTENT_RANGE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(content_range_start);
-        if start != Some(range.start) {
-            return Err(Error::RangeNotHonored { requested: range });
+        let response = request.send().await.map_err(transport)?;
+
+        match range {
+            Some(range) => {
+                // A 200 here means the server ignored the range and is sending the whole body: reject it
+                // rather than splice whole-file bytes into the middle of a chunk.
+                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                    return Err(Error::RangeNotHonored { requested: range });
+                }
+                let start = response
+                    .headers()
+                    .get(CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(content_range_start);
+                if start != Some(range.start) {
+                    return Err(Error::RangeNotHonored { requested: range });
+                }
+            }
+            None => {
+                if !response.status().is_success() {
+                    return Err(detail(&format!(
+                        "fetch returned HTTP {}",
+                        response.status()
+                    )));
+                }
+            }
         }
 
-        Ok(Box::pin(
-            response
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(transport)),
-        ))
-    }
-
-    async fn fetch_all(&self) -> Result<ByteStream, Error> {
-        let response = self
-            .client
-            .get(self.url.clone())
-            .send()
-            .await
-            .map_err(transport)?;
-        if !response.status().is_success() {
-            return Err(detail(&format!(
-                "fetch returned HTTP {}",
-                response.status()
-            )));
-        }
         Ok(Box::pin(
             response
                 .bytes_stream()
@@ -124,6 +121,49 @@ pub(crate) fn content_range_total(value: &str) -> Option<u64> {
 pub(crate) fn content_range_start(value: &str) -> Option<u64> {
     let span = value.strip_prefix("bytes ")?.split('/').next()?;
     span.split('-').next()?.trim().parse().ok()
+}
+
+/// Extract a filename from a `Content-Disposition` value, preferring the RFC 5987 `filename*` form and
+/// falling back to a plain `filename`. The result is stripped to its final path component, so a server
+/// cannot steer the output outside the intended directory with a value like `../../etc/passwd`. Returns
+/// `None` if no usable, non-empty name is present.
+pub(crate) fn content_disposition_name(value: &str) -> Option<String> {
+    let extended = value
+        .split(';')
+        .filter_map(|part| part.trim().strip_prefix("filename*="))
+        .find_map(decode_extended_filename);
+    let plain = || {
+        value
+            .split(';')
+            .filter_map(|part| part.trim().strip_prefix("filename="))
+            .map(|raw| raw.trim().trim_matches('"').to_owned())
+            .next()
+    };
+    let name = extended.or_else(plain)?;
+    let base = std::path::Path::new(&name)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)?;
+    (!base.is_empty()).then(|| base.to_owned())
+}
+
+/// Decode an RFC 5987 extended value like `UTF-8''my%20file.zip` into `my file.zip`, percent-decoding
+/// the bytes after the `charset''` prefix. Only UTF-8 output is accepted.
+fn decode_extended_filename(raw: &str) -> Option<String> {
+    let encoded = raw.rsplit("''").next()?;
+    let mut out = Vec::with_capacity(encoded.len());
+    let mut chars = encoded.bytes();
+    while let Some(byte) = chars.next() {
+        if byte == b'%' {
+            let hi = chars.next()?;
+            let lo = chars.next()?;
+            let pair = [hi, lo];
+            let text = core::str::from_utf8(&pair).ok()?;
+            out.push(u8::from_str_radix(text, 16).ok()?);
+        } else {
+            out.push(byte);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn transport(error: impl core::error::Error + Send + Sync + 'static) -> Error {

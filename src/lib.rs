@@ -74,6 +74,10 @@ pub trait Source {
     /// Fetch the given byte range as a stream. The engine requires the returned bytes to cover exactly
     /// `range`; a source that serves a different range is rejected.
     async fn fetch(&self, range: ByteRange) -> Result<ByteStream, Error>;
+
+    /// Fetch the whole resource as a single stream, used when [`Probe::supports_ranges`] is false and
+    /// the resource cannot be split into parallel chunks.
+    async fn fetch_all(&self) -> Result<ByteStream, Error>;
 }
 
 /// Reports download progress. The engine calls [`Progress::start`] once with the planned chunk sizes,

@@ -93,6 +93,26 @@ impl Source for HttpSource {
                 .map(|chunk| chunk.map_err(transport)),
         ))
     }
+
+    async fn fetch_all(&self) -> Result<ByteStream, Error> {
+        let response = self
+            .client
+            .get(self.url.clone())
+            .send()
+            .await
+            .map_err(transport)?;
+        if !response.status().is_success() {
+            return Err(detail(&format!(
+                "fetch returned HTTP {}",
+                response.status()
+            )));
+        }
+        Ok(Box::pin(
+            response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(transport)),
+        ))
+    }
 }
 
 /// Parse the total length from a `Content-Range` value like `bytes 0-0/1234`.

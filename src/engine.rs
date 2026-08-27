@@ -2,7 +2,8 @@
 //!
 //! The pipeline is one-shot. Parallel chunks stream into bounded per-chunk channels; a single
 //! reassembler drains them in order and both hashes and writes each byte in the same pass. Nothing is
-//! read back: the digest is computed as the resource is written, not over the finished file.
+//! read back: the digest is computed as the resource is written, not over the finished file. A source
+//! that cannot serve ranges is fetched as one stream instead of parallel chunks.
 
 use core::time::Duration;
 use std::path::Path;
@@ -32,11 +33,11 @@ pub struct Report {
 
 /// Download the resource behind `source` into `output`, fetching up to `parts` chunks in parallel and
 /// retrying a dropped chunk up to `retries` times, reporting to `progress`, and return its verified
-/// length and SHA-256.
+/// length and checksum.
 ///
-/// Chunks stream through in order and are hashed as they are written, in a single pass. Every chunk's
-/// range is validated, a retry resumes from where it dropped, and the total length is gated, so the
-/// returned digest certifies the resource rather than whatever bytes happened to arrive.
+/// A range-capable resource is fetched in parallel chunks, hashed as they are written in a single pass;
+/// one that is not is fetched as a single stream. Every chunk's range is validated, a retry resumes
+/// from where it dropped, and the total length is gated, so the returned digest certifies the resource.
 pub async fn download<S: Source, P: Progress>(
     source: &S,
     output: &Path,
@@ -46,12 +47,41 @@ pub async fn download<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
-    if !probe.supports_ranges && probe.length > 0 {
-        return Err(detail(
-            "resource does not support range requests (single-stream fetch is not yet implemented)",
-        ));
-    }
-    let ranges = plan(probe.length, parts);
+    let file = tokio::fs::File::create(output).await.map_err(io)?;
+
+    let hash = if probe.supports_ranges {
+        fetch_ranged(
+            source,
+            probe.length,
+            parts,
+            retries,
+            checksum,
+            file,
+            progress,
+        )
+        .await?
+    } else {
+        fetch_whole(source, probe.length, checksum, file, progress).await?
+    };
+
+    progress.finish();
+    Ok(Report {
+        length: probe.length,
+        hash,
+    })
+}
+
+/// Fetch a range-capable resource as `parts` parallel chunks, reassembled and hashed in order.
+async fn fetch_ranged<S: Source, P: Progress>(
+    source: &S,
+    total: u64,
+    parts: u32,
+    retries: u32,
+    checksum: Checksum,
+    file: tokio::fs::File,
+    progress: &P,
+) -> Result<Option<String>, Error> {
+    let ranges = plan(total, parts);
     let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
     progress.start(&sizes);
 
@@ -65,8 +95,6 @@ pub async fn download<S: Source, P: Progress>(
         receivers.push(rx);
     }
 
-    let file = tokio::fs::File::create(output).await.map_err(io)?;
-
     // Structured concurrency on one task: the source's futures are not `Send`. The fetchers feed the
     // channels while the reassembler drains them, hashing and writing in a single pass.
     let mut fetchers: FuturesUnordered<_> = ranges
@@ -75,24 +103,51 @@ pub async fn download<S: Source, P: Progress>(
         .enumerate()
         .map(|(index, (range, tx))| fetch_into(source, index, range, tx, retries, progress))
         .collect();
-    let fetch_all = async {
+    let drive = async {
         while let Some(result) = fetchers.next().await {
             result?;
         }
         Ok::<(), Error>(())
     };
 
-    let (fetched, hashed) = tokio::join!(
-        fetch_all,
-        reassemble(receivers, file, probe.length, checksum)
-    );
+    let (fetched, hashed) = tokio::join!(drive, reassemble(receivers, file, total, checksum));
     fetched?;
-    let hash = hashed?;
-    progress.finish();
-    Ok(Report {
-        length: probe.length,
-        hash,
-    })
+    hashed
+}
+
+/// Fetch a resource that does not support ranges as one stream, hashed and written in a single pass.
+async fn fetch_whole<S: Source, P: Progress>(
+    source: &S,
+    total: u64,
+    checksum: Checksum,
+    file: tokio::fs::File,
+    progress: &P,
+) -> Result<Option<String>, Error> {
+    progress.start(&[total]);
+    let (tx, rx) = mpsc::channel::<Bytes>(CHUNK_BUFFER);
+    let fetch = fetch_all_into(source, tx, progress);
+    let (fetched, hashed) = tokio::join!(fetch, reassemble(vec![rx], file, total, checksum));
+    fetched?;
+    hashed
+}
+
+/// Stream the whole resource into a single channel. No range validation and no resume: a source
+/// without ranges cannot be resumed, so an error mid-stream fails the download.
+async fn fetch_all_into<S: Source, P: Progress>(
+    source: &S,
+    tx: mpsc::Sender<Bytes>,
+    progress: &P,
+) -> Result<(), Error> {
+    let mut stream = source.fetch_all().await?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let len = chunk.len() as u64;
+        tx.send(chunk)
+            .await
+            .map_err(|_| detail("reassembler stopped receiving"))?;
+        progress.advance(0, len);
+    }
+    Ok(())
 }
 
 /// Fetch one chunk into its channel, resuming from its current offset with backoff if the connection
@@ -167,7 +222,7 @@ async fn stream_into<S: Source, P: Progress>(
 }
 
 /// Drain the per-chunk channels in order, hashing and writing each byte in one pass, and return the
-/// hex SHA-256. Gates the total length so a short assembly is an error, not a certified bad file.
+/// hex checksum. Gates the total length so a short assembly is an error, not a certified bad file.
 async fn reassemble(
     receivers: Vec<mpsc::Receiver<Bytes>>,
     mut file: tokio::fs::File,

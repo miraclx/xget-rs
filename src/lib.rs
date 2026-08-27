@@ -107,6 +107,9 @@ pub struct Probe {
     pub filename: Option<String>,
     /// The resource's media type (from an HTTP `Content-Type`), if the source reports one.
     pub content_type: Option<String>,
+    /// A checksum the source vouches for, as an algorithm and lowercase hex digest (e.g. an S3 stored
+    /// checksum). When present, a download can be verified against it with no hash supplied out of band.
+    pub checksum: Option<(Checksum, String)>,
 }
 
 /// A stream of byte chunks from a source, or a fetch error.

@@ -15,6 +15,7 @@ impl Source for Mock {
                 supports_ranges: true,
                 filename: None,
                 content_type: None,
+                checksum: None,
             })
         } else {
             Err(boom())

@@ -9,9 +9,10 @@ list current as features land; fold the ✅ ones into the README before release.
 
 - **Verified by construction.** One-shot streaming hash: bytes are hashed as they are written, never
   read back, and a length gate means a reported digest certifies the file. demo: n/a · readme: partial
-- **`--expect` gate.** Assert a known checksum (inline `algo:hex`) or point at a published checksum
-  file (`--expect https://.../file.sha256sum`); exits non-zero on mismatch. demo: ✅ (Helm sidecar) ·
-  readme: ⬜
+- **`--expect` gate.** Assert a known checksum (inline `algo:hex`), point at a published checksum file
+  (`--expect https://.../file.sha256sum`, or an `s3://.../file.sha256sum` sidecar), and for S3 objects
+  that carry a stored checksum it verifies automatically with no `--expect` at all. Exits non-zero on
+  mismatch. demo: ✅ (Helm sidecar; MinIO s3 sidecar + stored checksum) · readme: ⬜
 - **Atomic output.** Writes to `<file>.part` and renames on success, so a killed download never leaves
   a truncated file that looks whole. demo: ⬜ · readme: ⬜
 - **Resume across runs (`-c`).** Keeps the `.part`, fetches only what remains, and re-hashes the

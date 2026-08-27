@@ -122,12 +122,22 @@ async fn main() -> eyre::Result<()> {
 
     // `--expect` is a literal digest or a URL to a checksum file; resolve it (fetching the sidecar if
     // needed) to an optional pinned algorithm and the expected hex.
-    let expected = match cli.expect.as_deref() {
+    let mut expected = match cli.expect.as_deref() {
         Some(value) => {
             Some(resolve_expect(parse_expect(value)?, cli.endpoint_url.as_deref()).await?)
         }
         None => None,
     };
+    // With no explicit --expect, adopt a checksum the source vouches for (e.g. an S3 stored checksum),
+    // so the download is verified against it for free.
+    if expected.is_none()
+        && let Some((algo, hex)) = probe.as_ref().and_then(|probe| probe.checksum.clone())
+    {
+        if mode != ProgressMode::Json {
+            eprintln!("{DIM}Verifying against the source's stored {algo} checksum{RESET}");
+        }
+        expected = Some((Some(algo), hex));
+    }
     let checksum = match &expected {
         Some((Some(algo), _)) => *algo,
         Some((None, _)) if matches!(cli.checksum, Checksum::None) => {

@@ -1554,6 +1554,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-types",
  "blake3",
  "bytes",
  "clap",

@@ -59,6 +59,7 @@ impl Source for HttpSource {
                 supports_ranges: true,
                 filename,
                 content_type,
+                checksum: None,
             });
         }
         if response.status().is_success() {
@@ -70,6 +71,7 @@ impl Source for HttpSource {
                 supports_ranges: false,
                 filename,
                 content_type,
+                checksum: None,
             });
         }
         Err(detail(&format!(

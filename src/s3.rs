@@ -6,10 +6,11 @@
 
 use aws_credential_types::provider::ProvideCredentials as _;
 use aws_sdk_s3::config::BehaviorVersion;
+use aws_sdk_s3::types::ChecksumMode;
 use futures::StreamExt as _;
 use tokio_util::io::ReaderStream;
 
-use crate::{ByteRange, ByteStream, Error, Probe, Source};
+use crate::{ByteRange, ByteStream, Checksum, Error, Probe, Source};
 
 /// A byte source backed by an object in an S3 (or S3-compatible) bucket.
 pub struct S3Source {
@@ -65,6 +66,7 @@ impl Source for S3Source {
             .head_object()
             .bucket(&self.bucket)
             .key(&self.key)
+            .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
             .map_err(transport)?;
@@ -85,12 +87,17 @@ impl Source for S3Source {
         let filename = head
             .content_disposition()
             .and_then(content_disposition_name);
+        // A stored checksum, if the object was uploaded with one. S3 gives it base64-encoded; the engine
+        // works in hex, so decode and re-encode. Skip a composite multipart checksum (a `-N` suffix): it
+        // is a checksum of part checksums, not of the whole object, so it cannot verify the download.
+        let checksum = stored_checksum(&head);
 
         Ok(Probe {
             length,
             supports_ranges,
             filename,
             content_type,
+            checksum,
         })
     }
 
@@ -125,6 +132,28 @@ fn content_disposition_name(value: &str) -> Option<String> {
         .file_name()
         .and_then(std::ffi::OsStr::to_str)?;
     (!base.is_empty()).then(|| base.to_owned())
+}
+
+/// Read a whole-object stored checksum from a `HeadObject` response as an algorithm and lowercase hex
+/// digest. Prefers SHA-256, then SHA-1 (the two S3 algorithms the engine also computes); CRC algorithms
+/// and composite multipart checksums (a `-N` suffix) are ignored.
+fn stored_checksum(
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+) -> Option<(Checksum, String)> {
+    let candidates = [
+        (Checksum::Sha256, head.checksum_sha256()),
+        (Checksum::Sha1, head.checksum_sha1()),
+    ];
+    for (algorithm, value) in candidates {
+        let Some(value) = value else { continue };
+        if value.contains('-') {
+            continue; // composite multipart checksum, not a whole-object digest
+        }
+        if let Ok(bytes) = aws_smithy_types::base64::decode(value) {
+            return Some((algorithm, hex::encode(bytes)));
+        }
+    }
+    None
 }
 
 fn transport(error: impl core::error::Error + Send + Sync + 'static) -> Error {

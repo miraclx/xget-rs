@@ -795,12 +795,10 @@ struct BarProgress {
 }
 
 struct Live {
-    /// One segment per chunk, filled by each chunk's received bytes: the per-chunk download progress,
-    /// which advances in parallel.
-    chunks: Bar,
-    /// A single-segment bar for the whole transfer: done is bytes written and verified, lead is bytes
-    /// received, so its two-tone shows how far the download runs ahead of the in-order verify.
-    aggregate: Bar,
+    /// One segment per chunk: each segment's lead is bytes received, its done is bytes verified. The
+    /// aggregate header is derived from these same segments (summed lead and done), so there is one
+    /// source of truth, not a second bar to keep in step.
+    bar: Bar,
     target: DrawTarget,
     width: u16,
     multi: bool,
@@ -831,10 +829,9 @@ impl Progress for BarProgress {
             .with_leader('┅')
             .with_blank('┅')
             .with_separator('┆')
-            .with_color(Color::Cyan);
+            .with_color(Color::BrightCyan);
         let total: u64 = chunks.iter().sum();
-        let chunk_bar = Bar::new(chunks.iter().copied()).with_style(style.clone());
-        let aggregate = Bar::new([total]).with_style(style);
+        let bar = Bar::new(chunks.iter().copied()).with_style(style);
         let target = DrawTarget::from_env();
         // Fill the space beside the stats, but never past a fraction of the screen, so the bar scales
         // with the terminal up to a cap and only shrinks past that when the stats would clip.
@@ -844,8 +841,7 @@ impl Progress for BarProgress {
         let width = cap.min(columns.saturating_sub(reserve)).max(8);
         let mut slot = self.inner.borrow_mut();
         *slot = Some(Live {
-            chunks: chunk_bar,
-            aggregate,
+            bar,
             target,
             width,
             multi,
@@ -860,19 +856,19 @@ impl Progress for BarProgress {
 
     fn received(&self, index: usize, bytes: u64) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
-            // Each chunk's own download progress, and the aggregate's received-ahead marker.
-            live.chunks.advance(index, bytes);
-            live.aggregate.advance_lead(0, bytes);
+            // Downloaded but not yet verified: buffered-ahead (lead) on this chunk's segment.
+            live.bar.advance_lead(index, bytes);
             if live.meter.ready(Duration::from_millis(60)) {
                 redraw(live);
             }
         }
     }
 
-    fn wrote(&self, _index: usize, bytes: u64) {
+    fn wrote(&self, index: usize, bytes: u64) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
-            // Writing and hashing is in order, so it advances only the aggregate's verified frontier.
-            live.aggregate.advance(0, bytes);
+            // Verified in order: confirmed (done) on this chunk's segment; the aggregate's contiguous
+            // prefix is the sum of the segments' done, so it follows for free.
+            live.bar.advance(index, bytes);
             live.meter.add(bytes);
             if live.meter.ready(Duration::from_millis(60)) {
                 redraw(live);
@@ -907,16 +903,17 @@ fn frame(live: &Live) -> String {
     let done = fmt_size(meter.done, live.raw);
     let total = fmt_size(meter.total, live.raw);
     let rate = format!("{GREEN}{pct:>3}%{RESET}  {CYAN}{speed}/s{RESET}  {YELLOW}{eta}{RESET}");
+    let size = format!("{GREEN}{done}/{total}{RESET}");
     if live.multi {
         format!(
-            "  {DIM}┏{RESET} {} {DIM}┓{RESET}  {rate}\n  {DIM}┗{RESET} {} {DIM}┛{RESET}  {done}/{total}",
-            live.aggregate.render(live.width),
-            live.chunks.render(live.width),
+            "  {DIM}┏{RESET} {} {DIM}┓{RESET}  {rate}\n  {DIM}┗{RESET} {} {DIM}┛{RESET}  {size}",
+            live.bar.render_aggregate(live.width),
+            live.bar.render(live.width),
         )
     } else {
         format!(
-            "  {DIM}[{RESET}{}{DIM}]{RESET}  {rate}  {done}/{total}",
-            live.aggregate.render(live.width),
+            "  {DIM}[{RESET}{}{DIM}]{RESET}  {rate}  {size}",
+            live.bar.render_aggregate(live.width),
         )
     }
 }

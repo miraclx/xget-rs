@@ -58,6 +58,10 @@ struct Cli {
     /// Checksum to verify the download with: none, md5, sha1, sha256, or sha512.
     #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
     checksum: Checksum,
+    /// Require the download to match this checksum: `algo:hex`, or bare `hex` using `--checksum`'s
+    /// algorithm. Exits non-zero on mismatch.
+    #[arg(long, value_name = "[ALGO:]HEX")]
+    expect: Option<String>,
     /// Fail a chunk if no data arrives for this many seconds, so its retry can resume it.
     #[arg(long, value_name = "SECS")]
     timeout: Option<f64>,
@@ -103,19 +107,48 @@ async fn main() -> eyre::Result<()> {
         preamble(&cli, probe.as_ref(), &output);
     }
 
+    // A bare `--expect` hex uses the -s algorithm; an `algo:hex` form pins the algorithm itself.
+    let expected = cli.expect.as_deref().map(parse_expect).transpose()?;
+    let checksum = match &expected {
+        Some((Some(algo), _)) => *algo,
+        Some((None, _)) if matches!(cli.checksum, Checksum::None) => {
+            eyre::bail!("--expect needs an algorithm: pass --checksum or use algo:hex")
+        }
+        _ => cli.checksum,
+    };
+
     let reporter = Reporter::new(mode, cli.raw_sizes);
     let options = libxget::Options {
         parts: cli.chunks,
         retries: cli.tries,
-        checksum: cli.checksum,
+        checksum,
         timeout: cli.timeout.map(Duration::from_secs_f64),
         resume: cli.resume,
         cache: cli.cache_size,
     };
     let started = Instant::now();
     let report = libxget::download(&source, &output, options, &reporter).await?;
-    summary(mode, &cli, &report, started.elapsed());
+
+    if let Some((_, want)) = &expected {
+        match &report.hash {
+            Some(got) if got.eq_ignore_ascii_case(want) => {}
+            Some(got) => {
+                eyre::bail!("checksum mismatch: expected {checksum}:{want}, got {checksum}:{got}")
+            }
+            None => eyre::bail!("no checksum was computed to verify against"),
+        }
+    }
+
+    summary(mode, &cli, checksum, &report, started.elapsed());
     Ok(())
+}
+
+/// Parse an `--expect` value into an optional pinned algorithm and the lowercase hex digest.
+fn parse_expect(value: &str) -> eyre::Result<(Option<Checksum>, String)> {
+    match value.split_once(':') {
+        Some((algo, hex)) => Ok((Some(algo.parse()?), hex.to_ascii_lowercase())),
+        None => Ok((None, value.to_ascii_lowercase())),
+    }
 }
 
 /// Print the block shown before a live bar: the URL, how many chunks, the length and media type, and
@@ -145,14 +178,20 @@ fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path) {
 
 /// Print the closing summary: how much was fetched in how long, and the verified checksum if one was
 /// requested. Skipped for `json` (which emits an `end` event instead).
-fn summary(mode: ProgressMode, cli: &Cli, report: &libxget::Report, elapsed: Duration) {
+fn summary(
+    mode: ProgressMode,
+    cli: &Cli,
+    checksum: Checksum,
+    report: &libxget::Report,
+    elapsed: Duration,
+) {
     if mode == ProgressMode::Json {
         return;
     }
     let size = fmt_size(report.length, cli.raw_sizes);
     println!("Downloaded {size} in {}", fmt_elapsed(elapsed));
     if let Some(hash) = &report.hash {
-        println!("Hash({}): {hash}", cli.checksum);
+        println!("Hash({checksum}): {hash}");
     }
 }
 

@@ -35,6 +35,8 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
 tokio-util = { version = "0.7", optional = true, features = ["io"] }
+
+# Sibling crates from the same rewrite effort.
 xbytes = { path = "../xbytes-rs" }
 xprogress = { path = "../xprogress-rs" }
 

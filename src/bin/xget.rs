@@ -24,7 +24,7 @@ const BAR_MAX: u16 = 48;
 // ANSI colors for the live readout. Each code has zero display width, so it never affects the bar's
 // own width accounting; it only tints the text that follows the bar.
 const GREEN: &str = "\x1b[1;32m";
-const CYAN: &str = "\x1b[1;36m";
+const BLUE: &str = "\x1b[1;94m";
 const YELLOW: &str = "\x1b[1;33m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
@@ -903,7 +903,7 @@ fn frame(live: &Live) -> String {
     let eta = format_eta(meter.eta());
     let done = fmt_size(meter.done, live.raw);
     let total = fmt_size(meter.total, live.raw);
-    let rate = format!("{GREEN}{pct:>3}%{RESET}  {CYAN}{speed}/s{RESET}  {YELLOW}{eta}{RESET}");
+    let rate = format!("{GREEN}{pct:>3}%{RESET}  {BLUE}{speed}/s{RESET}  {YELLOW}{eta}{RESET}");
     let size = format!("{GREEN}{done}/{total}{RESET}");
     if live.multi {
         format!(

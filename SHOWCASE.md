@@ -21,7 +21,8 @@ list current as features land; fold the ✅ ones into the README before release.
 
 - Parallel chunked range GET with per-chunk retry/backoff. demo: ✅ (media/download.gif) · readme: ✅
 - Single-stream fetch for non-range sources, still hashed. demo: ⬜ · readme: ⬜
-- Configurable checksum: none / md5 / sha1 / sha256 / sha512 (blake3 pending). demo: ⬜ · readme: ⬜
+- Configurable checksum: none / md5 / sha1 / sha256 / sha512 / blake3 (the hash theia/iris speak).
+  demo: ⬜ · readme: ⬜
 - Inactivity `--timeout`; a stalled chunk's retry resumes it. demo: ⬜ · readme: ⬜
 - Bounded memory; `--cache-size` is the read-ahead knob. demo: ⬜ · readme: ⬜
 - Pluggable `Source` (HTTP today; S3 and a bifrost peer planned). demo: ⬜ · readme: partial

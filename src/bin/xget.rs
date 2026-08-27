@@ -55,7 +55,7 @@ struct Cli {
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
-    /// Checksum to verify the download with: none, md5, sha1, sha256, or sha512.
+    /// Checksum to verify the download with: none, md5, sha1, sha256, sha512, or blake3.
     #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
     checksum: Checksum,
     /// Require the download to match this checksum: `algo:hex`, or bare `hex` using `--checksum`'s

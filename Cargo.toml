@@ -11,6 +11,7 @@ keywords = ["download", "http", "range", "resume", "parallel"]
 categories = ["network-programming", "asynchronous"]
 
 [dependencies]
+blake3 = "1.8.7"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 digest = "0.10"

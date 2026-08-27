@@ -370,7 +370,7 @@ async fn reassemble<P: Progress>(
             received: written,
         });
     }
-    Ok(hasher.map(|mut hasher| hex::encode(hasher.finalize_reset())))
+    Ok(hasher.map(|hasher| hasher.finalize_hex()))
 }
 
 /// Exponential backoff before a retry, capped at a few seconds.

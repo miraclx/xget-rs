@@ -123,14 +123,19 @@ pub trait Source {
 }
 
 /// Reports download progress. The engine calls [`Progress::start`] once with the planned chunk sizes,
-/// then [`Progress::advance`] as each chunk's bytes arrive, then [`Progress::finish`]. Every method
-/// takes `&self` and defaults to nothing, so a caller opts in only to what it wants and passes `()` for
-/// none. The engine drives these on a single task, so an implementation need not be `Sync`.
+/// then, as bytes flow through the two-stage pipeline, [`Progress::received`] when a chunk's bytes
+/// arrive from the source and [`Progress::wrote`] when they are written and hashed in order, then
+/// [`Progress::finish`]. The two stages let a display shade bytes received (buffered ahead) apart from
+/// bytes confirmed. Every method takes `&self` and defaults to nothing, so a caller opts in only to
+/// what it wants and passes `()` for none. The engine drives these on a single task, so an
+/// implementation need not be `Sync`.
 pub trait Progress {
     /// The planned chunk sizes, in order, before fetching begins.
     fn start(&self, _chunks: &[u64]) {}
-    /// `bytes` more bytes arrived for chunk `index`.
-    fn advance(&self, _index: usize, _bytes: u64) {}
+    /// `bytes` more bytes arrived from the source for chunk `index`, buffered ahead of writing.
+    fn received(&self, _index: usize, _bytes: u64) {}
+    /// `bytes` more bytes of chunk `index` were written to the output and folded into the hash.
+    fn wrote(&self, _index: usize, _bytes: u64) {}
     /// The download finished.
     fn finish(&self) {}
 }

@@ -154,7 +154,7 @@ async fn fetch_ranged<S: Source, P: Progress>(
 
     let (fetched, hashed) = tokio::join!(
         drive,
-        reassemble(receivers, file, total, options.checksum, prefix)
+        reassemble(receivers, file, total, options.checksum, prefix, progress)
     );
     fetched?;
     hashed
@@ -173,7 +173,7 @@ async fn fetch_whole<S: Source, P: Progress>(
     let fetch = fetch_all_into(source, tx, options.timeout, progress);
     let (fetched, hashed) = tokio::join!(
         fetch,
-        reassemble(vec![rx], file, total, options.checksum, None)
+        reassemble(vec![rx], file, total, options.checksum, None, progress)
     );
     fetched?;
     hashed
@@ -193,7 +193,7 @@ async fn fetch_all_into<S: Source, P: Progress>(
         tx.send(chunk)
             .await
             .map_err(|_| detail("reassembler stopped receiving"))?;
-        progress.advance(0, len);
+        progress.received(0, len);
     }
     Ok(())
 }
@@ -293,7 +293,7 @@ async fn stream_into<S: Source, P: Progress>(
             .await
             .map_err(|_| detail("reassembler stopped receiving"))?;
         *offset += len;
-        progress.advance(index, len);
+        progress.received(index, len);
     }
     Ok(())
 }
@@ -305,12 +305,13 @@ async fn stream_into<S: Source, P: Progress>(
 /// Reading the prefix happens here while the fetchers are already pulling new bytes from the network
 /// into the bounded channels, so the disk read overlaps the live download rather than blocking it. The
 /// hasher still consumes prefix-then-new in order, which a single digest requires.
-async fn reassemble(
+async fn reassemble<P: Progress>(
     receivers: Vec<mpsc::Receiver<Bytes>>,
     mut file: tokio::fs::File,
     total: u64,
     checksum: Checksum,
     prefix: Option<Prefix>,
+    progress: &P,
 ) -> Result<Option<String>, Error> {
     let mut hasher = checksum.hasher();
     let mut written = 0u64;
@@ -338,13 +339,15 @@ async fn reassemble(
         }
     }
 
-    for mut receiver in receivers {
+    for (index, mut receiver) in receivers.into_iter().enumerate() {
         while let Some(bytes) = receiver.recv().await {
+            let len = bytes.len() as u64;
             if let Some(hasher) = hasher.as_mut() {
                 hasher.update(&bytes);
             }
             file.write_all(&bytes).await.map_err(io)?;
-            written += bytes.len() as u64;
+            written += len;
+            progress.wrote(index, len);
         }
     }
     file.flush().await.map_err(io)?;

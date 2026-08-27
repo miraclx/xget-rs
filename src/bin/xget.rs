@@ -10,7 +10,13 @@ use clap::Parser;
 use libxget::{Checksum, HttpSource, Probe, Progress, Source as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use xbytes::prelude::*;
-use xprogress::{Bar, Color, DrawTarget, Style, Width};
+use xprogress::{Bar, Color, DrawTarget, Style};
+
+/// The bar takes at most this fraction of the terminal width, so it scales with the screen instead of
+/// stretching across it. Capped by [`BAR_MAX`] and floored so it never vanishes.
+const BAR_MAX_PCT: u16 = 40;
+/// The bar never grows past this many cells, however wide the terminal, keeping the stats in focus.
+const BAR_MAX: u16 = 48;
 
 // ANSI colors for the live readout. Each code has zero display width, so it never affects the bar's
 // own width accounting; it only tints the text that follows the bar.
@@ -304,11 +310,20 @@ impl Progress for Reporter {
         }
     }
 
-    fn advance(&self, index: usize, bytes: u64) {
+    fn received(&self, index: usize, bytes: u64) {
         match self {
-            Self::Bar(bar) => bar.advance(index, bytes),
-            Self::Plain(plain) => plain.advance(index, bytes),
-            Self::Json(json) => json.advance(index, bytes),
+            Self::Bar(bar) => bar.received(index, bytes),
+            Self::Plain(plain) => plain.received(index, bytes),
+            Self::Json(json) => json.received(index, bytes),
+            Self::Silent => {}
+        }
+    }
+
+    fn wrote(&self, index: usize, bytes: u64) {
+        match self {
+            Self::Bar(bar) => bar.wrote(index, bytes),
+            Self::Plain(plain) => plain.wrote(index, bytes),
+            Self::Json(json) => json.wrote(index, bytes),
             Self::Silent => {}
         }
     }
@@ -343,15 +358,25 @@ impl Meter {
         }
     }
 
-    /// Record `bytes` more and report whether enough time has passed to redraw.
-    fn advance(&mut self, bytes: u64, every: Duration) -> bool {
+    /// Record `bytes` more of confirmed progress.
+    fn add(&mut self, bytes: u64) {
         self.done += bytes;
+    }
+
+    /// Whether enough time has passed since the last redraw to draw again.
+    fn ready(&mut self, every: Duration) -> bool {
         let now = Instant::now();
         if now.duration_since(self.last) < every {
             return false;
         }
         self.last = now;
         true
+    }
+
+    /// Record `bytes` more and report whether enough time has passed to redraw.
+    fn advance(&mut self, bytes: u64, every: Duration) -> bool {
+        self.add(bytes);
+        self.ready(every)
     }
 
     /// Bytes per second so far.
@@ -438,7 +463,7 @@ impl Progress for PlainProgress {
         *self.meter.borrow_mut() = Some(meter);
     }
 
-    fn advance(&self, _index: usize, bytes: u64) {
+    fn wrote(&self, _index: usize, bytes: u64) {
         if let Some(meter) = self.meter.borrow_mut().as_mut() {
             if meter.advance(bytes, Duration::from_millis(200)) {
                 eprint!("{}", self.line(meter));
@@ -473,7 +498,7 @@ impl Progress for JsonProgress {
         *self.meter.borrow_mut() = Some(Meter::new(chunks.iter().sum()));
     }
 
-    fn advance(&self, _index: usize, bytes: u64) {
+    fn wrote(&self, _index: usize, bytes: u64) {
         if let Some(meter) = self.meter.borrow_mut().as_mut() {
             if meter.advance(bytes, Duration::from_millis(200)) {
                 eprintln!(
@@ -500,8 +525,10 @@ impl Progress for JsonProgress {
     }
 }
 
-/// A live segmented progress bar: one xprogress segment per chunk, with an xbytes size, speed, and ETA
-/// readout, drawn in place and throttled so a fast download does not spend its time redrawing.
+/// The live bar. With a handful of chunks it draws an aggregate header line over a per-chunk line, both
+/// two-tone (done vs received-ahead); with one chunk or many it collapses to a single aggregate bar.
+/// The lead comes from bytes received off the network, the done from bytes written and hashed, so the
+/// shaded gap between them is the buffered-ahead window. Drawn in place and throttled.
 struct BarProgress {
     inner: RefCell<Option<Live>>,
     raw: bool,
@@ -511,6 +538,8 @@ struct Live {
     bar: Bar,
     target: DrawTarget,
     width: u16,
+    multi: bool,
+    prev_lines: usize,
     meter: Meter,
     raw: bool,
 }
@@ -526,56 +555,99 @@ impl BarProgress {
 
 impl Progress for BarProgress {
     fn start(&self, chunks: &[u64]) {
-        let bar =
-            Bar::new(chunks.iter().copied()).with_style(Style::default().with_color(Color::Cyan));
+        // A two-line view is worth it for a few chunks; one chunk has nothing to aggregate and twenty
+        // would not fit, so both collapse to a single aggregate bar.
+        let multi = (2..20).contains(&chunks.len());
+        // The libxget-js look: a thin solid line for done capped with a head, dashed for lead and
+        // empty, cyan fill.
+        let style = Style::default()
+            .with_filler('━')
+            .with_header('╸')
+            .with_leader('┅')
+            .with_blank('┅')
+            .with_separator('┆')
+            .with_color(Color::Cyan);
+        let bar = Bar::new(chunks.iter().copied()).with_style(style);
         let target = DrawTarget::from_env();
-        // Reserve enough for the widest readout ("1023.99 KiB / 1023.99 KiB  1023.99 KiB/s  eta 1h2m")
-        // so the line never wraps and the in-place redraw stays on one row.
-        let width = Width::TerminalMinus(56).resolve(target.columns(), 24);
+        // Fill the space beside the stats, but never past a fraction of the screen, so the bar scales
+        // with the terminal up to a cap and only shrinks past that when the stats would clip.
+        let columns = target.columns().unwrap_or(80);
+        let reserve = if multi { 34 } else { 52 };
+        let cap = (columns.saturating_mul(BAR_MAX_PCT) / 100).min(BAR_MAX);
+        let width = cap.min(columns.saturating_sub(reserve)).max(8);
         let mut slot = self.inner.borrow_mut();
         *slot = Some(Live {
             bar,
             target,
             width,
+            multi,
+            prev_lines: 0,
             meter: Meter::new(chunks.iter().sum()),
             raw: self.raw,
         });
         if let Some(live) = slot.as_mut() {
-            let line = frame(live);
-            let _ = live.target.draw(&line);
+            redraw(live);
         }
     }
 
-    fn advance(&self, index: usize, bytes: u64) {
+    fn received(&self, index: usize, bytes: u64) {
+        if let Some(live) = self.inner.borrow_mut().as_mut() {
+            live.bar.advance_lead(index, bytes);
+            if live.meter.ready(Duration::from_millis(60)) {
+                redraw(live);
+            }
+        }
+    }
+
+    fn wrote(&self, index: usize, bytes: u64) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
             live.bar.advance(index, bytes);
-            if live.meter.advance(bytes, Duration::from_millis(60)) {
-                let line = frame(live);
-                let _ = live.target.draw(&line);
+            live.meter.add(bytes);
+            if live.meter.ready(Duration::from_millis(60)) {
+                redraw(live);
             }
         }
     }
 
     fn finish(&self) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
-            let line = frame(live);
-            let _ = live.target.finish(&line);
+            let block = frame(live);
+            let _ = live.target.finish_block(&block, live.prev_lines);
         }
     }
 }
 
-/// Compose the bar with a colored `pct%  speed  eta  done/total` readout.
+/// Redraw the bar block in place, remembering how many lines it drew for the next redraw.
+fn redraw(live: &mut Live) {
+    let block = frame(live);
+    if let Ok(lines) = live.target.draw_block(&block, live.prev_lines) {
+        live.prev_lines = lines;
+    }
+}
+
+/// Compose the bar block: an aggregate header line over the per-chunk line when multi, otherwise a
+/// single aggregate bar. The readout (percent, speed, eta, sizes) is xget's to write; xprogress only
+/// renders the bars.
 fn frame(live: &Live) -> String {
     let meter = &live.meter;
-    format!(
-        "[{bar}] {GREEN}{pct:>3}%{RESET}  {CYAN}{speed}/s{RESET}  {YELLOW}{eta}{RESET}  {done}/{total}",
-        bar = live.bar.render(live.width),
-        pct = meter.percent(),
-        speed = fmt_size(meter.rate(), live.raw),
-        eta = format_eta(meter.eta()),
-        done = fmt_size(meter.done, live.raw),
-        total = fmt_size(meter.total, live.raw),
-    )
+    let pct = meter.percent();
+    let speed = fmt_size(meter.rate(), live.raw);
+    let eta = format_eta(meter.eta());
+    let done = fmt_size(meter.done, live.raw);
+    let total = fmt_size(meter.total, live.raw);
+    let rate = format!("{GREEN}{pct:>3}%{RESET}  {CYAN}{speed}/s{RESET}  {YELLOW}{eta}{RESET}");
+    if live.multi {
+        format!(
+            "  {DIM}┏{RESET} {} {DIM}┓{RESET}  {rate}\n  {DIM}┗{RESET} {} {DIM}┛{RESET}  {done}/{total}",
+            live.bar.render_aggregate(live.width),
+            live.bar.render(live.width),
+        )
+    } else {
+        format!(
+            "  {DIM}[{RESET}{}{DIM}]{RESET}  {rate}  {done}/{total}",
+            live.bar.render_aggregate(live.width),
+        )
+    }
 }
 
 /// A compact `1h2m` / `3m4s` / `5s` duration for the ETA readout.

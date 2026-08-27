@@ -47,6 +47,9 @@ struct Cli {
     /// Fail a chunk if no data arrives for this many seconds, so its retry can resume it.
     #[arg(long, value_name = "SECS")]
     timeout: Option<f64>,
+    /// Buffers each chunk may read ahead of the reassembler; trades memory for smoother throughput.
+    #[arg(long, value_name = "N", default_value_t = 64)]
+    cache_size: usize,
     /// Progress output: auto (a bar on a terminal, else plain lines), bar, plain, json, or none.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -85,6 +88,7 @@ async fn main() -> eyre::Result<()> {
         checksum: cli.checksum,
         timeout: cli.timeout.map(Duration::from_secs_f64),
         resume: cli.resume,
+        cache: cli.cache_size,
     };
     let report = libxget::download(&source, &output, options, &reporter).await?;
     let size = fmt_size(report.length, cli.raw_sizes);

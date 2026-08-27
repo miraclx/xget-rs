@@ -26,12 +26,6 @@ struct Prefix {
     len: u64,
 }
 
-/// Buffers a chunk may read ahead before its fetch blocks on the reassembler. This is the
-/// memory-versus-parallelism knob (the JS `--cache-size`): larger lets a chunk download further ahead
-/// of the in-order reassembler, so a slow early chunk head-of-line-blocks the others less, at the cost
-/// of `parts * CHUNK_BUFFER` buffered chunks of memory. TODO: expose as `--cache-size`.
-const CHUNK_BUFFER: usize = 64;
-
 /// The outcome of a completed download.
 #[derive(Clone, Debug)]
 pub struct Report {
@@ -134,10 +128,11 @@ async fn fetch_ranged<S: Source, P: Progress>(
 
     // One bounded channel per chunk. The chunk fetches fill them in parallel; the reassembler drains
     // them in order, so the bytes leave this stage in resource order.
+    let cache = options.cache.max(1);
     let mut senders = Vec::with_capacity(ranges.len());
     let mut receivers = Vec::with_capacity(ranges.len());
     for _ in &ranges {
-        let (tx, rx) = mpsc::channel::<Bytes>(CHUNK_BUFFER);
+        let (tx, rx) = mpsc::channel::<Bytes>(cache);
         senders.push(tx);
         receivers.push(rx);
     }
@@ -174,7 +169,7 @@ async fn fetch_whole<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<Option<String>, Error> {
     progress.start(&[total]);
-    let (tx, rx) = mpsc::channel::<Bytes>(CHUNK_BUFFER);
+    let (tx, rx) = mpsc::channel::<Bytes>(options.cache.max(1));
     let fetch = fetch_all_into(source, tx, options.timeout, progress);
     let (fetched, hashed) = tokio::join!(
         fetch,

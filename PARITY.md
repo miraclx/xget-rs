@@ -34,7 +34,8 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512 |
 | `--timeout <secs>` | ✅ | inactivity timeout |
 | `-c, --continue` | ✅ | resume a partial file |
-| `--start-pos`, `--cache-size` | ⬜ | see engine |
+| `--cache-size <N>` | ✅ | per-chunk read-ahead buffers |
+| `--start-pos` | ⬜ | `-c` covers the real resume case |
 
 ## Progress
 
@@ -48,5 +49,6 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 
 ## Deliberately different (➖)
 
-- No `StreamCache` / `--cache-size` / `--show-cache`: replaced by bounded per-chunk channels, so memory
-  is `parts * CHUNK_BUFFER` by construction. A `--cache-size` knob could map to that bound later.
+- No `StreamCache` / `--show-cache`: the JS cache is replaced by bounded per-chunk channels, so memory
+  is `parts * cache` by construction. `--cache-size` maps to that per-chunk bound (default 64) rather
+  than a global byte budget.

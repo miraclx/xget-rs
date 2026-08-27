@@ -123,7 +123,9 @@ async fn main() -> eyre::Result<()> {
     // `--expect` is a literal digest or a URL to a checksum file; resolve it (fetching the sidecar if
     // needed) to an optional pinned algorithm and the expected hex.
     let expected = match cli.expect.as_deref() {
-        Some(value) => Some(resolve_expect(parse_expect(value)?).await?),
+        Some(value) => {
+            Some(resolve_expect(parse_expect(value)?, cli.endpoint_url.as_deref()).await?)
+        }
         None => None,
     };
     let checksum = match &expected {
@@ -269,11 +271,14 @@ fn parse_expect(value: &str) -> eyre::Result<Expect> {
 /// Resolve an [`Expect`] to a pinned algorithm and the expected hex, fetching and parsing a checksum
 /// file if the value was a URL. A checksum file's first hex-looking token is taken, so both a bare
 /// digest and the usual `<hex>  <filename>` line both work.
-async fn resolve_expect(expect: Expect) -> eyre::Result<(Option<Checksum>, String)> {
+async fn resolve_expect(
+    expect: Expect,
+    endpoint_url: Option<&str>,
+) -> eyre::Result<(Option<Checksum>, String)> {
     match expect {
         Expect::Literal { algo, hex } => Ok((algo, hex)),
         Expect::Sidecar { algo, url } => {
-            let body = reqwest::get(&url).await?.error_for_status()?.text().await?;
+            let body = fetch_sidecar(&url, endpoint_url).await?;
             let hex = body
                 .split_whitespace()
                 .find(|token| is_hex_digest(token))
@@ -282,6 +287,40 @@ async fn resolve_expect(expect: Expect) -> eyre::Result<(Option<Checksum>, Strin
             Ok((algo, hex))
         }
     }
+}
+
+/// Fetch a checksum file as text, over HTTP or, for an `s3://` URL, through the S3 source (so a sidecar
+/// published in the same bucket works). The file is small, so it is read whole.
+async fn fetch_sidecar(url: &str, endpoint_url: Option<&str>) -> eyre::Result<String> {
+    match url.strip_prefix("s3://") {
+        Some(rest) => fetch_s3_text(rest, endpoint_url).await,
+        None => Ok(reqwest::get(url).await?.error_for_status()?.text().await?),
+    }
+}
+
+/// Read a small `s3://bucket/key` object whole and decode it as UTF-8. Only available with `--features
+/// s3`.
+#[cfg(feature = "s3")]
+async fn fetch_s3_text(rest: &str, endpoint_url: Option<&str>) -> eyre::Result<String> {
+    use futures::StreamExt as _;
+
+    let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
+    if bucket.is_empty() || key.is_empty() {
+        eyre::bail!("s3 checksum URL must be s3://bucket/key");
+    }
+    let source = libxget::S3Source::new(bucket, key, endpoint_url.map(str::to_owned)).await;
+    let mut stream = source.fetch(None).await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend_from_slice(&chunk?);
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
+/// Reject an `s3://` checksum URL when the `s3` feature was not compiled in.
+#[cfg(not(feature = "s3"))]
+async fn fetch_s3_text(_rest: &str, _endpoint_url: Option<&str>) -> eyre::Result<String> {
+    eyre::bail!("s3:// checksum URL requires building with --features s3")
 }
 
 /// Infer a checksum algorithm from a checksum file's extension, e.g. `.sha256` or `.sha256sum`.

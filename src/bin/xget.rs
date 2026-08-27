@@ -448,7 +448,9 @@ impl Progress for BarProgress {
         let bar =
             Bar::new(chunks.iter().copied()).with_style(Style::default().with_color(Color::Cyan));
         let target = DrawTarget::from_env();
-        let width = Width::TerminalMinus(46).resolve(target.columns(), 32);
+        // Reserve enough for the widest readout ("1023.99 KiB / 1023.99 KiB  1023.99 KiB/s  eta 1h2m")
+        // so the line never wraps and the in-place redraw stays on one row.
+        let width = Width::TerminalMinus(56).resolve(target.columns(), 24);
         let mut slot = self.inner.borrow_mut();
         *slot = Some(Live {
             bar,

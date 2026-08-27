@@ -12,6 +12,13 @@
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+mod plan;
+
+#[cfg(test)]
+mod plan_tests;
+
+pub use crate::plan::plan;
+
 /// A half-open byte range `[start, end)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ByteRange {
@@ -23,12 +30,12 @@ pub struct ByteRange {
 
 impl ByteRange {
     /// The number of bytes in the range.
-    pub const fn len(self) -> u64 {
+    pub const fn len(&self) -> u64 {
         self.end.saturating_sub(self.start)
     }
 
     /// Whether the range covers no bytes.
-    pub const fn is_empty(self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.start >= self.end
     }
 }

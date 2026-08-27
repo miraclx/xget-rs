@@ -15,7 +15,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use xbytes::ByteSize;
 use xbytes::sizes::BYTE;
 
-use crate::expect::{parse_expect, resolve_expect};
+use crate::expect::{Expect, parse_expect, resolve_expect};
 use crate::progress::{DIM, RESET, Reporter};
 
 /// Download a URL in parallel chunks, verify it, and print its SHA-256.
@@ -45,8 +45,8 @@ struct Cli {
     #[arg(short = 'c', long = "continue")]
     resume: bool,
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
-    #[arg(short = 'H', long = "header")]
-    headers: Vec<String>,
+    #[arg(short = 'H', long = "header", value_parser = parse_header)]
+    headers: Vec<(HeaderName, HeaderValue)>,
     /// A mirror URL for the same resource, tried when the primary fails a chunk (repeatable).
     #[arg(long = "mirror", value_name = "URL")]
     mirrors: Vec<String>,
@@ -58,9 +58,9 @@ struct Cli {
     #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
     checksum: Checksum,
     /// Require the download to match this checksum: `algo:hex`, or bare `hex` using `--checksum`'s
-    /// algorithm. Exits non-zero on mismatch.
-    #[arg(long, value_name = "[ALGO:]HEX")]
-    expect: Option<String>,
+    /// algorithm, or a URL to a checksum file. Exits non-zero on mismatch.
+    #[arg(long, value_name = "[ALGO:]HEX", value_parser = parse_expect)]
+    expect: Option<Expect>,
     /// Fail a chunk if no data arrives for this many seconds, so its retry can resume it.
     #[arg(long, value_name = "SECS", value_parser = parse_timeout)]
     timeout: Option<Duration>,
@@ -128,7 +128,11 @@ async fn run() -> eyre::Result<()> {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     init_tracing(cli.verbose);
-    let headers = parse_headers(&cli.headers)?;
+    // The headers were validated into typed pairs at parse time; assemble them into a map.
+    let mut headers = HeaderMap::new();
+    for (name, value) in &cli.headers {
+        headers.insert(name.clone(), value.clone());
+    }
     let source = build_source(&cli, &headers).await?;
     let mode = resolve_mode(&cli);
 
@@ -139,12 +143,10 @@ async fn run() -> eyre::Result<()> {
         preamble(&cli, probe.as_ref(), &output);
     }
 
-    // `--expect` is a literal digest or a URL to a checksum file; resolve it (fetching the sidecar if
-    // needed) to an optional pinned algorithm and the expected hex.
-    let mut expected = match cli.expect.as_deref() {
-        Some(value) => {
-            Some(resolve_expect(parse_expect(value)?, cli.endpoint_url.as_deref()).await?)
-        }
+    // `--expect` was parsed to a literal digest or a checksum-file URL at parse time; resolve it now,
+    // fetching the sidecar if needed, to an optional pinned algorithm and the expected hex.
+    let mut expected = match &cli.expect {
+        Some(expect) => Some(resolve_expect(expect.clone(), cli.endpoint_url.as_deref()).await?),
         None => None,
     };
     // With no explicit --expect, adopt a checksum the source vouches for (e.g. an S3 stored checksum),
@@ -342,19 +344,21 @@ fn fmt_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// Parse repeated `Name: Value` header arguments into a [`HeaderMap`].
-fn parse_headers(raw: &[String]) -> eyre::Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
-    for entry in raw {
-        let (name, value) = entry
-            .split_once(':')
-            .ok_or_else(|| eyre::eyre!("header must be `Name: Value`: {entry}"))?;
-        headers.insert(
-            name.trim().parse::<HeaderName>()?,
-            value.trim().parse::<HeaderValue>()?,
-        );
-    }
-    Ok(headers)
+/// Parse one `Name: Value` header argument into a typed name and value. A `clap` value parser, so a
+/// malformed header is rejected at parse time rather than mid-run.
+fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
+    let (name, value) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("header must be `Name: Value`: {raw}"))?;
+    let name: HeaderName = name
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid header name: {name}"))?;
+    let value: HeaderValue = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid header value: {value}"))?;
+    Ok((name, value))
 }
 
 /// Resolve where to write: an explicit file, a name inside an explicit directory, or a name inferred

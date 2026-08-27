@@ -2,6 +2,7 @@ use libxget::Checksum;
 
 /// An `--expect` value: either a checksum given inline, or a URL to a checksum file to fetch. Both
 /// carry an optional pinned algorithm (from an `algo:` prefix inline, or the sidecar's extension).
+#[derive(Clone)]
 pub(crate) enum Expect {
     /// A digest given on the command line.
     Literal {
@@ -20,8 +21,10 @@ pub(crate) enum Expect {
 }
 
 /// Parse an `--expect` value: a URL (contains `://`) becomes a [`Expect::Sidecar`] with the algorithm
-/// inferred from its extension; otherwise an `algo:hex` or bare `hex` [`Expect::Literal`].
-pub(crate) fn parse_expect(value: &str) -> eyre::Result<Expect> {
+/// inferred from its extension; otherwise an `algo:hex` or bare `hex` [`Expect::Literal`]. A `clap`
+/// value parser, so a bad `algo:` prefix is rejected at parse time; the sidecar it names is fetched
+/// later, at run time.
+pub(crate) fn parse_expect(value: &str) -> Result<Expect, String> {
     if value.contains("://") {
         return Ok(Expect::Sidecar {
             algo: algo_from_extension(value),
@@ -30,7 +33,7 @@ pub(crate) fn parse_expect(value: &str) -> eyre::Result<Expect> {
     }
     match value.split_once(':') {
         Some((algo, hex)) => Ok(Expect::Literal {
-            algo: Some(algo.parse()?),
+            algo: Some(algo.parse().map_err(|error| format!("{error}"))?),
             hex: hex.to_ascii_lowercase(),
         }),
         None => Ok(Expect::Literal {

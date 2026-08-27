@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use libxget::{Checksum, HttpSource, Progress};
+use libxget::{Checksum, HttpSource, Progress, Source as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use xbytes::prelude::*;
 use xprogress::{Bar, Color, DrawTarget, Style, Width};
@@ -79,8 +79,8 @@ enum ProgressMode {
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
-    let output = resolve_output(&cli)?;
     let source = HttpSource::new(&cli.url, parse_headers(&cli.headers)?)?;
+    let output = resolve_output(&cli, &source).await?;
     let reporter = Reporter::new(resolve_mode(&cli), cli.raw_sizes);
     let options = libxget::Options {
         parts: cli.chunks,
@@ -141,14 +141,14 @@ fn parse_headers(raw: &[String]) -> eyre::Result<HeaderMap> {
 }
 
 /// Resolve where to write: an explicit file, a name inside an explicit directory, or a name inferred
-/// from the URL (under `--directory-prefix`). Refuses to clobber an existing file without `-f`, and
-/// creates missing parents unless `--no-directories`.
-fn resolve_output(cli: &Cli) -> eyre::Result<PathBuf> {
+/// from the resource (its `Content-Disposition`, else the URL) under `--directory-prefix`. Refuses to
+/// clobber an existing file without `-f`, and creates missing parents unless `--no-directories`.
+async fn resolve_output(cli: &Cli, source: &HttpSource) -> eyre::Result<PathBuf> {
     let path = match &cli.output {
-        Some(dir) if dir.is_dir() => dir.join(url_basename(&cli.url)?),
+        Some(dir) if dir.is_dir() => dir.join(infer_name(cli, source).await?),
         Some(file) => file.to_path_buf(),
         None => {
-            let name = url_basename(&cli.url)?;
+            let name = infer_name(cli, source).await?;
             match &cli.directory_prefix {
                 Some(prefix) => prefix.join(name),
                 None => PathBuf::from(name),
@@ -169,6 +169,18 @@ fn resolve_output(cli: &Cli) -> eyre::Result<PathBuf> {
         }
     }
     Ok(path)
+}
+
+/// Infer an output filename: the resource's `Content-Disposition` if the server offers one, otherwise
+/// the URL's last path segment. Probing for the header is best-effort; if it fails, the real error
+/// surfaces later when the download itself probes.
+async fn infer_name(cli: &Cli, source: &HttpSource) -> eyre::Result<String> {
+    if let Ok(probe) = source.probe().await {
+        if let Some(name) = probe.filename {
+            return Ok(name);
+        }
+    }
+    url_basename(&cli.url)
 }
 
 /// The last path segment of the URL, for naming a downloaded file.

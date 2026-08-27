@@ -26,7 +26,7 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | `-n, --chunks <N>` | ✅ | concurrent chunks |
 | `-t, --tries <N>` | ✅ | numeric or `inf` |
 | `-H, --header <H>` (repeatable) | ✅ | custom request headers |
-| output filename inference | 🟡 | URL basename; Content-Disposition TODO |
+| output filename inference | ✅ | Content-Disposition (RFC 5987), else URL basename |
 | `-D, --directory-prefix`, `--no-directories` | ✅ | |
 | `-f, --overwrite` | ✅ | refuses to clobber without `-f`; `--force-append` TODO |
 | `--progress <bar\|plain\|json\|none>`, `--no-bar` | ✅ | auto-detects a TTY |

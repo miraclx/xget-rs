@@ -139,6 +139,12 @@ pub trait Source {
 pub trait Progress {
     /// The planned chunk sizes, in order, before fetching begins.
     fn start(&self, _chunks: &[u64]) {}
+    /// Bytes already present per chunk before fetching begins, in plan order: a resumed download's
+    /// chunks already on disk from an earlier run. A reporter shades these as downloaded-but-not-yet
+    /// -verified, so the bar opens where the previous run left off and the verify pass sweeps the
+    /// confirmed frontier up through them. These bytes did not arrive over the network this run, so they
+    /// are not [`Progress::received`] and never enter a speed estimate. Defaults to nothing.
+    fn restore(&self, _present: &[u64]) {}
     /// `bytes` more bytes arrived from the source for chunk `index`, buffered ahead of writing.
     fn received(&self, _index: usize, _bytes: u64) {}
     /// `bytes` more bytes of chunk `index` were written to the output and folded into the hash.

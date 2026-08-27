@@ -199,6 +199,12 @@ async fn fetch_scatter<S: Source, P: Progress>(
             received[index] = range.len();
         }
     }
+    // Show the resume where it starts: the bytes already on disk open as downloaded-but-unverified, so
+    // the bar picks up where the last run stopped and the verify pass sweeps the confirmed frontier
+    // through them. Only meaningful when resuming; a fresh run has nothing on disk.
+    if plan.resumed {
+        progress.restore(&received);
+    }
     let shared = Rc::new(Shared {
         received: RefCell::new(received),
         notify: Notify::new(),

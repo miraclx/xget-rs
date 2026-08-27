@@ -24,11 +24,11 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | flag | status | notes |
 | ---- | ------ | ----- |
 | `-n, --chunks <N>` | ✅ | concurrent chunks |
-| `-t, --tries <N>` | 🟡 | numeric; want `inf` |
+| `-t, --tries <N>` | ✅ | numeric or `inf` |
 | `-H, --header <H>` (repeatable) | ✅ | custom request headers |
-| output filename inference (Content-Disposition / URL) | ⬜ | must name output explicitly today |
-| `-D, --directory-prefix`, `--no-directories` | ⬜ | |
-| `-f, --overwrite`, `--force-append` | ⬜ | currently overwrites |
+| output filename inference | 🟡 | URL basename; Content-Disposition TODO |
+| `-D, --directory-prefix`, `--no-directories` | ✅ | |
+| `-f, --overwrite` | ✅ | refuses to clobber without `-f`; `--force-append` TODO |
 | `--progress <bar|plain|json|none>`, `--no-bar` | 🟡 | bar only |
 | `--raw-sizes` | ⬜ | human sizes only |
 | `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512 |

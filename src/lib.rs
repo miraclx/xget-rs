@@ -12,11 +12,17 @@
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+mod engine;
+mod http;
 mod plan;
 
 #[cfg(test)]
+mod http_tests;
+#[cfg(test)]
 mod plan_tests;
 
+pub use crate::engine::{Report, download};
+pub use crate::http::HttpSource;
 pub use crate::plan::plan;
 
 /// A half-open byte range `[start, end)`.

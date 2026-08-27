@@ -4,6 +4,7 @@
 //! and IMDS), so credentials are never hand-parsed here. An explicit `endpoint_url` with path-style
 //! addressing lets the same source reach S3-compatible stores like Cloudflare R2, MinIO, and Backblaze.
 
+use aws_credential_types::provider::ProvideCredentials as _;
 use aws_sdk_s3::config::BehaviorVersion;
 use futures::StreamExt as _;
 use tokio_util::io::ReaderStream;
@@ -18,17 +19,32 @@ pub struct S3Source {
 }
 
 impl S3Source {
-    /// Build a source for `key` in `bucket`, resolving credentials from the default AWS chain
-    /// (environment variables, shared config or profile, and IMDS). When `endpoint_url` is set the
-    /// client targets that endpoint with path-style addressing, so an S3-compatible store (R2, MinIO,
-    /// Backblaze) works without a bucket-as-subdomain DNS name.
+    /// Build a source for `key` in `bucket`. Credentials come from the default AWS chain (environment
+    /// variables, shared config or profile, and IMDS) and are used to sign requests when the chain
+    /// resolves any; when it resolves none, requests go out unsigned so a public bucket still works.
+    /// Presence of credentials decides it, not a flag. When `endpoint_url` is set the client targets
+    /// that endpoint with path-style addressing, so an S3-compatible store (R2, MinIO, Backblaze) works
+    /// without a bucket-as-subdomain DNS name.
     pub async fn new(
         bucket: impl Into<String>,
         key: impl Into<String>,
         endpoint_url: Option<String>,
     ) -> Self {
-        let loader = aws_config::defaults(BehaviorVersion::latest());
-        let shared = loader.load().await;
+        let shared = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        // Sign only if the chain actually yields credentials; otherwise reload without them so the
+        // client sends anonymous requests instead of failing on a missing credential provider.
+        let signed = match shared.credentials_provider() {
+            Some(provider) => provider.provide_credentials().await.is_ok(),
+            None => false,
+        };
+        let shared = if signed {
+            shared
+        } else {
+            aws_config::defaults(BehaviorVersion::latest())
+                .no_credentials()
+                .load()
+                .await
+        };
         let mut builder = aws_sdk_s3::config::Builder::from(&shared);
         if let Some(endpoint_url) = endpoint_url {
             builder = builder.endpoint_url(endpoint_url).force_path_style(true);

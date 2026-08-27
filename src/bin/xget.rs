@@ -105,6 +105,9 @@ enum ProgressMode {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    // Load a .env from the working directory if present, so credentials (e.g. for an s3:// URL) can
+    // live there instead of being exported by hand. A missing file is not an error.
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     let headers = parse_headers(&cli.headers)?;
     let source = build_source(&cli, &headers).await?;

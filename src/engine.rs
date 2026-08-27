@@ -10,11 +10,10 @@ use std::path::Path;
 use bytes::Bytes;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
-use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc;
 
-use crate::{ByteRange, Error, Progress, Source, plan};
+use crate::{ByteRange, Checksum, Error, Progress, Source, plan};
 
 /// Buffers a chunk may read ahead before its fetch blocks on the reassembler. This is the
 /// memory-versus-parallelism knob (the JS `--cache-size`): larger lets a chunk download further ahead
@@ -27,8 +26,8 @@ const CHUNK_BUFFER: usize = 64;
 pub struct Report {
     /// The verified total length in bytes.
     pub length: u64,
-    /// The lowercase hex SHA-256 of the downloaded bytes.
-    pub sha256: String,
+    /// The lowercase hex checksum, or `None` if no checksum was requested.
+    pub hash: Option<String>,
 }
 
 /// Download the resource behind `source` into `output`, fetching up to `parts` chunks in parallel and
@@ -43,6 +42,7 @@ pub async fn download<S: Source, P: Progress>(
     output: &Path,
     parts: u32,
     retries: u32,
+    checksum: Checksum,
     progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
@@ -82,13 +82,16 @@ pub async fn download<S: Source, P: Progress>(
         Ok::<(), Error>(())
     };
 
-    let (fetched, hashed) = tokio::join!(fetch_all, reassemble(receivers, file, probe.length));
+    let (fetched, hashed) = tokio::join!(
+        fetch_all,
+        reassemble(receivers, file, probe.length, checksum)
+    );
     fetched?;
-    let sha256 = hashed?;
+    let hash = hashed?;
     progress.finish();
     Ok(Report {
         length: probe.length,
-        sha256,
+        hash,
     })
 }
 
@@ -169,12 +172,15 @@ async fn reassemble(
     receivers: Vec<mpsc::Receiver<Bytes>>,
     mut file: tokio::fs::File,
     total: u64,
-) -> Result<String, Error> {
-    let mut hasher = Sha256::new();
+    checksum: Checksum,
+) -> Result<Option<String>, Error> {
+    let mut hasher = checksum.hasher();
     let mut written = 0u64;
     for mut receiver in receivers {
         while let Some(bytes) = receiver.recv().await {
-            hasher.update(&bytes);
+            if let Some(hasher) = hasher.as_mut() {
+                hasher.update(&bytes);
+            }
             file.write_all(&bytes).await.map_err(io)?;
             written += bytes.len() as u64;
         }
@@ -186,7 +192,7 @@ async fn reassemble(
             received: written,
         });
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(hasher.map(|mut hasher| hex::encode(hasher.finalize_reset())))
 }
 
 /// Exponential backoff before a retry, capped at a few seconds.

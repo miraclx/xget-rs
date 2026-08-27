@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use libxget::{HttpSource, Progress};
+use libxget::{Checksum, HttpSource, Progress};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use xbytes::prelude::*;
 use xprogress::{Bar, Color, DrawTarget, Style, Width};
@@ -28,6 +28,9 @@ struct Cli {
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
+    /// Checksum to verify the download with: none, md5, sha1, sha256, or sha512.
+    #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
+    checksum: Checksum,
 }
 
 #[tokio::main]
@@ -35,12 +38,20 @@ async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
     let source = HttpSource::new(&cli.url, parse_headers(&cli.headers)?)?;
     let progress = BarProgress::new();
-    let report = libxget::download(&source, &cli.output, cli.chunks, cli.tries, &progress).await?;
-    println!(
-        "{}  {}",
-        report.sha256,
-        ByteSize::of(report.length, BYTE).iec()
-    );
+    let report = libxget::download(
+        &source,
+        &cli.output,
+        cli.chunks,
+        cli.tries,
+        cli.checksum,
+        &progress,
+    )
+    .await?;
+    let size = ByteSize::of(report.length, BYTE).iec();
+    match report.hash {
+        Some(hash) => println!("{}:{hash}  {size}", cli.checksum),
+        None => println!("{size}"),
+    }
     Ok(())
 }
 

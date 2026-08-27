@@ -12,6 +12,7 @@
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+mod checksum;
 mod engine;
 mod http;
 mod plan;
@@ -21,6 +22,7 @@ mod http_tests;
 #[cfg(test)]
 mod plan_tests;
 
+pub use crate::checksum::{Checksum, UnknownChecksum};
 pub use crate::engine::{Report, download};
 pub use crate::http::HttpSource;
 pub use crate::plan::plan;

@@ -13,7 +13,7 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | range-not-honored / length gates | ✅ | typed `RangeNotHonored` / `LengthMismatch` |
 | bounded memory (no StreamCache) | ✅ | `parts * CHUNK_BUFFER` buffers |
 | single-stream fetch for non-range sources | ⬜ | currently a typed error |
-| configurable checksum algorithm | 🟡 | sha256 only; want sha1/sha512/blake3 + none |
+| configurable checksum algorithm | ✅ | none/md5/sha1/sha256/sha512 |
 | resume a partial FILE across runs (`-c`) | ⬜ | different from per-chunk retry |
 | start from offset (`-i, --start-pos`) | ⬜ | |
 | inactivity timeout (`--timeout`) | ⬜ | |
@@ -31,7 +31,7 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | `-f, --overwrite`, `--force-append` | ⬜ | currently overwrites |
 | `--progress <bar|plain|json|none>`, `--no-bar` | 🟡 | bar only |
 | `--raw-sizes` | ⬜ | human sizes only |
-| `--hash [algo]` reporting | 🟡 | always sha256 |
+| `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512 |
 | `--continue`, `--start-pos`, `--timeout`, `--cache-size` | ⬜ | see engine |
 
 ## Progress

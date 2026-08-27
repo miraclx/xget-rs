@@ -14,7 +14,7 @@ use core::time::Duration;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use xbytes::ByteSize;
-use xbytes::sizes::all::MEBI_BYTE;
+use xbytes::sizes::MEBI_BYTE;
 
 mod checksum;
 mod engine;

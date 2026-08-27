@@ -18,7 +18,7 @@ use futures::stream::FuturesUnordered;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use xbytes::ByteSize;
-use xbytes::sizes::all::MEBI_BYTE;
+use xbytes::sizes::MEBI_BYTE;
 
 use crate::plan::plan_range;
 use crate::{ByteRange, Checksum, Error, Options, Progress, Source};

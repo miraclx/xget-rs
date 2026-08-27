@@ -11,7 +11,8 @@ use libxget::{
     ByteRange, ByteStream, Checksum, Error, HttpSource, Mirrors, Probe, Progress, Source,
 };
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use xbytes::prelude::*;
+use xbytes::ByteSize;
+use xbytes::sizes::BYTE;
 use xprogress::{Bar, Color, DrawTarget, Style};
 
 /// The bar takes at most this fraction of the terminal width, so it scales with the screen instead of

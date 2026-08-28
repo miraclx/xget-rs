@@ -31,9 +31,7 @@ use crate::{ByteRange, Checksum, Error, Options, Progress, Source, control};
 
 /// How many freshly downloaded bytes a chunk accumulates before it checkpoints its flushed prefix to the
 /// control trailer, so an interrupt loses at most this much of an in-flight chunk's progress.
-fn checkpoint_bytes() -> u64 {
-    ByteSize::of(4, MEBI_BYTE).byte_count() as u64
-}
+const CHECKPOINT_BYTES: u64 = ByteSize::of_int(4, MEBI_BYTE).byte_count() as u64;
 
 /// The outcome of a completed download.
 #[derive(Clone, Debug)]
@@ -328,7 +326,7 @@ impl Sink<'_> {
             progress.received(self.index, len);
             // Persist this chunk's flushed prefix now and then, so a resume keeps partial progress and
             // does not refetch it. The bytes are already flushed, so the recorded range is on disk.
-            if *offset - self.checkpointed >= checkpoint_bytes() {
+            if *offset - self.checkpointed >= CHECKPOINT_BYTES {
                 self.writer
                     .lock()
                     .await

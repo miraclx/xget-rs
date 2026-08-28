@@ -60,6 +60,10 @@ struct Cli {
     /// for HTTP URLs.
     #[arg(long, value_name = "URL")]
     endpoint_url: Option<String>,
+    /// Gateway for an `ipfs://` URL (e.g. http://127.0.0.1:8080). Defaults to $IPFS_GATEWAY, then the
+    /// local daemon's ~/.ipfs/gateway, then a public gateway. Ignored for other URLs.
+    #[arg(long, value_name = "URL")]
+    ipfs_gateway: Option<String>,
     /// Checksum to verify the download with: none, md5, sha1, sha256, sha512, or blake3.
     #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
     checksum: Checksum,
@@ -216,6 +220,9 @@ enum AnySource {
     /// An object in an S3 (or S3-compatible) bucket.
     #[cfg(feature = "s3")]
     S3(libxget::S3Source),
+    /// Content-addressed data behind an `ipfs://` URL, fetched through a gateway.
+    #[cfg(feature = "ipfs")]
+    Ipfs(libxget::IpfsSource),
 }
 
 impl Source for AnySource {
@@ -224,6 +231,8 @@ impl Source for AnySource {
             Self::Http(source) => source.probe().await,
             #[cfg(feature = "s3")]
             Self::S3(source) => source.probe().await,
+            #[cfg(feature = "ipfs")]
+            Self::Ipfs(source) => source.probe().await,
         }
     }
 
@@ -232,6 +241,8 @@ impl Source for AnySource {
             Self::Http(source) => source.fetch(range).await,
             #[cfg(feature = "s3")]
             Self::S3(source) => source.fetch(range).await,
+            #[cfg(feature = "ipfs")]
+            Self::Ipfs(source) => source.fetch(range).await,
         }
     }
 }
@@ -242,6 +253,9 @@ impl Source for AnySource {
 async fn build_source(cli: &Cli, headers: &HeaderMap) -> eyre::Result<AnySource> {
     if let Some(rest) = cli.url.strip_prefix("s3://") {
         return build_s3_source(rest, cli.endpoint_url.clone()).await;
+    }
+    if let Some(rest) = cli.url.strip_prefix("ipfs://") {
+        return build_ipfs_source(rest, cli.ipfs_gateway.clone());
     }
     // The primary plus any --mirror URLs, tried in order on failure. With no mirrors this is just the
     // primary, so there is one download path.
@@ -271,6 +285,19 @@ async fn build_s3_source(rest: &str, endpoint_url: Option<String>) -> eyre::Resu
 #[cfg(not(feature = "s3"))]
 async fn build_s3_source(_rest: &str, _endpoint_url: Option<String>) -> eyre::Result<AnySource> {
     eyre::bail!("s3:// requires building with --features s3")
+}
+
+/// Build an IPFS source from the part of an `ipfs://` URL after the scheme: a CID, optionally followed
+/// by a path. Only available when built with `--features ipfs`.
+#[cfg(feature = "ipfs")]
+fn build_ipfs_source(rest: &str, gateway: Option<String>) -> eyre::Result<AnySource> {
+    Ok(AnySource::Ipfs(libxget::IpfsSource::new(rest, gateway)?))
+}
+
+/// Reject an `ipfs://` URL when the `ipfs` feature was not compiled in.
+#[cfg(not(feature = "ipfs"))]
+fn build_ipfs_source(_rest: &str, _gateway: Option<String>) -> eyre::Result<AnySource> {
+    eyre::bail!("ipfs:// requires building with --features ipfs")
 }
 
 /// Print the block shown before a live bar: the URL, how many chunks, the length and media type, and

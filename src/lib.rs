@@ -18,6 +18,8 @@ mod checksum;
 mod control;
 mod engine;
 mod http;
+#[cfg(feature = "ipfs")]
+mod ipfs;
 mod mirror;
 mod plan;
 #[cfg(feature = "s3")]
@@ -25,6 +27,8 @@ mod s3;
 
 #[cfg(test)]
 mod http_tests;
+#[cfg(all(test, feature = "ipfs"))]
+mod ipfs_tests;
 #[cfg(test)]
 mod mirror_tests;
 #[cfg(test)]
@@ -41,6 +45,8 @@ pub async fn resumable(output: &std::path::Path) -> bool {
 }
 
 pub use crate::http::HttpSource;
+#[cfg(feature = "ipfs")]
+pub use crate::ipfs::IpfsSource;
 pub use crate::mirror::Mirrors;
 pub use crate::plan::plan;
 #[cfg(feature = "s3")]

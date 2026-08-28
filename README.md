@@ -61,6 +61,8 @@ xget https://example.com/big.iso --expect sha256:9f86d0818...
 xget https://example.com/big.iso --expect https://example.com/big.iso.sha256sum
 ```
 
+![a checksum mismatch fails loudly and exits non-zero](media/expect.gif)
+
 Resume an interrupted download. A partial resumes automatically on a re-run with no flag; `-c` forces
 resuming and `--restart` forces a fresh start:
 
@@ -78,6 +80,8 @@ non-AWS store. If the object carries a stored checksum, it is verified automatic
 xget s3://my-bucket/big.iso
 xget s3://my-bucket/big.iso --endpoint-url https://s3.example.com
 ```
+
+![an S3 object verified automatically against its stored checksum](media/s3.gif)
 
 Download from IPFS through an HTTP gateway (needs the `ipfs` feature). A CID that addresses raw bytes is
 verified against its own hash for free:

@@ -77,7 +77,12 @@ pub async fn download<S: Source, P: Progress>(
         let plan = resume_plan(&part, probe.length, &options).await?;
         tracing::debug!(
             chunks = plan.ranges.len(),
-            already_done = plan.completed.len(),
+            already_done = plan
+                .received
+                .iter()
+                .zip(&plan.ranges)
+                .filter(|(received, range)| **received >= range.len())
+                .count(),
             resumed = plan.resumed,
             "planned download"
         );
@@ -129,15 +134,15 @@ pub(crate) fn part_path(output: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// How a scatter download is laid out: the chunks tiling `[0, total)`, which of them are already on disk
-/// from a previous run, and whether this continues an existing `.part`.
+/// How a scatter download is laid out: the chunks tiling `[0, total)`, how many bytes of each are
+/// already on disk from a previous run, and whether this continues an existing `.xget`.
 struct ResumePlan {
-    /// The chunks to fetch, tiling `[0, total)` in order. On a resume these align to the bytes already
-    /// present, so a chunk is either entirely on disk or entirely to fetch.
+    /// The chunks to fetch, tiling `[0, total)` in order, the same as a fresh run would use.
     ranges: Vec<ByteRange>,
-    /// Indices into `ranges` whose whole region is already on disk.
-    completed: Vec<usize>,
-    /// Whether this continues an existing `.part` (so it must not be truncated).
+    /// How many bytes of each chunk are already on disk, as a prefix from the chunk's start. A chunk
+    /// whose received equals its length is complete and skipped; otherwise it resumes from that offset.
+    received: Vec<u64>,
+    /// Whether this continues an existing `.xget` (so it must not be truncated).
     resumed: bool,
 }
 
@@ -147,10 +152,14 @@ struct ResumePlan {
 /// run that started it. A file with no valid control cannot be safely resumed (its holes are unknown),
 /// so it is an error rather than a corrupt result.
 async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<ResumePlan, Error> {
-    let fresh = || ResumePlan {
-        ranges: plan_range(0, total, options.parts),
-        completed: Vec::new(),
-        resumed: false,
+    let fresh = || {
+        let ranges = plan_range(0, total, options.parts);
+        let received = vec![0u64; ranges.len()];
+        ResumePlan {
+            ranges,
+            received,
+            resumed: false,
+        }
     };
     if !options.resume {
         return Ok(fresh());
@@ -158,10 +167,10 @@ async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<Resum
     if let Some(control) = control::read(part).await
         && control.total == total
     {
-        let (ranges, completed) = plan_resume(total, options.parts, &control.done);
+        let (ranges, received) = plan_resume(total, options.parts, &control.done);
         return Ok(ResumePlan {
             ranges,
-            completed,
+            received,
             resumed: true,
         });
     }
@@ -205,24 +214,19 @@ async fn fetch_scatter<S: Source, P: Progress>(
     writer: &Rc<Mutex<Writer>>,
 ) -> Result<Option<String>, Error> {
     let ranges = &plan.ranges;
-    let completed = &plan.completed;
+    // How much of each chunk is already on disk: its resume prefix (zero for a fresh run).
+    let received = &plan.received;
     let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
     progress.start(&sizes);
 
-    // Chunks already on disk from a previous run start full, so the verifier counts them and reads them
-    // back, and their fetch is skipped.
-    let mut received = vec![0u64; ranges.len()];
-    for &index in completed {
-        received[index] = ranges[index].len();
-    }
     // Show the resume where it starts: the bytes already on disk open as downloaded-but-unverified, so
     // the bar picks up where the last run stopped and the verify pass sweeps the confirmed frontier
     // through them. Only meaningful when resuming; a fresh run has nothing on disk.
     if plan.resumed {
-        progress.restore(&received);
+        progress.restore(received);
     }
     let shared = Rc::new(Shared {
-        received: RefCell::new(received),
+        received: RefCell::new(received.clone()),
         notify: Notify::new(),
         failed: Cell::new(false),
     });
@@ -234,16 +238,21 @@ async fn fetch_scatter<S: Source, P: Progress>(
         .copied()
         .enumerate()
         .map(|(index, range)| {
-            let done = completed.contains(&index);
+            let chunk = Chunk {
+                index,
+                range,
+                resume_from: range.start + received[index],
+            };
+            let complete = received[index] >= range.len();
             let scatter = Scatter {
                 shared: Rc::clone(&shared),
                 writer: Rc::clone(writer),
             };
             async move {
-                if done {
+                if complete {
                     Ok(())
                 } else {
-                    scatter_one(source, part, index, range, options, progress, &scatter).await
+                    scatter_one(source, part, chunk, options, progress, &scatter).await
                 }
             }
         })
@@ -284,6 +293,15 @@ struct Shared {
 struct Scatter {
     shared: Rc<Shared>,
     writer: Rc<Mutex<Writer>>,
+}
+
+/// One chunk to fetch: its position in the plan, the byte range it covers, and the offset to resume from
+/// (its start for a fresh chunk, past its on-disk prefix for a resumed one).
+#[derive(Clone, Copy)]
+struct Chunk {
+    index: usize,
+    range: ByteRange,
+    resume_from: u64,
 }
 
 /// One chunk's write target: its own file handle, its range, the shared state it reports into, and the
@@ -355,17 +373,22 @@ impl Sink<'_> {
     }
 }
 
-/// Download one chunk's range into `part` at its offset, resuming from where it dropped with backoff.
-/// Each chunk holds its own file handle, so concurrent writes to different offsets never contend.
+/// Download `chunk`'s range into `part` at its offset, starting from `chunk.resume_from` (past any
+/// on-disk prefix) and resuming from where it drops with backoff. Each chunk holds its own file handle,
+/// so concurrent writes to different offsets never contend.
 async fn scatter_one<S: Source, P: Progress>(
     source: &S,
     part: &Path,
-    index: usize,
-    range: ByteRange,
+    chunk: Chunk,
     options: Options,
     progress: &P,
     scatter: &Scatter,
 ) -> Result<(), Error> {
+    let Chunk {
+        index,
+        range,
+        resume_from,
+    } = chunk;
     let file = OpenOptions::new()
         .write(true)
         .open(part)
@@ -377,15 +400,16 @@ async fn scatter_one<S: Source, P: Progress>(
         file,
         shared: &scatter.shared,
         writer: &scatter.writer,
-        checkpointed: range.start,
+        checkpointed: resume_from,
         checkpoint_at: Instant::now(),
     };
-    let mut offset = range.start;
+    let mut offset = resume_from;
     let mut last_error = None;
     tracing::debug!(
         chunk = index,
         start = range.start,
         end = range.end,
+        resume_from,
         "opening chunk"
     );
     for attempt in 0..=options.retries {

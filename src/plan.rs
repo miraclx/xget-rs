@@ -36,21 +36,21 @@ pub fn plan_range(start: u64, end: u64, parts: u32) -> Vec<ByteRange> {
     ranges
 }
 
-/// Plan a resume: tile `[0, total)` into ~`parts` uniform chunks, cutting at every boundary of the byte
-/// ranges already on disk so no chunk ever straddles a done/missing edge, and returning the indices of
-/// the chunks that are fully on disk. Both the done regions and the gaps are subdivided to the same
-/// target size, so a resume shows the same uniform chunks a fresh run would, with some already complete
-/// (five chunks with two done stays five chunks, two done; switching to ten makes ten, with the covered
-/// ones marked done).
+/// Plan a resume as the same `parts` chunks a fresh run uses, each paired with how many of its bytes are
+/// already on disk as a contiguous prefix. A chunk downloads sequentially from its start, so its bytes
+/// on disk are a prefix `[chunk.start, chunk.start + received)`; the chunk resumes by fetching only the
+/// rest, exactly like retrying a connection dropped mid-chunk. Keeping the same chunks, rather than
+/// re-cutting the file around the recorded ranges, is what keeps the progress view the fixed `parts`
+/// chunks each shown partially done, instead of fragmenting into many.
 ///
-/// This is what lets a resume re-chunk with a different `parts` than the run that started it: the plan
-/// is rebuilt from the bytes actually present, not from the old chunk count. The returned ranges tile
-/// `[0, total)` exactly and in order, so the engine's contiguous-prefix verify works over them unchanged.
 /// `done` ranges may be unsorted, overlapping, adjacent, or reach past `total`; they are clamped and
-/// merged first.
+/// merged first. When `parts` differs from the run that recorded the ranges, a chunk's on-disk bytes may
+/// not be a clean prefix (a hole can fall inside it); only the leading contiguous run is credited and
+/// the rest is refetched.
 #[must_use]
-pub fn plan_resume(total: u64, parts: u32, done: &[ByteRange]) -> (Vec<ByteRange>, Vec<usize>) {
-    // Clamp to the resource and merge, so stale, overlapping, or adjacent ranges do not break the tiling.
+pub fn plan_resume(total: u64, parts: u32, done: &[ByteRange]) -> (Vec<ByteRange>, Vec<u64>) {
+    let ranges = plan_range(0, total, parts);
+    // Clamp to the resource and merge, so stale, overlapping, or adjacent ranges do not mislead.
     let clamped: Vec<ByteRange> = done
         .iter()
         .map(|range| ByteRange {
@@ -61,33 +61,30 @@ pub fn plan_resume(total: u64, parts: u32, done: &[ByteRange]) -> (Vec<ByteRange
         .collect();
     let done = merge_ranges(clamped);
 
-    // The target chunk size that ~`parts` chunks over the whole resource would use, so every subdivided
-    // segment lands near it and the plan reads as uniform chunks regardless of what is already done.
-    let target = total.div_ceil(u64::from(parts.max(1))).max(1);
-
-    let mut ranges = Vec::new();
-    let mut completed = Vec::new();
-    let mut cursor = 0;
-    for range in done {
-        if cursor < range.start {
-            subdivide(&mut ranges, cursor, range.start, target);
-        }
-        let first = ranges.len();
-        subdivide(&mut ranges, range.start, range.end, target);
-        completed.extend(first..ranges.len());
-        cursor = range.end;
-    }
-    if cursor < total {
-        subdivide(&mut ranges, cursor, total, target);
-    }
-    (ranges, completed)
+    let received = ranges
+        .iter()
+        .map(|chunk| contiguous_prefix(*chunk, &done))
+        .collect();
+    (ranges, received)
 }
 
-/// Split `[start, end)` into contiguous chunks of about `target` bytes each and append them, so a done
-/// region or a gap is tiled at the same granularity as the rest of the plan.
-fn subdivide(ranges: &mut Vec<ByteRange>, start: u64, end: u64, target: u64) {
-    let pieces = (end - start).div_ceil(target).clamp(1, u64::from(u32::MAX)) as u32;
-    ranges.extend(plan_range(start, end, pieces));
+/// How many bytes of `chunk`, from its start, `done` covers without a gap. `done` is sorted and
+/// non-overlapping. A hole before the chunk end stops the count there, so only the leading run is
+/// credited and any covered bytes past the hole are ignored (they are refetched).
+fn contiguous_prefix(chunk: ByteRange, done: &[ByteRange]) -> u64 {
+    let mut frontier = chunk.start;
+    for range in done {
+        if range.start > frontier {
+            break;
+        }
+        if range.end > frontier {
+            frontier = range.end.min(chunk.end);
+        }
+        if frontier >= chunk.end {
+            break;
+        }
+    }
+    frontier - chunk.start
 }
 
 /// Sort and coalesce ranges so the result is non-overlapping and gap-free between touching ranges, which

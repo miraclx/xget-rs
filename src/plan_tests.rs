@@ -81,91 +81,66 @@ fn planning_a_whole_resource_matches_planning_its_full_range() {
 }
 
 #[test]
-fn a_resume_with_nothing_done_matches_a_fresh_plan() {
-    let (ranges, completed) = plan_resume(1000, 5, &[]);
+fn a_resume_uses_the_same_chunks_as_a_fresh_run() {
+    // Nothing on disk: the same chunks a fresh run would use, all with zero received.
+    let (ranges, received) = plan_resume(1000, 5, &[]);
     assert_eq!(ranges, plan_range(0, 1000, 5));
-    assert!(completed.is_empty());
+    assert_eq!(received, [0, 0, 0, 0, 0]);
 }
 
 #[test]
-fn a_resume_tiles_the_whole_resource_into_uniform_chunks_with_some_done() {
-    // 500 bytes already on disk at the front. The whole resource re-splits into ~uniform chunks, and the
-    // pieces inside the on-disk range are the ones marked done (not one merged chunk).
-    let (ranges, completed) = plan_resume(1000, 4, &[ByteRange { start: 0, end: 500 }]);
-    covers_exactly(&ranges, 1000);
-    let done_bytes: u64 = completed.iter().map(|&index| ranges[index].len()).sum();
-    assert_eq!(
-        done_bytes, 500,
-        "the done pieces cover exactly the on-disk range"
-    );
-    assert!(
-        completed.iter().all(|&index| ranges[index].end <= 500),
-        "every done piece lies within the on-disk range"
-    );
-    // With a target near 1000/4, half the resource is more than one chunk.
-    assert!(
-        completed.len() >= 2,
-        "the done region is uniform chunks, not one"
-    );
+fn a_partial_chunk_resumes_from_its_prefix() {
+    // 100 bytes of the first 200-byte chunk are on disk: the plan stays five chunks, and only the first
+    // carries a received prefix, so the download fetches just that chunk's remaining 100 bytes.
+    let (ranges, received) = plan_resume(1000, 5, &[ByteRange { start: 0, end: 100 }]);
+    assert_eq!(ranges, plan_range(0, 1000, 5), "same five chunks as fresh");
+    assert_eq!(received, [100, 0, 0, 0, 0]);
 }
 
 #[test]
-fn a_resume_keeps_a_hole_in_the_middle_as_its_own_chunk() {
-    let (ranges, completed) = plan_resume(
+fn a_hole_before_a_chunks_prefix_is_not_credited() {
+    // A recorded range that does not start at the chunk's start (a hole precedes it) credits nothing:
+    // only a clean leading prefix counts, so the covered bytes past the hole are refetched.
+    let (_, received) = plan_resume(
         1000,
-        4,
+        5,
         &[ByteRange {
-            start: 400,
-            end: 600,
+            start: 50,
+            end: 150,
         }],
     );
-    covers_exactly(&ranges, 1000);
-    assert_eq!(completed.len(), 1);
     assert_eq!(
-        ranges[completed[0]],
-        ByteRange {
-            start: 400,
-            end: 600
-        }
+        received[0], 0,
+        "the [50,150) range is not a prefix of [0,200)"
     );
-    // No chunk straddles either boundary of the on-disk range.
-    assert!(ranges.iter().all(|r| r.end <= 400 || r.start >= 400));
-    assert!(ranges.iter().all(|r| r.end <= 600 || r.start >= 600));
 }
 
 #[test]
-fn a_resume_merges_overlapping_and_unsorted_done_ranges() {
+fn a_resume_credits_only_the_contiguous_prefix() {
+    // The first chunk [0,200) has [0,120) then a hole then [160,200): only the leading 120 count.
     let done = [
         ByteRange {
-            start: 600,
-            end: 800,
+            start: 160,
+            end: 200,
         },
-        ByteRange { start: 0, end: 300 },
-        ByteRange {
-            start: 250,
-            end: 400,
-        }, // overlaps the [0, 300) range
+        ByteRange { start: 0, end: 120 },
     ];
-    let (ranges, completed) = plan_resume(1000, 4, &done);
-    covers_exactly(&ranges, 1000);
-    // Merged to [0, 400) and [600, 800); the done pieces cover exactly those 600 bytes and nothing in
-    // the gaps between them.
-    let done_bytes: u64 = completed.iter().map(|&index| ranges[index].len()).sum();
-    assert_eq!(
-        done_bytes, 600,
-        "overlapping and out-of-order ranges are clamped and merged"
-    );
-    assert!(
-        completed
-            .iter()
-            .all(|&index| ranges[index].end <= 400 || ranges[index].start >= 600),
-        "every done piece lies within a merged on-disk region"
-    );
+    let (_, received) = plan_resume(1000, 5, &done);
+    assert_eq!(received[0], 120, "sorted and merged, then the prefix taken");
 }
 
 #[test]
-fn a_fully_downloaded_resume_is_all_done_and_still_tiles() {
-    let (ranges, completed) = plan_resume(
+fn a_different_parts_count_re_splits_and_credits_each_chunk() {
+    // Recorded as one 250-byte prefix, resumed as ten 100-byte chunks: the first two are complete, the
+    // third is half done, the rest empty. Same as the user's "ten chunks, some done" model.
+    let (ranges, received) = plan_resume(1000, 10, &[ByteRange { start: 0, end: 250 }]);
+    assert_eq!(ranges, plan_range(0, 1000, 10), "the requested ten chunks");
+    assert_eq!(received, [100, 100, 50, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn a_fully_downloaded_resume_has_every_chunk_complete() {
+    let (ranges, received) = plan_resume(
         1000,
         4,
         &[ByteRange {
@@ -173,10 +148,9 @@ fn a_fully_downloaded_resume_is_all_done_and_still_tiles() {
             end: 1000,
         }],
     );
-    covers_exactly(&ranges, 1000);
     assert_eq!(
-        completed.len(),
-        ranges.len(),
-        "every chunk is already on disk"
+        received,
+        ranges.iter().map(ByteRange::len).collect::<Vec<_>>(),
+        "each chunk's received equals its full length"
     );
 }

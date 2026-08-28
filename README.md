@@ -169,6 +169,39 @@ whether to `resume`. `Progress` is an opt-in trait with a no-op `()` implementat
 observe bytes as they are received and verified. Whether a resumable partial exists beside an output can
 be checked with `resumable`.
 
+## Differences from libxget-js
+
+xget is a rewrite, not a port: it keeps the shape of the original (chunked parallel range GET, a
+segmented progress bar, checksum reporting) but changes some behavior on purpose. If you are coming from
+[`libxget-js`](https://github.com/miraclx/libxget-js), the differences that matter:
+
+- **Verification is structural, not a stream you happen to hash.** Chunks scatter into a sparse file at
+  their offsets; one verifier reads the file back in order, hashing the contiguous prefix and gating on
+  the exact length. A reported digest certifies the bytes on disk, not a stream that was glued together
+  in memory.
+- **No `StreamCache`, no `--cache-size`.** Positioned writes mean there is no in-memory buffer to size
+  and parallelism is not bounded by it. A slow or dropped connection just resumes its chunk; the others
+  never idle waiting on it.
+- **Resume is range-based, automatic, and validated.** An interrupted download leaves a single
+  `<file>.xget` (data, a control trailer of the ranges written, and a footer). A re-run resumes it with
+  no flag, keeps the same chunk count, and picks each chunk up from its on-disk prefix. Before resuming
+  it checks a validator (HTTP `ETag`/`Last-Modified`, an S3 `ETag`, or an IPFS CID): if the resource
+  changed, the partial is discarded and the download restarts clean rather than splicing old and new
+  bytes. `-c` forces resuming, `--restart` forces fresh.
+- **No `--start-pos` or `--force-append`.** Both would produce bytes that cannot be verified against a
+  whole-resource checksum (a bare suffix, or an append to a file the engine never wrote), so they are
+  deliberate non-goals. The real reason to start mid-file, resuming, is handled by the control file
+  above.
+- **More than HTTP behind one engine.** The same engine drives S3 and S3-compatible stores (signing when
+  credentials resolve, anonymous when they do not) and IPFS through an HTTP gateway, behind the `s3` and
+  `ipfs` features. An S3 object's stored checksum, or a raw-bytes IPFS CID, verifies the download for
+  free.
+- **Sinks are explicit.** Write to a file, stream to stdout with `-`, discard for a speed test with
+  `/dev/null`, or (as a library) keep a resumable file and pipe the verified bytes onward at once with
+  `Output::tee`.
+
+The full feature-by-feature table, including what is intentionally different, is in [PARITY.md](PARITY.md).
+
 ## License
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.

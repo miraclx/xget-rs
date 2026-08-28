@@ -9,8 +9,10 @@
 //! Unlike curl, which trusts the gateway's bytes, a CID that addresses raw bytes carries the content's
 //! own hash, so the download is verified against its own address for free, no checksum supplied out of
 //! band. A CID that wraps a file in a UnixFS DAG (the usual case above one block) addresses the DAG root
-//! rather than the raw bytes, so it cannot be checked this way; verifying those needs the block-by-block
-//! DAG (a CAR response), which this does not yet do.
+//! rather than the raw bytes. Verifying one would mean fetching the whole DAG as a CAR and checking each
+//! block against its CID, which is a single-stream download with no byte ranges. Rather than give up the
+//! parallel, resumable range fetch this engine is built on, a DAG CID is trusted the way curl trusts the
+//! gateway, and only a raw CID is verified against its address.
 
 use std::env;
 use std::path::PathBuf;

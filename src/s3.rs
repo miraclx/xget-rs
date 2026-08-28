@@ -91,6 +91,12 @@ impl Source for S3Source {
         // works in hex, so decode and re-encode. Skip a composite multipart checksum (a `-N` suffix): it
         // is a checksum of part checksums, not of the whole object, so it cannot verify the download.
         let checksum = stored_checksum(&head);
+        // The object's ETag identifies this version, so a resume can tell it apart from a later upload
+        // to the same key. S3 always returns one on a successful head.
+        let validator = head
+            .e_tag()
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty());
 
         Ok(Probe {
             length,
@@ -98,6 +104,7 @@ impl Source for S3Source {
             filename,
             content_type,
             checksum,
+            validator,
         })
     }
 

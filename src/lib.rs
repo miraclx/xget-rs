@@ -162,6 +162,12 @@ pub struct Probe {
     pub filename: Option<String>,
     /// The resource's media type (from an HTTP `Content-Type`), if the source reports one.
     pub content_type: Option<String>,
+    /// A validator identifying this exact version of the resource: an HTTP `ETag` when offered, else
+    /// `Last-Modified`, else a source's own immutable identity (an IPFS CID). Recorded when a partial is
+    /// written and compared on resume, so a partial from a since-changed resource is discarded rather
+    /// than stitched. `None` when the source offers nothing to identify the version by, in which case
+    /// resume falls back to the length alone.
+    pub validator: Option<String>,
     /// A checksum the source vouches for, as an algorithm and lowercase hex digest (e.g. an S3 stored
     /// checksum). When present, a download can be verified against it with no hash supplied out of band.
     pub checksum: Option<(Checksum, String)>,

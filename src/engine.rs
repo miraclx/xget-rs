@@ -90,7 +90,7 @@ pub async fn download<S: Source, P: Progress>(
     );
 
     let hash = if probe.supports_ranges {
-        let plan = resume_plan(&part, probe.length, &options).await?;
+        let plan = resume_plan(&part, probe.length, probe.validator.as_deref(), &options).await?;
         tracing::debug!(
             chunks = plan.ranges.len(),
             already_done = plan
@@ -108,7 +108,7 @@ pub async fn download<S: Source, P: Progress>(
             Writer::open(&part, probe.length).await?
         } else {
             allocate_fresh(&part, probe.length).await?;
-            Writer::create(&part, probe.length).await?
+            Writer::create(&part, probe.length, probe.validator.as_deref()).await?
         };
         let writer = Rc::new(Mutex::new(writer));
         let hash = fetch_scatter(
@@ -277,7 +277,12 @@ struct ResumePlan {
 /// rebuilt around them with `options.parts` chunks, so a resume may use a different parallelism than the
 /// run that started it. A file with no valid control cannot be safely resumed (its holes are unknown),
 /// so it is an error rather than a corrupt result.
-async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<ResumePlan, Error> {
+async fn resume_plan(
+    part: &Path,
+    total: u64,
+    validator: Option<&str>,
+    options: &Options,
+) -> Result<ResumePlan, Error> {
     let fresh = || {
         let ranges = plan_range(0, total, options.parts);
         let received = vec![0u64; ranges.len()];
@@ -290,15 +295,26 @@ async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<Resum
     if !options.resume {
         return Ok(fresh());
     }
-    if let Some(control) = control::read(part).await
-        && control.total == total
-    {
-        let (ranges, received) = plan_resume(total, options.parts, &control.done);
-        return Ok(ResumePlan {
-            ranges,
-            received,
-            resumed: true,
-        });
+    if let Some(control) = control::read(part).await {
+        // We wrote this control, so the partial is ours to reason about. Resume it only if it is still
+        // the same resource: same length, and a validator that either matches or is absent on one side
+        // (nothing to compare, so fall back to the length alone). A changed resource is discarded, not
+        // stitched: the fresh plan's `allocate_fresh` truncates the stale bytes away. We never splice
+        // old and new bytes into one file.
+        if control.total == total && validators_agree(control.validator.as_deref(), validator) {
+            let (ranges, received) = plan_resume(total, options.parts, &control.done);
+            return Ok(ResumePlan {
+                ranges,
+                received,
+                resumed: true,
+            });
+        }
+        tracing::info!(
+            expected_len = control.total,
+            actual_len = total,
+            "the resource changed since the partial was written; restarting from scratch"
+        );
+        return Ok(fresh());
     }
     if file_len(part).await == 0 {
         Ok(fresh())
@@ -306,6 +322,17 @@ async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<Resum
         Err(detail(
             "cannot resume: no saved state in the partial file (use --restart to start over)",
         ))
+    }
+}
+
+/// Whether a stored validator and the resource's current validator are compatible for resume. Two
+/// present validators must be equal; if either side is absent there is nothing to compare, so this
+/// yields `true` and resume falls back to the length check that gates it. Absent-on-both is the
+/// no-validator case (a source that offers no `ETag`/`Last-Modified`): weaker, but the best available.
+fn validators_agree(stored: Option<&str>, current: Option<&str>) -> bool {
+    match (stored, current) {
+        (Some(stored), Some(current)) => stored == current,
+        _ => true,
     }
 }
 

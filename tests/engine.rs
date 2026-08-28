@@ -66,6 +66,7 @@ impl Source for FakeSource {
             filename: None,
             content_type: None,
             checksum: None,
+            validator: None,
         })
     }
 
@@ -274,6 +275,7 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
                 filename: None,
                 content_type: None,
                 checksum: None,
+                validator: None,
             })
         }
         async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
@@ -337,6 +339,7 @@ async fn resume_re_chunks_with_a_different_parts_count() {
                 filename: None,
                 content_type: None,
                 checksum: None,
+                validator: None,
             })
         }
         async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
@@ -394,6 +397,92 @@ async fn resume_re_chunks_with_a_different_parts_count() {
         std::fs::read(&scratch.path).expect("output present"),
         body,
         "the re-chunked resume holds every byte"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_validator_discards_the_partial_and_restarts_clean() {
+    // A range source that carries a validator and can drop everything from an offset, so a first pass
+    // leaves a partial tagged with its validator.
+    struct TaggedSource {
+        body: Arc<Vec<u8>>,
+        validator: String,
+        fail_from: u64,
+    }
+    impl Source for TaggedSource {
+        async fn probe(&self) -> Result<Probe, Error> {
+            Ok(Probe {
+                length: self.body.len() as u64,
+                supports_ranges: true,
+                filename: None,
+                content_type: None,
+                checksum: None,
+                validator: Some(self.validator.clone()),
+            })
+        }
+        async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
+            let range = range.expect("a range-capable fetch");
+            if range.start >= self.fail_from {
+                return Err(Error::Transport(Box::new(std::io::Error::other("drop"))));
+            }
+            let start = range.start as usize;
+            let end = (range.end as usize).min(self.body.len());
+            Ok(pieces(&self.body[start..end]))
+        }
+    }
+
+    let scratch = Scratch::new("validator-change");
+    let options = Options {
+        parts: 4,
+        retries: 1,
+        checksum: Checksum::Sha256,
+        resume: true,
+        ..Options::default()
+    };
+
+    // First pass: version one lands its early chunks then drops, leaving a partial tagged "v1".
+    let v1 = sample_body(4096);
+    let first = download(
+        &TaggedSource {
+            body: Arc::new(v1.clone()),
+            validator: "\"v1\"".to_owned(),
+            fail_from: 3072,
+        },
+        Output::File(&scratch.path),
+        options,
+        &(),
+    )
+    .await;
+    assert!(first.is_err(), "the first pass drops its tail");
+    assert!(scratch.part().exists(), "a partial is left behind");
+
+    // Second pass: the resource is now a different version of the *same length*, so the length check
+    // alone cannot tell it changed; only the validator can. A resume that reused the v1 prefix would
+    // splice v1 and v2 bytes into a corrupt file. The validator mismatch must force a clean restart, so
+    // the output is exactly v2.
+    let v2: Vec<u8> = v1.iter().map(|byte| byte ^ 0xff).collect();
+    let report = download(
+        &TaggedSource {
+            body: Arc::new(v2.clone()),
+            validator: "\"v2\"".to_owned(),
+            fail_from: u64::MAX,
+        },
+        Output::File(&scratch.path),
+        options,
+        &(),
+    )
+    .await
+    .expect("the restart completes against the new version");
+
+    assert_eq!(
+        report.hash.as_deref(),
+        Some(sha256_hex(&v2).as_str()),
+        "the output is wholly the new version, not a v1/v2 splice"
+    );
+    assert_eq!(
+        std::fs::read(&scratch.path).expect("output present"),
+        v2,
+        "every byte on disk is the new version's"
     );
 }
 

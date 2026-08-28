@@ -2,9 +2,11 @@
 //! plus a sidecar to keep in step.
 //!
 //! The layout is `[data: 0..total][trailer: completed-range text][footer: fixed]`. The sparse data
-//! occupies `[0, total)`; a text trailer of `done <start> <end>` lines records the byte ranges written
-//! and flushed; a fixed footer at the very end carries a magic, the total, and the trailer length, so a
-//! later run can find the trailer without knowing the total in advance. Chunk writes only ever touch the
+//! occupies `[0, total)`; a text trailer records, one per line, an optional leading `tag <validator>`
+//! (the resource validator, so a resume can tell the resource apart from a changed one) followed by
+//! `done <start> <end>` lines for the byte ranges written and flushed; a fixed footer at the very end
+//! carries a magic, the total, and the trailer length, so a later run can find the trailer without
+//! knowing the total in advance. Chunk writes only ever touch the
 //! data region, and control appends only ever touch the trailer and footer, so the two never collide.
 //! On success the trailer and footer are truncated away, leaving the file a byte-exact image to rename
 //! into place. A file whose footer does not validate (a foreign or truncated file) is simply not
@@ -28,6 +30,12 @@ const FOOTER: u64 = 32;
 pub(crate) struct Control {
     /// The resource's total length, to detect a stale control against a changed resource.
     pub total: u64,
+    /// The resource validator recorded when the partial was written: an HTTP `ETag` when the server
+    /// offered one, else `Last-Modified`, else the source's own immutable identity (an IPFS CID). On
+    /// resume it is compared against the resource as probed now; a mismatch means the resource changed,
+    /// so the partial is discarded rather than stitched into a corrupt file. `None` when the source
+    /// offered no validator, in which case resume falls back to the length alone.
+    pub validator: Option<String>,
     /// The byte ranges recorded as written, each an absolute `[start, end)`. May overlap or be partial
     /// (a checkpoint of an in-flight chunk); the planner clamps and merges them.
     pub done: Vec<ByteRange>,
@@ -59,7 +67,13 @@ pub(crate) async fn read(path: &Path) -> Option<Control> {
     let text = String::from_utf8(text).ok()?;
 
     let mut done = Vec::new();
+    let mut validator = None;
     for line in text.lines() {
+        // The validator is the rest of the line, so it may carry spaces (a `Last-Modified` date does).
+        if let Some(value) = line.strip_prefix("tag ") {
+            validator = Some(value.to_owned());
+            continue;
+        }
         let mut fields = line.split_whitespace();
         if fields.next() == Some("done")
             && let (Some(Ok(start)), Some(Ok(end))) =
@@ -68,7 +82,11 @@ pub(crate) async fn read(path: &Path) -> Option<Control> {
             done.push(ByteRange { start, end });
         }
     }
-    Some(Control { total, done })
+    Some(Control {
+        total,
+        validator,
+        done,
+    })
 }
 
 /// Whether `path` holds a resumable download: a valid control footer of the given total.
@@ -88,16 +106,27 @@ pub(crate) struct Writer {
 
 impl Writer {
     /// Begin control for a freshly allocated file whose data region is already `set_len` to `total`:
-    /// write the footer for an empty trailer.
-    pub(crate) async fn create(path: &Path, total: u64) -> Result<Writer, Error> {
+    /// seed the trailer with the resource `validator` (if any) as a `tag` line and write the footer.
+    pub(crate) async fn create(
+        path: &Path,
+        total: u64,
+        validator: Option<&str>,
+    ) -> Result<Writer, Error> {
         let mut file = open_rw(path).await?;
+        let trailer_text = match validator {
+            Some(value) => format!("tag {value}\n"),
+            None => String::new(),
+        };
+        let trailer = trailer_text.len() as u64;
         file.seek(SeekFrom::Start(total)).await.map_err(io)?;
-        file.write_all(&footer_bytes(total, 0)).await.map_err(io)?;
+        let mut buffer = trailer_text.into_bytes();
+        buffer.extend_from_slice(&footer_bytes(total, trailer));
+        file.write_all(&buffer).await.map_err(io)?;
         file.flush().await.map_err(io)?;
         Ok(Writer {
             file,
             total,
-            trailer: 0,
+            trailer,
         })
     }
 

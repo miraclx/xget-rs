@@ -1,7 +1,9 @@
 //! An HTTP [`Source`]: probe with a length request, fetch validated byte ranges.
 
 use futures::StreamExt as _;
-use reqwest::header::{CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, RANGE};
+use reqwest::header::{
+    CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
+};
 
 use crate::{ByteRange, ByteStream, Error, Probe, Source};
 
@@ -46,6 +48,16 @@ impl Source for HttpSource {
             .and_then(|value| value.to_str().ok())
             .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
             .filter(|value| !value.is_empty());
+        // Prefer the ETag (a version identifier the server maintains), else fall back to Last-Modified.
+        // Either lets a resume tell this version of the resource apart from a later, changed one.
+        let validator = response
+            .headers()
+            .get(ETAG)
+            .or_else(|| response.headers().get(LAST_MODIFIED))
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
 
         if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
             let length = response
@@ -60,6 +72,7 @@ impl Source for HttpSource {
                 filename,
                 content_type,
                 checksum: None,
+                validator,
             });
         }
         if response.status().is_success() {
@@ -72,6 +85,7 @@ impl Source for HttpSource {
                 filename,
                 content_type,
                 checksum: None,
+                validator,
             });
         }
         Err(detail(&format!(

@@ -34,6 +34,10 @@ const RAW_CODEC: u64 = 0x55;
 pub struct IpfsSource {
     http: HttpSource,
     checksum: Option<(Checksum, String)>,
+    /// The content-addressed identity of this resource (`<cid>[/path]`), used as the resume validator.
+    /// Being the address itself, it is immutable and gateway-independent, so a partial resumes across a
+    /// change of gateway and can never stitch a differently-addressed resource.
+    identity: String,
 }
 
 impl IpfsSource {
@@ -52,6 +56,7 @@ impl IpfsSource {
         Ok(Self {
             http,
             checksum: checksum_from_cid(&cid),
+            identity: format!("{cid}{path}"),
         })
     }
 }
@@ -64,6 +69,9 @@ impl Source for IpfsSource {
         if probe.checksum.is_none() {
             probe.checksum = self.checksum.clone();
         }
+        // The CID addresses the content itself, so it is a stronger, gateway-independent validator than
+        // whatever ETag a particular gateway happens to return.
+        probe.validator = Some(self.identity.clone());
         Ok(probe)
     }
 

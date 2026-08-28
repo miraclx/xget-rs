@@ -16,6 +16,7 @@ impl Source for Mock {
                 filename: None,
                 content_type: None,
                 checksum: None,
+                validator: None,
             })
         } else {
             Err(boom())

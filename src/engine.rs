@@ -15,6 +15,7 @@ use core::time::Duration;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
@@ -29,9 +30,14 @@ use crate::control::Writer;
 use crate::plan::{plan_range, plan_resume};
 use crate::{ByteRange, Checksum, Error, Options, Progress, Source, control};
 
-/// How many freshly downloaded bytes a chunk accumulates before it checkpoints its flushed prefix to the
-/// control trailer, so an interrupt loses at most this much of an in-flight chunk's progress.
+/// A chunk checkpoints its flushed prefix to the control trailer after this many freshly downloaded
+/// bytes, so a fast large chunk records often without a checkpoint per write.
 const CHECKPOINT_BYTES: u64 = ByteSize::of_int(4, MEBI_BYTE).byte_count() as u64;
+
+/// ...and at least this often while it is making progress, so a small or slow chunk that never reaches
+/// [`CHECKPOINT_BYTES`] still persists its partial progress and resumes near where it stopped rather
+/// than from zero.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The outcome of a completed download.
 #[derive(Clone, Debug)]
@@ -290,6 +296,8 @@ struct Sink<'a> {
     writer: &'a Rc<Mutex<Writer>>,
     /// The offset last written to the control trailer, so this chunk checkpoints only every so often.
     checkpointed: u64,
+    /// When it last checkpointed, so a slow chunk still records on a time basis, not only by bytes.
+    checkpoint_at: Instant,
 }
 
 impl Sink<'_> {
@@ -325,8 +333,12 @@ impl Sink<'_> {
             self.shared.notify.notify_one();
             progress.received(self.index, len);
             // Persist this chunk's flushed prefix now and then, so a resume keeps partial progress and
-            // does not refetch it. The bytes are already flushed, so the recorded range is on disk.
-            if *offset - self.checkpointed >= CHECKPOINT_BYTES {
+            // does not refetch it: after enough new bytes, or after enough time while progressing, so a
+            // small or slow chunk records too. The bytes are already flushed, so the range is on disk.
+            let progressed = *offset - self.checkpointed;
+            if progressed >= CHECKPOINT_BYTES
+                || (progressed > 0 && self.checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL)
+            {
                 self.writer
                     .lock()
                     .await
@@ -336,6 +348,7 @@ impl Sink<'_> {
                     })
                     .await?;
                 self.checkpointed = *offset;
+                self.checkpoint_at = Instant::now();
             }
         }
         Ok(())
@@ -365,6 +378,7 @@ async fn scatter_one<S: Source, P: Progress>(
         shared: &scatter.shared,
         writer: &scatter.writer,
         checkpointed: range.start,
+        checkpoint_at: Instant::now(),
     };
     let mut offset = range.start;
     let mut last_error = None;

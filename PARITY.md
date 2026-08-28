@@ -51,7 +51,6 @@ Honest tracking of libxget-js against xget-rs, so "done" means done. ✅ done ·
 | live segmented bar, one segment per chunk | ✅ | xprogress |
 | human size readout (done / total) | ✅ | xbytes |
 | speed and ETA | ✅ | rolling readout |
-| per-chunk detail / labels | 🟡 | the segmented bar shows each chunk's state; a per-chunk numeric readout is not built |
 | plain / json output modes | ✅ | `--progress plain\|json`, throttled |
 
 ## Deliberately different (➖)

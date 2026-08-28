@@ -9,19 +9,16 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncWriteExt as _;
 
-use crate::Error;
+use crate::{ByteRange, Error};
 
-/// The resumable state beside a `.part`: the plan the download was made with and the indices of chunks
-/// whose whole region is on disk.
+/// The resumable state beside a `.part`: the resource's length and the byte ranges whose whole region is
+/// on disk. Ranges rather than chunk indices, so a resume can re-chunk with a different parallelism than
+/// the run that started it: the plan is rebuilt from the bytes present, not from the old chunk count.
 pub(crate) struct Control {
     /// The resource's total length, to detect a stale control against a changed resource.
     pub total: u64,
-    /// How many chunks the remaining range was split into.
-    pub parts: u32,
-    /// The byte offset the chunk plan starts at (the resumed prefix ends here).
-    pub start: u64,
-    /// The indices of chunks that are fully written.
-    pub completed: Vec<usize>,
+    /// The byte ranges that are fully written, each an absolute `[start, end)` in the resource.
+    pub done: Vec<ByteRange>,
 }
 
 /// The control file path for a given `.part`.
@@ -34,17 +31,17 @@ pub(crate) fn path(part: &Path) -> PathBuf {
 /// Read the control file for `part`, or `None` if it is missing or unparseable.
 pub(crate) async fn read(part: &Path) -> Option<Control> {
     let text = tokio::fs::read_to_string(path(part)).await.ok()?;
-    let (mut total, mut parts, mut start) = (None, None, None);
-    let mut completed = Vec::new();
+    let mut total = None;
+    let mut done = Vec::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
-        match (fields.next(), fields.next()) {
-            (Some("total"), Some(value)) => total = value.parse().ok(),
-            (Some("parts"), Some(value)) => parts = value.parse().ok(),
-            (Some("start"), Some(value)) => start = value.parse().ok(),
-            (Some("done"), Some(value)) => {
-                if let Ok(index) = value.parse() {
-                    completed.push(index);
+        match fields.next() {
+            Some("total") => total = fields.next().and_then(|value| value.parse().ok()),
+            Some("done") => {
+                if let (Some(Ok(start)), Some(Ok(end))) =
+                    (fields.next().map(str::parse), fields.next().map(str::parse))
+                {
+                    done.push(ByteRange { start, end });
                 }
             }
             _ => {}
@@ -52,26 +49,25 @@ pub(crate) async fn read(part: &Path) -> Option<Control> {
     }
     Some(Control {
         total: total?,
-        parts: parts?,
-        start: start?,
-        completed,
+        done,
     })
 }
 
 /// Write a fresh control header for `part`, replacing any earlier one.
-pub(crate) async fn begin(part: &Path, total: u64, parts: u32, start: u64) -> Result<(), Error> {
-    let body = format!("total {total}\nparts {parts}\nstart {start}\n");
-    tokio::fs::write(path(part), body).await.map_err(io)
+pub(crate) async fn begin(part: &Path, total: u64) -> Result<(), Error> {
+    tokio::fs::write(path(part), format!("total {total}\n"))
+        .await
+        .map_err(io)
 }
 
-/// Record chunk `index` as fully written by appending a line, so two completions never clobber.
-pub(crate) async fn mark_done(part: &Path, index: usize) -> Result<(), Error> {
+/// Record `range` as fully written by appending a line, so two completions never clobber.
+pub(crate) async fn mark_done(part: &Path, range: ByteRange) -> Result<(), Error> {
     let mut file = tokio::fs::OpenOptions::new()
         .append(true)
         .open(path(part))
         .await
         .map_err(io)?;
-    file.write_all(format!("done {index}\n").as_bytes())
+    file.write_all(format!("done {} {}\n", range.start, range.end).as_bytes())
         .await
         .map_err(io)
 }

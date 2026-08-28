@@ -319,6 +319,84 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
 }
 
 #[tokio::test]
+async fn resume_re_chunks_with_a_different_parts_count() {
+    let body = sample_body(8192);
+    let scratch = Scratch::new("resume-rechunk");
+
+    // First pass with eight chunks; fail the tail so several early chunks land and are recorded.
+    struct PartialSource {
+        body: Arc<Vec<u8>>,
+        fail_from: u64,
+    }
+    impl Source for PartialSource {
+        async fn probe(&self) -> Result<Probe, Error> {
+            Ok(Probe {
+                length: self.body.len() as u64,
+                supports_ranges: true,
+                filename: None,
+                content_type: None,
+                checksum: None,
+            })
+        }
+        async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
+            let range = range.expect("a range-capable resume fetches ranges");
+            if range.start >= self.fail_from {
+                return Err(Error::Transport(Box::new(std::io::Error::other("drop"))));
+            }
+            let start = range.start as usize;
+            let end = (range.end as usize).min(self.body.len());
+            Ok(pieces(&self.body[start..end]))
+        }
+    }
+
+    let partial = PartialSource {
+        body: Arc::new(body.clone()),
+        fail_from: 5000,
+    };
+    let first = download(
+        &partial,
+        &scratch.path,
+        Options {
+            parts: 8,
+            retries: 1,
+            resume: true,
+            ..Options::default()
+        },
+        &(),
+    )
+    .await;
+    assert!(first.is_err(), "the first pass fails on the dropped tail");
+
+    // Resume with a different parallelism. The plan is rebuilt from the bytes present, so the new chunk
+    // count re-tiles only what is missing, and the download still verifies to the full digest.
+    let full = FakeSource::honest(body.clone());
+    let report = download(
+        &full,
+        &scratch.path,
+        Options {
+            parts: 3,
+            retries: 1,
+            resume: true,
+            ..Options::default()
+        },
+        &(),
+    )
+    .await
+    .expect("the resume completes with a different chunk count");
+
+    assert_eq!(
+        report.hash.as_deref(),
+        Some(sha256_hex(&body).as_str()),
+        "a re-chunked resume verifies to the same digest as a clean download"
+    );
+    assert_eq!(
+        std::fs::read(&scratch.path).expect("output present"),
+        body,
+        "the re-chunked resume holds every byte"
+    );
+}
+
+#[tokio::test]
 async fn a_non_range_source_streams_and_verifies() {
     let body = sample_body(3000);
     let source = FakeSource::new(body.clone(), false, Behavior::Honest);

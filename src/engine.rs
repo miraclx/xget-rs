@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::sync::Notify;
 
 use crate::checksum::Hasher;
-use crate::plan::plan_range;
+use crate::plan::{plan_range, plan_resume};
 use crate::{ByteRange, Checksum, Error, Options, Progress, Source, control};
 
 /// The outcome of a completed download.
@@ -63,15 +63,14 @@ pub async fn download<S: Source, P: Progress>(
     let hash = if probe.supports_ranges {
         let plan = resume_plan(&part, probe.length, &options).await?;
         tracing::debug!(
-            start = plan.start,
-            parts = plan.parts,
+            chunks = plan.ranges.len(),
             already_done = plan.completed.len(),
             resumed = plan.resumed,
             "planned download"
         );
         allocate(&part, probe.length, !plan.resumed).await?;
         if !plan.resumed {
-            control::begin(&part, probe.length, plan.parts, plan.start).await?;
+            control::begin(&part, probe.length).await?;
         }
         fetch_scatter(source, &part, probe.length, &plan, options, progress).await?
     } else {
@@ -100,48 +99,44 @@ fn part_path(output: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// How a scatter download starts: at a prefix offset, split into `parts` chunks, with some chunks
-/// already on disk from a previous run.
+/// How a scatter download is laid out: the chunks tiling `[0, total)`, which of them are already on disk
+/// from a previous run, and whether this continues an existing `.part`.
 struct ResumePlan {
-    /// The byte offset the chunk plan starts at.
-    start: u64,
-    /// How many chunks to split the remaining range into.
-    parts: u32,
-    /// Chunk indices already fully written on a previous run.
+    /// The chunks to fetch, tiling `[0, total)` in order. On a resume these align to the bytes already
+    /// present, so a chunk is either entirely on disk or entirely to fetch.
+    ranges: Vec<ByteRange>,
+    /// Indices into `ranges` whose whole region is already on disk.
     completed: Vec<usize>,
     /// Whether this continues an existing `.part` (so it must not be truncated).
     resumed: bool,
 }
 
-/// Work out how a download starts. Fresh, it is the whole resource in `options.parts` chunks. Resuming,
-/// the control file beside the `.part` says how far it got; a `.part` with no control file cannot be
-/// safely resumed (its holes are unknown), so it is an error rather than a corrupt result.
+/// Work out how a download is laid out. Fresh, it is the whole resource in `options.parts` chunks.
+/// Resuming, the control file beside the `.part` lists the byte ranges already written, and the plan is
+/// rebuilt around them with `options.parts` chunks over what remains, so a resume may use a different
+/// parallelism than the run that started it. A `.part` with no control file cannot be safely resumed
+/// (its holes are unknown), so it is an error rather than a corrupt result.
 async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<ResumePlan, Error> {
+    let fresh = || ResumePlan {
+        ranges: plan_range(0, total, options.parts),
+        completed: Vec::new(),
+        resumed: false,
+    };
     if !options.resume {
-        return Ok(ResumePlan {
-            start: 0,
-            parts: options.parts,
-            completed: Vec::new(),
-            resumed: false,
-        });
+        return Ok(fresh());
     }
     if let Some(control) = control::read(part).await
         && control.total == total
     {
+        let (ranges, completed) = plan_resume(total, options.parts, &control.done);
         return Ok(ResumePlan {
-            start: control.start,
-            parts: control.parts,
-            completed: control.completed,
+            ranges,
+            completed,
             resumed: true,
         });
     }
     if file_len(part).await == 0 {
-        Ok(ResumePlan {
-            start: 0,
-            parts: options.parts,
-            completed: Vec::new(),
-            resumed: false,
-        })
+        Ok(fresh())
     } else {
         Err(detail(
             "cannot resume: no saved state for this partial (delete the .part to start over)",
@@ -185,9 +180,8 @@ async fn fetch_scatter<S: Source, P: Progress>(
     options: Options,
     progress: &P,
 ) -> Result<Option<String>, Error> {
-    let start = plan.start;
+    let ranges = &plan.ranges;
     let completed = &plan.completed;
-    let ranges = plan_range(start, total, plan.parts);
     let sizes: Vec<u64> = ranges.iter().map(ByteRange::len).collect();
     progress.start(&sizes);
 
@@ -195,9 +189,7 @@ async fn fetch_scatter<S: Source, P: Progress>(
     // back, and their fetch is skipped.
     let mut received = vec![0u64; ranges.len()];
     for &index in completed {
-        if let Some(range) = ranges.get(index) {
-            received[index] = range.len();
-        }
+        received[index] = ranges[index].len();
     }
     // Show the resume where it starts: the bytes already on disk open as downloaded-but-unverified, so
     // the bar picks up where the last run stopped and the verify pass sweeps the confirmed frontier
@@ -245,15 +237,7 @@ async fn fetch_scatter<S: Source, P: Progress>(
 
     let (fetched, hashed) = tokio::join!(
         drive,
-        verify(
-            part,
-            start,
-            &ranges,
-            &shared,
-            options.checksum,
-            total,
-            progress
-        )
+        verify(part, ranges, &shared, options.checksum, total, progress)
     );
     fetched?;
     hashed
@@ -367,8 +351,8 @@ async fn scatter_one<S: Source, P: Progress>(
         }));
     }
     tracing::debug!(chunk = index, "chunk complete");
-    // Record the whole chunk as on disk, so a later run can skip it.
-    control::mark_done(part, index).await?;
+    // Record the whole chunk's byte range as on disk, so a later run skips it however it re-chunks.
+    control::mark_done(part, range).await?;
     Ok(())
 }
 
@@ -378,7 +362,6 @@ async fn scatter_one<S: Source, P: Progress>(
 /// whole file.
 async fn verify<P: Progress>(
     part: &Path,
-    start: u64,
     ranges: &[ByteRange],
     shared: &Rc<Shared>,
     checksum: Checksum,
@@ -389,15 +372,16 @@ async fn verify<P: Progress>(
     let mut reader = File::open(part).await.map_err(io)?;
     let mut buffer = vec![0u8; 128 * 1024];
 
-    // The resumed prefix is already on disk; fold it in first (it is not a planned chunk, so no report).
-    read_into(&mut reader, &mut hasher, start, &mut buffer).await?;
-    let mut hashed = start;
+    // The plan tiles the whole resource from zero, so verifying is a single in-order sweep of the
+    // contiguous prefix: chunks already on disk report their bytes as it passes over them, just like
+    // freshly fetched ones.
+    let mut hashed = 0;
 
     loop {
         if shared.failed.get() {
             return Err(detail("a chunk failed before it could be verified"));
         }
-        let frontier = start + contiguous_run(&shared.received.borrow(), ranges);
+        let frontier = contiguous_run(&shared.received.borrow(), ranges);
         while hashed < frontier {
             // Read no further than the current chunk's end, so each read is one chunk's bytes to report.
             let index = chunk_of(ranges, hashed);

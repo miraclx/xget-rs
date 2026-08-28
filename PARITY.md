@@ -14,10 +14,13 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | no memory buffering (no StreamCache) | ✅ | positioned writes, so parallelism is unbounded |
 | single-stream fetch for non-range sources | ✅ | one stream, hashed inline |
 | configurable checksum algorithm | ✅ | none/md5/sha1/sha256/sha512/blake3 |
-| resume a partial FILE across runs (`-c`) | ✅ | fetches the remainder; prefix folded into the verify pass |
+| resume a partial FILE across runs | ✅ | auto-resumes a partial; `-c` forces, `--restart` fresh; prefix folded into the verify pass |
 | start from offset (`-i, --start-pos`) | ⬜ | |
 | inactivity timeout (`--timeout`) | ✅ | per-read; a ranged chunk's retry resumes it |
-| pluggable sources (S3, bifrost peer) | 🟡 | `Source` seam exists; only HTTP impl |
+| pluggable sources | ✅ | `Source` seam with HTTP, S3, and IPFS impls; a bifrost peer planned |
+| S3 / S3-compatible source (`s3` feature) | ✅ | signs or anonymous, workdir `.env`, `--endpoint-url`, adopts a stored checksum |
+| IPFS source (`ipfs` feature) | ✅ | `ipfs://<cid>` via an HTTP gateway; a raw-bytes CID self-verifies |
+| mirror / failover (`--mirror`) | ✅ | `Mirrors` source, tried in order per operation |
 
 ## CLI (`xget`)
 
@@ -31,9 +34,14 @@ Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done
 | `-f, --overwrite` | ✅ | refuses to clobber without `-f`; `--force-append` TODO |
 | `--progress <bar\|plain\|json\|none>`, `--no-bar` | ✅ | auto-detects a TTY |
 | `--raw-sizes` | ✅ | raw byte counts |
-| `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512 |
+| `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512/blake3 |
+| `--expect <[algo:]hex\|url>` | ✅ | gate on a known checksum; inline, bare hex, or a checksum-file URL |
 | `--timeout <secs>` | ✅ | inactivity timeout |
-| `-c, --continue` | ✅ | resume a partial file |
+| `-c, --continue` | ✅ | force resuming a partial (a partial resumes automatically without it) |
+| `--restart` | ✅ | ignore a resumable partial and download from scratch |
+| `--mirror <url>` (repeatable) | ✅ | failover for the same resource |
+| `--endpoint-url <url>` | ✅ | S3-compatible endpoint (with the `s3` feature) |
+| `--ipfs-gateway <url>` | ✅ | HTTP gateway for `ipfs://` (with the `ipfs` feature) |
 | `--start-pos` | ⬜ | `-c` covers the real resume case |
 
 ## Progress

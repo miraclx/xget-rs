@@ -615,7 +615,7 @@ async fn a_tee_delivers_the_same_bytes_to_a_file_and_a_writer() {
     // rename; the writer receives every byte. Both must be byte-exact and share the one digest.
     let mut buf: Vec<u8> = Vec::new();
     let report = {
-        let sink = Output::file(&scratch.path).and(Output::writer(&mut buf));
+        let sink = Output::tee(&scratch.path, &mut buf);
         download(&source, sink, options, &())
             .await
             .expect("a tee download verifies and finalizes")

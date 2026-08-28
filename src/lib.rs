@@ -85,9 +85,15 @@ impl Default for Options {
 
 /// Where a download's verified bytes go.
 ///
-/// A [`download`] scatters and verifies into a seekable scratch, then finalizes to the chosen sink. Only
-/// a lone [`Output::File`] leaves a persistent artifact and so is resumable; a [`Output::Writer`], a
-/// [`Output::Discard`], or any composition ([`Output::Many`]) has nothing to come back to and runs fresh.
+/// A [`download`] scatters and verifies into a seekable scratch, then finalizes to the chosen sink. A
+/// sink with a file ([`Output::File`] or [`Output::Tee`]) leaves a persistent `.xget` and so is
+/// resumable; a lone [`Output::Writer`] or an [`Output::Discard`] has nothing to come back to and runs
+/// fresh.
+///
+/// A sink is at heart a writer; the one thing a file adds is a persistent, resumable artifact. So there
+/// is exactly one composition worth having, [`Output::Tee`]: keep a resumable file and pass the same
+/// verified bytes to one writer. Fanning out to more files would just be a copy, and fanning out to more
+/// writers is the receiving writer's own job, so neither is a sink the engine needs to model.
 pub enum Output<'a> {
     /// Persist to a file: scatter into `<path>.xget`, atomic-rename on success. Resumable.
     File(&'a std::path::Path),
@@ -95,10 +101,15 @@ pub enum Output<'a> {
     Writer(&'a mut (dyn tokio::io::AsyncWrite + Unpin)),
     /// Verify and keep nothing (a speed test, or /dev/null). Not resumable.
     Discard,
-    /// Several sinks at once (tee / fan-out): the verified bytes go to every one. The first file among
-    /// them is finalized by rename and any further files are copied; every writer is streamed. Build it
-    /// with [`Output::and`]. Not resumable.
-    Many(Vec<Output<'a>>),
+    /// Persist to a resumable file and hand the same verified bytes to a writer: the file is finalized by
+    /// rename, the writer receives the verified image. Build it with [`Output::tee`]. Resumable, via the
+    /// file.
+    Tee {
+        /// The resumable file, finalized by atomic rename on success.
+        file: &'a std::path::Path,
+        /// A writer that receives the verified bytes.
+        writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin),
+    },
 }
 
 impl<'a> Output<'a> {
@@ -112,19 +123,13 @@ impl<'a> Output<'a> {
         Output::Writer(writer)
     }
 
-    /// Send the verified bytes to `self` and `other` both, a tee. Compose freely: keep a file and pipe
-    /// to stdout, fan out to several writers, and so on. Flattens, so `a.and(b).and(c)` is one set.
-    #[must_use]
-    pub fn and(self, other: Output<'a>) -> Output<'a> {
-        let mut sinks = match self {
-            Output::Many(sinks) => sinks,
-            single => vec![single],
-        };
-        match other {
-            Output::Many(more) => sinks.extend(more),
-            single => sinks.push(single),
-        }
-        Output::Many(sinks)
+    /// Persist to a resumable `file` and also hand the verified bytes to `writer`: keep a copy and pipe
+    /// it onward at once.
+    pub fn tee(
+        file: &'a std::path::Path,
+        writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin),
+    ) -> Self {
+        Output::Tee { file, writer }
     }
 }
 

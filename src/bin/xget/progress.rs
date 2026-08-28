@@ -2,7 +2,7 @@ use core::cell::RefCell;
 use core::time::Duration;
 use std::time::Instant;
 
-use libxget::Progress;
+use xget::Progress;
 use xprogress::{AnsiColor, Bar, DrawTarget, Style};
 
 use crate::speedometer::Speedometer;

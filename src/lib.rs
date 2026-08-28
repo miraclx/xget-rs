@@ -1,4 +1,4 @@
-//! libxget: a chunked, parallel, resumable, verified fetch engine.
+//! xget: a chunked, parallel, resumable, verified fetch engine.
 //!
 //! The engine plans a resource into chunks, fetches them in parallel, resumes a dropped chunk from its
 //! offset, reassembles them in order, gates on the exact length, and streams the bytes through a hash

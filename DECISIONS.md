@@ -1,4 +1,4 @@
-# libxget-rs decisions
+# xget-rs decisions
 
 A Rust rewrite of the JS libxget: a chunked, parallel, resumable, verified fetch engine. Built from the
 JS autopsy in `rust-rewrites/research/libxget.md`.
@@ -41,7 +41,7 @@ a real second consumer appears.
 ## Verification: a plain streaming digest, no merkle
 
 A single `sha2` (optionally `blake3`) digest over the ordered, length-gated output stream. No merkle
-tree: the JS did not use one, and libxget hashes the whole resource, not per-chunk against a root.
+tree: the JS did not use one, and xget hashes the whole resource, not per-chunk against a root.
 
 ## Progress and sizes
 

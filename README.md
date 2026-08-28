@@ -1,4 +1,4 @@
-# libxget
+# xget
 
 A chunked, parallel, resumable, verified fetch engine over a pluggable byte source, with a command-line
 downloader (`xget`) built on top of it.
@@ -7,7 +7,7 @@ downloader (`xget`) built on top of it.
 
 ## What it is
 
-libxget plans a resource into chunks and fetches them in parallel, each written straight to its own
+xget plans a resource into chunks and fetches them in parallel, each written straight to its own
 offset in a sparse file. A single verifier reads that file back in order, hashing the contiguous prefix
 as it grows, gated on the exact length. The digest it reports certifies the bytes on disk, not "the
 bytes we glued together": a source that ignores a range, or serves a length that does not match, is a
@@ -40,9 +40,9 @@ As a library dependency:
 
 ```toml
 [dependencies]
-libxget = { git = "https://github.com/miraclx/libxget-rs" }
+xget = { git = "https://github.com/miraclx/xget-rs" }
 # or with optional sources:
-# libxget = { git = "https://github.com/miraclx/libxget-rs", features = ["s3", "ipfs"] }
+# xget = { git = "https://github.com/miraclx/xget-rs", features = ["s3", "ipfs"] }
 ```
 
 ## Quick start
@@ -146,7 +146,7 @@ The engine is `download`, driven over anything that implements the `Source` trai
 used here; you can supply your own for any protocol that can probe a length and serve a byte range.
 
 ```rust
-use libxget::{download, HttpSource, Options};
+use xget::{download, HttpSource, Options};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

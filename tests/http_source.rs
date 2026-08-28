@@ -6,10 +6,10 @@
 //! answers `200` to a range request must be rejected as [`Error::RangeNotHonored`]. No live network is
 //! touched.
 
-use libxget::{Checksum, Error, HttpSource, Options, Source, download};
 use sha2::{Digest as _, Sha256};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use xget::{Checksum, Error, HttpSource, Options, Source, download};
 
 /// A deterministic body large enough to span several chunks under the default plan.
 fn sample_body(len: usize) -> Vec<u8> {
@@ -92,7 +92,7 @@ async fn a_clean_parallel_http_download_verifies_to_the_right_hash() {
         .await;
 
     let dir = std::env::temp_dir().join(format!(
-        "libxget-http-clean-{}-{}.bin",
+        "xget-http-clean-{}-{}.bin",
         std::process::id(),
         line!()
     ));
@@ -135,7 +135,7 @@ async fn a_server_that_ignores_the_range_is_rejected() {
     // validation an engine chunk would hit. The Ok variant is a boxed stream and not `Debug`, so match
     // rather than `expect_err`.
     match source
-        .fetch(Some(libxget::ByteRange { start: 0, end: 100 }))
+        .fetch(Some(xget::ByteRange { start: 0, end: 100 }))
         .await
     {
         Err(Error::RangeNotHonored { .. }) => {}

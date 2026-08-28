@@ -1,4 +1,4 @@
-use libxget::Checksum;
+use xget::Checksum;
 
 /// An `--expect` value: either a checksum given inline, or a URL to a checksum file to fetch. Both
 /// carry an optional pinned algorithm (from an `algo:` prefix inline, or the sidecar's extension).
@@ -78,7 +78,7 @@ async fn fetch_sidecar(url: &str, endpoint_url: Option<&str>) -> eyre::Result<St
 #[cfg(feature = "s3")]
 async fn fetch_s3_text(rest: &str, endpoint_url: Option<&str>) -> eyre::Result<String> {
     use futures::StreamExt as _;
-    use libxget::{S3Source, Source};
+    use xget::{S3Source, Source};
 
     let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
     if bucket.is_empty() || key.is_empty() {

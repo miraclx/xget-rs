@@ -1,11 +1,11 @@
 [package]
-name = "libxget"
+name = "xget"
 version = "0.1.0"
 authors = ["Miraculous Owonubi <omiraculous@gmail.com>"]
 edition = "2024"
 rust-version = "1.85"
 description = "A chunked, parallel, resumable, verified fetch engine over a pluggable byte source"
-repository = "https://github.com/miraclx/libxget-rs"
+repository = "https://github.com/miraclx/xget-rs"
 license = "MIT OR Apache-2.0"
 keywords = ["download", "http", "range", "resume", "parallel"]
 categories = ["network-programming", "asynchronous"]

@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
-use libxget::{ByteRange, ByteStream, Checksum, Error, HttpSource, Mirrors, Probe, Source};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use xbytes::ByteSize;
 use xbytes::sizes::BYTE;
+use xget::{ByteRange, ByteStream, Checksum, Error, HttpSource, Mirrors, Probe, Source};
 
 use crate::expect::{Expect, parse_expect, resolve_expect};
 use crate::progress::{DIM, Reporter};
@@ -96,9 +96,8 @@ fn init_tracing(verbose: u8) {
         return;
     }
     let level = if verbose == 1 { "debug" } else { "trace" };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(format!("libxget={level},xget={level}"))
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(format!("xget={level}")));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -153,7 +152,7 @@ async fn run() -> eyre::Result<()> {
     // their presence is the signal to continue where the last run stopped, so a re-run resumes without
     // needing -c. Resume is independent of -f (which only permits replacing the destination), so a
     // corrupt finished file can be overwritten by resuming its partial; --restart forces a fresh start.
-    let resume = !cli.restart && (cli.resume || libxget::resumable(&output).await);
+    let resume = !cli.restart && (cli.resume || xget::resumable(&output).await);
     if mode == ProgressMode::Bar {
         preamble(&cli, probe.as_ref(), &output, resume);
     }
@@ -187,7 +186,7 @@ async fn run() -> eyre::Result<()> {
     };
 
     let reporter = Reporter::new(mode, cli.raw_sizes);
-    let options = libxget::Options {
+    let options = xget::Options {
         parts: cli.chunks,
         retries: cli.tries,
         checksum,
@@ -195,7 +194,7 @@ async fn run() -> eyre::Result<()> {
         resume,
     };
     let started = Instant::now();
-    let report = libxget::download(&source, &output, options, &reporter).await?;
+    let report = xget::download(&source, &output, options, &reporter).await?;
 
     if let Some((_, want)) = &expected {
         match &report.hash {
@@ -219,10 +218,10 @@ enum AnySource {
     Http(Mirrors<HttpSource>),
     /// An object in an S3 (or S3-compatible) bucket.
     #[cfg(feature = "s3")]
-    S3(libxget::S3Source),
+    S3(xget::S3Source),
     /// Content-addressed data behind an `ipfs://` URL, fetched through a gateway.
     #[cfg(feature = "ipfs")]
-    Ipfs(libxget::IpfsSource),
+    Ipfs(xget::IpfsSource),
 }
 
 impl Source for AnySource {
@@ -276,7 +275,7 @@ async fn build_s3_source(rest: &str, endpoint_url: Option<String>) -> eyre::Resu
     if bucket.is_empty() || key.is_empty() {
         eyre::bail!("s3 URL must be s3://bucket/key");
     }
-    let source = libxget::S3Source::new(bucket, key, endpoint_url).await;
+    let source = xget::S3Source::new(bucket, key, endpoint_url).await;
     Ok(AnySource::S3(source))
 }
 
@@ -291,7 +290,7 @@ async fn build_s3_source(_rest: &str, _endpoint_url: Option<String>) -> eyre::Re
 /// by a path. Only available when built with `--features ipfs`.
 #[cfg(feature = "ipfs")]
 fn build_ipfs_source(rest: &str, gateway: Option<String>) -> eyre::Result<AnySource> {
-    Ok(AnySource::Ipfs(libxget::IpfsSource::new(rest, gateway)?))
+    Ok(AnySource::Ipfs(xget::IpfsSource::new(rest, gateway)?))
 }
 
 /// Reject an `ipfs://` URL when the `ipfs` feature was not compiled in.
@@ -305,9 +304,7 @@ fn build_ipfs_source(_rest: &str, _gateway: Option<String>) -> eyre::Result<AnyS
 fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path, resume: bool) {
     eprintln!("{}URL:{} {}", DIM.render(), DIM.render_reset(), cli.url);
     let chunks = match probe {
-        Some(probe) if probe.supports_ranges => {
-            libxget::plan(probe.length, cli.chunks).len().max(1)
-        }
+        Some(probe) if probe.supports_ranges => xget::plan(probe.length, cli.chunks).len().max(1),
         Some(_) => 1,
         None => cli.chunks as usize,
     };
@@ -347,7 +344,7 @@ fn summary(
     mode: ProgressMode,
     cli: &Cli,
     checksum: Checksum,
-    report: &libxget::Report,
+    report: &xget::Report,
     elapsed: Duration,
 ) {
     if mode == ProgressMode::Json {

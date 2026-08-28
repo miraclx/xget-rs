@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream;
-use libxget::{ByteRange, ByteStream, Checksum, Error, Options, Probe, Report, Source, download};
 use sha2::{Digest as _, Sha256};
+use xget::{ByteRange, ByteStream, Checksum, Error, Options, Probe, Report, Source, download};
 
 /// A deterministic in-memory resource, served either range by range (honestly) or with an injected
 /// fault, so the engine's guarantees can be asserted without a server.
@@ -114,7 +114,7 @@ impl Scratch {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let path = std::env::temp_dir().join(format!("libxget-{tag}-{pid}-{unique}.bin"));
+        let path = std::env::temp_dir().join(format!("xget-{tag}-{pid}-{unique}.bin"));
         Self { path }
     }
 

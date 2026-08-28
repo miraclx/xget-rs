@@ -1,6 +1,6 @@
 # Feature parity with libxget-js
 
-Honest tracking of libxget-js against libxget-rs, so "done" means done. ✅ done · 🟡 partial ·
+Honest tracking of libxget-js against xget-rs, so "done" means done. ✅ done · 🟡 partial ·
 ⬜ todo · ➖ intentionally different.
 
 ## Engine

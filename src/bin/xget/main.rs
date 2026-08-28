@@ -41,7 +41,8 @@ struct Cli {
     /// Overwrite an existing output file.
     #[arg(short = 'f', long)]
     overwrite: bool,
-    /// Resume a partial download: keep the existing file, fetch only what remains, still verified.
+    /// Force resuming a partial download. A partial left by an interrupted run resumes automatically, so
+    /// this is only needed to override; use -f to discard a partial and start fresh.
     #[arg(short = 'c', long = "continue")]
     resume: bool,
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
@@ -139,8 +140,12 @@ async fn run() -> eyre::Result<()> {
     // Probe once up front for the preamble and the output name; the download re-probes authoritatively.
     let probe = source.probe().await.ok();
     let output = resolve_output(&cli, probe.as_ref())?;
+    // Auto-resume: an interrupted download leaves a `.part` and its control file beside the output, and
+    // their presence is the signal to continue where the last run stopped, so a re-run resumes without
+    // needing -c. -f forces a fresh restart, discarding the partial.
+    let resume = !cli.overwrite && (cli.resume || has_resumable_partial(&output));
     if mode == ProgressMode::Bar {
-        preamble(&cli, probe.as_ref(), &output);
+        preamble(&cli, probe.as_ref(), &output, resume);
     }
 
     // `--expect` was parsed to a literal digest or a checksum-file URL at parse time; resolve it now,
@@ -177,7 +182,7 @@ async fn run() -> eyre::Result<()> {
         retries: cli.tries,
         checksum,
         timeout: cli.timeout,
-        resume: cli.resume,
+        resume,
     };
     let started = Instant::now();
     let report = libxget::download(&source, &output, options, &reporter).await?;
@@ -263,8 +268,8 @@ async fn build_s3_source(_rest: &str, _endpoint_url: Option<String>) -> eyre::Re
 }
 
 /// Print the block shown before a live bar: the URL, how many chunks, the length and media type, and
-/// where the file is being written.
-fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path) {
+/// where the file is being written, noting when the run is continuing a partial.
+fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path, resume: bool) {
     eprintln!("{}URL:{} {}", DIM.render(), DIM.render_reset(), cli.url);
     let chunks = match probe {
         Some(probe) if probe.supports_ranges => {
@@ -294,6 +299,13 @@ fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path) {
         DIM.render_reset(),
         output.display()
     );
+    if resume {
+        eprintln!(
+            "{}Resuming a previous download{}",
+            DIM.render(),
+            DIM.render_reset()
+        );
+    }
 }
 
 /// Print the closing summary: how much was fetched in how long, and the verified checksum if one was
@@ -376,7 +388,7 @@ fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
 
 /// Resolve where to write: an explicit file, a name inside an explicit directory, or a name inferred
 /// from the resource (its `Content-Disposition`, else the URL) under `--directory-prefix`. Refuses to
-/// clobber an existing file without `-f`, and creates missing parents unless `--no-directories`.
+/// clobber an existing complete file without `-f`, and creates missing parents unless `--no-directories`.
 fn resolve_output(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<PathBuf> {
     let path = match &cli.output {
         Some(dir) if dir.is_dir() => dir.join(infer_name(cli, probe)?),
@@ -389,11 +401,10 @@ fn resolve_output(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<PathBuf> {
             }
         }
     };
-    if path.exists() && !cli.overwrite && !cli.resume {
-        eyre::bail!(
-            "{} already exists (use -f to overwrite or -c to resume)",
-            path.display()
-        );
+    // A complete file at the destination is never clobbered without -f. A resume, by contrast, works on
+    // the sibling `.part` (which is not this path), so it is not gated here.
+    if path.exists() && !cli.overwrite {
+        eyre::bail!("{} already exists (use -f to overwrite)", path.display());
     }
     if !cli.no_directories {
         if let Some(parent) = path.parent() {
@@ -403,6 +414,17 @@ fn resolve_output(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<PathBuf> {
         }
     }
     Ok(path)
+}
+
+/// Whether an interrupted download left a resumable partial beside `output`: both the `.part` data file
+/// and its `.part.st` control file (which records what is safely on disk). Their presence together is
+/// what lets a re-run continue without an explicit `-c`; a `.part` without its control is not trusted.
+fn has_resumable_partial(output: &Path) -> bool {
+    let mut part = output.as_os_str().to_owned();
+    part.push(".part");
+    let mut control = part.clone();
+    control.push(".st");
+    Path::new(&part).exists() && Path::new(&control).exists()
 }
 
 /// Infer an output filename: the resource's `Content-Disposition` if the server offered one in the

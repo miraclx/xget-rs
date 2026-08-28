@@ -86,9 +86,8 @@ impl Default for Options {
 /// Where a download's verified bytes go.
 ///
 /// A [`download`] scatters and verifies into a seekable scratch, then finalizes to the chosen sink. Only
-/// [`Output::File`] leaves a persistent artifact and so is resumable; a [`Output::Writer`] or
-/// [`Output::Discard`] has nothing to come back to and always runs fresh.
-// TODO: composition (tee) via a Many variant
+/// a lone [`Output::File`] leaves a persistent artifact and so is resumable; a [`Output::Writer`], a
+/// [`Output::Discard`], or any composition ([`Output::Many`]) has nothing to come back to and runs fresh.
 pub enum Output<'a> {
     /// Persist to a file: scatter into `<path>.xget`, atomic-rename on success. Resumable.
     File(&'a std::path::Path),
@@ -96,6 +95,10 @@ pub enum Output<'a> {
     Writer(&'a mut (dyn tokio::io::AsyncWrite + Unpin)),
     /// Verify and keep nothing (a speed test, or /dev/null). Not resumable.
     Discard,
+    /// Several sinks at once (tee / fan-out): the verified bytes go to every one. The first file among
+    /// them is finalized by rename and any further files are copied; every writer is streamed. Build it
+    /// with [`Output::and`]. Not resumable.
+    Many(Vec<Output<'a>>),
 }
 
 impl<'a> Output<'a> {
@@ -107,6 +110,21 @@ impl<'a> Output<'a> {
     /// Stream the download's verified bytes to `writer` as they are confirmed.
     pub fn writer(writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin)) -> Self {
         Output::Writer(writer)
+    }
+
+    /// Send the verified bytes to `self` and `other` both, a tee. Compose freely: keep a file and pipe
+    /// to stdout, fan out to several writers, and so on. Flattens, so `a.and(b).and(c)` is one set.
+    #[must_use]
+    pub fn and(self, other: Output<'a>) -> Output<'a> {
+        let mut sinks = match self {
+            Output::Many(sinks) => sinks,
+            single => vec![single],
+        };
+        match other {
+            Output::Many(more) => sinks.extend(more),
+            single => sinks.push(single),
+        }
+        Output::Many(sinks)
     }
 }
 

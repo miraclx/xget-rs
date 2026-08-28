@@ -510,3 +510,39 @@ async fn writer_streams_the_exact_bytes_and_hash() {
     );
     assert_eq!(streamed.length, body.len() as u64);
 }
+
+#[tokio::test]
+async fn a_tee_delivers_the_same_bytes_to_a_file_and_a_writer() {
+    let body = sample_body(4096);
+    let source = FakeSource::honest(body.clone());
+    let scratch = Scratch::new("tee");
+    let options = Options {
+        parts: 5,
+        checksum: Checksum::Sha256,
+        ..Options::default()
+    };
+
+    // Tee the verified bytes to a file and an in-memory writer at once. The file is finalized by
+    // rename; the writer receives every byte. Both must be byte-exact and share the one digest.
+    let mut buf: Vec<u8> = Vec::new();
+    let report = {
+        let sink = Output::file(&scratch.path).and(Output::writer(&mut buf));
+        download(&source, sink, options, &())
+            .await
+            .expect("a tee download verifies and finalizes")
+    };
+
+    let on_disk = std::fs::read(&scratch.path).expect("the tee's file was finalized into place");
+    assert_eq!(on_disk, body, "the file received every byte in order");
+    assert_eq!(buf, body, "the writer received every byte in order");
+    assert_eq!(
+        report.hash.as_deref(),
+        Some(sha256_hex(&body).as_str()),
+        "the tee certifies the digest of the bytes both sinks received"
+    );
+    assert_eq!(report.length, body.len() as u64);
+    assert!(
+        !scratch.part().exists(),
+        "the scratch was renamed away, not left beside the output"
+    );
+}

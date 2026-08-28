@@ -69,12 +69,14 @@ pub async fn download<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
-    // The scratch is a seekable `.xget`: for a file it sits beside the output so it can be renamed into
-    // place, carrying the resume control in a trailer past the data until it is finalized; for a writer or
-    // a discard, which have no persistent artifact to resume, it is a throwaway under the temp dir. Only a
-    // file may resume, so a writer or a discard forces no-resume regardless of `options`.
+    // The scratch is a seekable `.xget`: when the output persists a file it sits beside that file so it
+    // can be renamed into place, carrying the resume control in a trailer past the data until finalized;
+    // otherwise (writers or a discard) it is a throwaway under the temp dir. Resume comes back to that
+    // persistent `.xget`, so any output that keeps a file (a lone file, or a tee that includes one) may
+    // resume; a writer-only or discard output has nothing to return to and forces no-resume. Delivery to
+    // writers happens after the download completes, so a resumed run simply delivers the full stream once.
     let part = scratch_path(&output);
-    let can_resume = matches!(output, Output::File(_));
+    let can_resume = first_file(&output).is_some();
     let options = Options {
         resume: options.resume && can_resume,
         ..options
@@ -121,19 +123,10 @@ pub async fn download<S: Source, P: Progress>(
         .await?;
         // Strip the control trailer and footer, leaving the scratch a byte-exact image `[0, total)`.
         writer.lock().await.finish().await?;
-        // Finalize by sink: a file becomes the output by rename; a writer copies the finalized scratch out
-        // then drops it; a discard just drops it. (A writer re-reads the scratch for now; it could later
-        // stream during verify.)
-        match output {
-            Output::File(path) => tokio::fs::rename(&part, path).await.map_err(io)?,
-            Output::Writer(sink) => {
-                copy_out(&part, probe.length, sink).await?;
-                let _ = tokio::fs::remove_file(&part).await;
-            }
-            Output::Discard => {
-                let _ = tokio::fs::remove_file(&part).await;
-            }
-        }
+        // Deliver the verified scratch to the sink(s): rename it to a file, stream it to every writer,
+        // copy it to any further files, or drop it for a discard. (A writer re-reads the scratch for now;
+        // it could later stream during verify.)
+        distribute(&part, probe.length, output).await?;
         hash
     } else {
         if options.resume && file_len(&part).await > 0 {
@@ -141,12 +134,12 @@ pub async fn download<S: Source, P: Progress>(
                 "cannot resume: the source does not support byte ranges",
             ));
         }
-        // The single-stream path writes straight to the sink: a file to its scratch (renamed after), a
-        // writer live with no scratch, a discard nowhere.
+        // The single stream writes straight to the sink: a file or a composition to the scratch (then
+        // delivered), a lone writer live with no scratch, a discard nowhere.
         let hash =
             fetch_stream(source, &mut output, &part, probe.length, options, progress).await?;
-        if let Output::File(path) = output {
-            tokio::fs::rename(&part, path).await.map_err(io)?;
+        if matches!(output, Output::File(_) | Output::Many(_)) {
+            distribute(&part, probe.length, output).await?;
         }
         hash
     };
@@ -162,13 +155,74 @@ pub async fn download<S: Source, P: Progress>(
 /// renamed into place), or a unique throwaway under the temp dir for a [`Output::Writer`] or
 /// [`Output::Discard`] (which have no persistent artifact and so are copied out or dropped after verify).
 fn scratch_path(output: &Output<'_>) -> PathBuf {
-    match output {
-        Output::File(path) => part_path(path),
-        Output::Writer(_) | Output::Discard => std::env::temp_dir().join(format!(
+    match first_file(output) {
+        // A file (alone or first in a composition) becomes the output by rename, so its `.xget` beside
+        // it is the scratch and doubles as the resume control.
+        Some(path) => part_path(path),
+        // No file to persist: scatter into a throwaway under the temp dir, copied out then dropped.
+        None => std::env::temp_dir().join(format!(
             "xget-{}-{}.xget",
             std::process::id(),
             SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
         )),
+    }
+}
+
+/// The first `File` sink in `output`, if any: a lone file, or the first file in a composition. Its
+/// presence is what lets a run persist (and so resume); its `.xget` is the scratch.
+fn first_file<'a>(output: &Output<'a>) -> Option<&'a Path> {
+    match output {
+        Output::File(path) => Some(path),
+        Output::Many(sinks) => sinks.iter().find_map(first_file),
+        Output::Writer(_) | Output::Discard => None,
+    }
+}
+
+/// Deliver the finalized scratch to every sink in `output`: stream it to each writer, copy it to any
+/// file after the first, and finalize the first file by rename; with no file at all, drop the scratch.
+/// Called once the scatter or stream has left the scratch a byte-exact image of `[0, total)`.
+///
+/// Only ever one file's `.xget` was the scratch, so there is a single authoritative artifact (and a
+/// single resume point); any further files are plain copies produced here at the end, so an interrupt
+/// leaves at most that one `.xget`, never a tangle of half-written outputs.
+async fn distribute(part: &Path, total: u64, output: Output<'_>) -> Result<(), Error> {
+    let mut files: Vec<&Path> = Vec::new();
+    let mut writers: Vec<&mut (dyn AsyncWrite + Unpin)> = Vec::new();
+    flatten(output, &mut files, &mut writers);
+
+    for writer in writers {
+        copy_out(part, total, writer).await?;
+    }
+    match files.split_first() {
+        Some((first, rest)) => {
+            for extra in rest {
+                let mut file = File::create(*extra).await.map_err(io)?;
+                copy_out(part, total, &mut file).await?;
+            }
+            tokio::fs::rename(part, *first).await.map_err(io)?;
+        }
+        None => {
+            let _ = tokio::fs::remove_file(part).await;
+        }
+    }
+    Ok(())
+}
+
+/// Split an [`Output`] into its file paths and writer sinks, in order, flattening any composition.
+fn flatten<'a>(
+    output: Output<'a>,
+    files: &mut Vec<&'a Path>,
+    writers: &mut Vec<&'a mut (dyn AsyncWrite + Unpin)>,
+) {
+    match output {
+        Output::File(path) => files.push(path),
+        Output::Writer(writer) => writers.push(writer),
+        Output::Discard => {}
+        Output::Many(sinks) => {
+            for sink in sinks {
+                flatten(sink, files, writers);
+            }
+        }
     }
 }
 
@@ -617,9 +671,10 @@ async fn fetch_stream<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<Option<String>, Error> {
     progress.start(&[total]);
-    // The scratch a file streams to, kept open only for that case; a writer and a discard write elsewhere.
+    // A file or a composition streams to the scratch (delivered after); a lone writer goes live; a
+    // discard writes nowhere.
     let mut file = match output {
-        Output::File(_) => Some(File::create(part).await.map_err(io)?),
+        Output::File(_) | Output::Many(_) => Some(File::create(part).await.map_err(io)?),
         Output::Writer(_) | Output::Discard => None,
     };
     let mut hasher = options.checksum.hasher();
@@ -631,7 +686,7 @@ async fn fetch_stream<S: Source, P: Progress>(
             hasher.update(&chunk);
         }
         match output {
-            Output::File(_) => {
+            Output::File(_) | Output::Many(_) => {
                 if let Some(file) = file.as_mut() {
                     file.write_all(&chunk).await.map_err(io)?;
                 }
@@ -644,7 +699,7 @@ async fn fetch_stream<S: Source, P: Progress>(
         progress.wrote(0, len);
     }
     match output {
-        Output::File(_) => {
+        Output::File(_) | Output::Many(_) => {
             if let Some(file) = file.as_mut() {
                 file.flush().await.map_err(io)?;
             }

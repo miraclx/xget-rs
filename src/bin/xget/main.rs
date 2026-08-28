@@ -38,13 +38,18 @@ struct Cli {
     /// Do not create missing directories.
     #[arg(long)]
     no_directories: bool,
-    /// Overwrite an existing output file.
+    /// Overwrite an existing output file. Grants permission to replace the destination; it does not by
+    /// itself discard a resumable partial (see --restart), so a corrupt finished file can be replaced by
+    /// resuming an interrupted download of it.
     #[arg(short = 'f', long)]
     overwrite: bool,
     /// Force resuming a partial download. A partial left by an interrupted run resumes automatically, so
-    /// this is only needed to override; use -f to discard a partial and start fresh.
-    #[arg(short = 'c', long = "continue")]
+    /// this is only needed to override.
+    #[arg(short = 'c', long = "continue", conflicts_with = "restart")]
     resume: bool,
+    /// Ignore any resumable partial and download from scratch.
+    #[arg(long)]
+    restart: bool,
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header", value_parser = parse_header)]
     headers: Vec<(HeaderName, HeaderValue)>,
@@ -142,8 +147,9 @@ async fn run() -> eyre::Result<()> {
     let output = resolve_output(&cli, probe.as_ref())?;
     // Auto-resume: an interrupted download leaves a `.part` and its control file beside the output, and
     // their presence is the signal to continue where the last run stopped, so a re-run resumes without
-    // needing -c. -f forces a fresh restart, discarding the partial.
-    let resume = !cli.overwrite && (cli.resume || has_resumable_partial(&output));
+    // needing -c. Resume is independent of -f (which only permits replacing the destination), so a
+    // corrupt finished file can be overwritten by resuming its partial; --restart forces a fresh start.
+    let resume = !cli.restart && (cli.resume || has_resumable_partial(&output));
     if mode == ProgressMode::Bar {
         preamble(&cli, probe.as_ref(), &output, resume);
     }

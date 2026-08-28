@@ -90,14 +90,15 @@ impl Writer {
     /// Begin control for a freshly allocated file whose data region is already `set_len` to `total`:
     /// write the footer for an empty trailer.
     pub(crate) async fn create(path: &Path, total: u64) -> Result<Writer, Error> {
-        let file = open_rw(path).await?;
-        let mut writer = Writer {
+        let mut file = open_rw(path).await?;
+        file.seek(SeekFrom::Start(total)).await.map_err(io)?;
+        file.write_all(&footer_bytes(total, 0)).await.map_err(io)?;
+        file.flush().await.map_err(io)?;
+        Ok(Writer {
             file,
             total,
             trailer: 0,
-        };
-        writer.write_footer().await?;
-        Ok(writer)
+        })
     }
 
     /// Reopen control for a resumed file, positioned to append after its existing trailer. The caller has
@@ -116,31 +117,23 @@ impl Writer {
         })
     }
 
-    /// Append `range` as written and rewrite the footer. Recording a range twice, or a prefix then a
-    /// longer one, is harmless: the planner merges them.
+    /// Append `range` as written and re-stamp the footer. The line and the new footer are written as one
+    /// contiguous buffer at the current footer's position, so the file never sits with the line in place
+    /// but the footer not yet updated: a reader sees either the old trailer and footer or the new pair,
+    /// never a half-written state. Recording a range twice, or a prefix then a longer one, is harmless:
+    /// the planner merges them.
     pub(crate) async fn append(&mut self, range: ByteRange) -> Result<(), Error> {
         let line = format!("done {} {}\n", range.start, range.end);
+        let trailer = self.trailer + line.len() as u64;
+        // The line overwrites the current footer; the new footer follows it, all in one write.
+        let mut buffer = line.into_bytes();
+        buffer.extend_from_slice(&footer_bytes(self.total, trailer));
         self.file
             .seek(SeekFrom::Start(self.total + self.trailer))
             .await
             .map_err(io)?;
-        self.file.write_all(line.as_bytes()).await.map_err(io)?;
-        self.trailer += line.len() as u64;
-        self.write_footer().await
-    }
-
-    /// Write the fixed footer at the current end of the trailer and flush, so an interrupt leaves a
-    /// findable control.
-    async fn write_footer(&mut self) -> Result<(), Error> {
-        self.file
-            .seek(SeekFrom::Start(self.total + self.trailer))
-            .await
-            .map_err(io)?;
-        let mut footer = [0u8; FOOTER as usize];
-        footer[0..8].copy_from_slice(&MAGIC);
-        footer[8..16].copy_from_slice(&self.total.to_le_bytes());
-        footer[16..24].copy_from_slice(&self.trailer.to_le_bytes());
-        self.file.write_all(&footer).await.map_err(io)?;
+        self.file.write_all(&buffer).await.map_err(io)?;
+        self.trailer = trailer;
         self.file.flush().await.map_err(io)
     }
 
@@ -150,6 +143,16 @@ impl Writer {
         self.file.set_len(self.total).await.map_err(io)?;
         self.file.flush().await.map_err(io)
     }
+}
+
+/// The fixed footer bytes for a trailer of `trailer` bytes past a data region of `total` bytes: the
+/// magic, the total, and the trailer length, so a resume can find and validate the trailer.
+fn footer_bytes(total: u64, trailer: u64) -> [u8; FOOTER as usize] {
+    let mut footer = [0u8; FOOTER as usize];
+    footer[0..8].copy_from_slice(&MAGIC);
+    footer[8..16].copy_from_slice(&total.to_le_bytes());
+    footer[16..24].copy_from_slice(&trailer.to_le_bytes());
+    footer
 }
 
 /// Open a `.xget` file for reading and writing without truncating it.

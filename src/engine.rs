@@ -32,7 +32,7 @@ use crate::{ByteRange, Checksum, Error, Options, Progress, Source, control};
 
 /// A chunk checkpoints its flushed prefix to the control trailer after this many freshly downloaded
 /// bytes, so a fast large chunk records often without a checkpoint per write.
-const CHECKPOINT_BYTES: u64 = ByteSize::of_int(4, MEBI_BYTE).byte_count() as u64;
+const CHECKPOINT_BYTES: u64 = ByteSize::of_int(4, MEBI_BYTE).byte_count_lossy() as u64;
 
 /// ...and at least this often while it is making progress, so a small or slow chunk that never reaches
 /// [`CHECKPOINT_BYTES`] still persists its partial progress and resumes near where it stopped rather

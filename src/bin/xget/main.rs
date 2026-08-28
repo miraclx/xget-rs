@@ -381,9 +381,10 @@ fn summary(
         return;
     }
     let size = fmt_size(report.length, cli.raw_sizes);
-    println!("Downloaded {size} in {}", fmt_elapsed(elapsed));
+    // The summary is chatter, not data, so it goes to stderr, leaving stdout clean for a `-` stream.
+    eprintln!("Downloaded {size} in {}", fmt_elapsed(elapsed));
     if let Some(hash) = &report.hash {
-        println!("Hash({checksum}): {hash}");
+        eprintln!("Hash({checksum}): {hash}");
     }
 }
 

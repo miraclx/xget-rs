@@ -32,6 +32,14 @@ mod plan_tests;
 
 pub use crate::checksum::{Checksum, UnknownChecksum};
 pub use crate::engine::{Report, download};
+
+/// Whether an interrupted download left a resumable partial beside `output`: its `.xget` file with a
+/// valid control trailer. A caller can use this to resume automatically without an explicit request. The
+/// naming and format of the partial are the engine's to own, so a caller need not know them.
+pub async fn resumable(output: &std::path::Path) -> bool {
+    crate::control::is_resumable(&crate::engine::part_path(output)).await
+}
+
 pub use crate::http::HttpSource;
 pub use crate::mirror::Mirrors;
 pub use crate::plan::plan;

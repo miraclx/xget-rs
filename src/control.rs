@@ -1,82 +1,171 @@
-//! A control file recording a scatter download's plan and which chunks are fully written, so a later
-//! run can resume. It sits beside the `.part` (as `<part>.st`) and is append-only, so the parallel
-//! chunk completions that record into it never race, and it is deleted once the download succeeds.
+//! Resume control embedded in the download's own `.xget` file, so there is one artifact, not a data file
+//! plus a sidecar to keep in step.
 //!
-//! With scatter writes the `.part` is preallocated to full length from the start, so its size says
-//! nothing about progress: this file is the source of truth for what has actually been downloaded.
+//! The layout is `[data: 0..total][trailer: completed-range text][footer: fixed]`. The sparse data
+//! occupies `[0, total)`; a text trailer of `done <start> <end>` lines records the byte ranges written
+//! and flushed; a fixed footer at the very end carries a magic, the total, and the trailer length, so a
+//! later run can find the trailer without knowing the total in advance. Chunk writes only ever touch the
+//! data region, and control appends only ever touch the trailer and footer, so the two never collide.
+//! On success the trailer and footer are truncated away, leaving the file a byte-exact image to rename
+//! into place. A file whose footer does not validate (a foreign or truncated file) is simply not
+//! resumable.
 
-use std::path::{Path, PathBuf};
+use core::convert::TryInto as _;
+use std::io::SeekFrom;
+use std::path::Path;
 
-use tokio::io::AsyncWriteExt as _;
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
 use crate::{ByteRange, Error};
 
-/// The resumable state beside a `.part`: the resource's length and the byte ranges whose whole region is
-/// on disk. Ranges rather than chunk indices, so a resume can re-chunk with a different parallelism than
-/// the run that started it: the plan is rebuilt from the bytes present, not from the old chunk count.
+/// Magic marking a valid xget control footer.
+const MAGIC: [u8; 8] = *b"XGETCTL1";
+/// The fixed footer: magic (8) + total (8) + trailer length (8) + reserved (8).
+const FOOTER: u64 = 32;
+
+/// The resumable state read from a `.xget` file: the resource length and the completed byte ranges.
 pub(crate) struct Control {
     /// The resource's total length, to detect a stale control against a changed resource.
     pub total: u64,
-    /// The byte ranges that are fully written, each an absolute `[start, end)` in the resource.
+    /// The byte ranges recorded as written, each an absolute `[start, end)`. May overlap or be partial
+    /// (a checkpoint of an in-flight chunk); the planner clamps and merges them.
     pub done: Vec<ByteRange>,
 }
 
-/// The control file path for a given `.part`.
-pub(crate) fn path(part: &Path) -> PathBuf {
-    let mut name = part.as_os_str().to_owned();
-    name.push(".st");
-    PathBuf::from(name)
-}
+/// Read the embedded control from `path`, or `None` if the file is missing, too short, or its footer
+/// does not validate.
+pub(crate) async fn read(path: &Path) -> Option<Control> {
+    let mut file = File::open(path).await.ok()?;
+    let size = file.metadata().await.ok()?.len();
+    if size < FOOTER {
+        return None;
+    }
+    file.seek(SeekFrom::Start(size - FOOTER)).await.ok()?;
+    let mut footer = [0u8; FOOTER as usize];
+    file.read_exact(&mut footer).await.ok()?;
+    if footer[0..8] != MAGIC {
+        return None;
+    }
+    let total = u64::from_le_bytes(footer[8..16].try_into().ok()?);
+    let trailer = u64::from_le_bytes(footer[16..24].try_into().ok()?);
+    // The layout must add up exactly, or this is not a control we wrote.
+    if total.checked_add(trailer)?.checked_add(FOOTER)? != size {
+        return None;
+    }
+    file.seek(SeekFrom::Start(total)).await.ok()?;
+    let mut text = vec![0u8; trailer as usize];
+    file.read_exact(&mut text).await.ok()?;
+    let text = String::from_utf8(text).ok()?;
 
-/// Read the control file for `part`, or `None` if it is missing or unparseable.
-pub(crate) async fn read(part: &Path) -> Option<Control> {
-    let text = tokio::fs::read_to_string(path(part)).await.ok()?;
-    let mut total = None;
     let mut done = Vec::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
-        match fields.next() {
-            Some("total") => total = fields.next().and_then(|value| value.parse().ok()),
-            Some("done") => {
-                if let (Some(Ok(start)), Some(Ok(end))) =
-                    (fields.next().map(str::parse), fields.next().map(str::parse))
-                {
-                    done.push(ByteRange { start, end });
-                }
-            }
-            _ => {}
+        if fields.next() == Some("done")
+            && let (Some(Ok(start)), Some(Ok(end))) =
+                (fields.next().map(str::parse), fields.next().map(str::parse))
+        {
+            done.push(ByteRange { start, end });
         }
     }
-    Some(Control {
-        total: total?,
-        done,
-    })
+    Some(Control { total, done })
 }
 
-/// Write a fresh control header for `part`, replacing any earlier one.
-pub(crate) async fn begin(part: &Path, total: u64) -> Result<(), Error> {
-    tokio::fs::write(path(part), format!("total {total}\n"))
+/// Whether `path` holds a resumable download: a valid control footer of the given total.
+pub(crate) async fn is_resumable(path: &Path) -> bool {
+    read(path).await.is_some()
+}
+
+/// A handle over an open `.xget` file that appends completed or checkpointed byte ranges to its trailer,
+/// rewriting the footer after each, and truncates them away on finish. Held behind an async mutex and
+/// shared by the fetchers, so their appends serialize even though they interleave at await points.
+pub(crate) struct Writer {
+    file: File,
+    total: u64,
+    /// The current trailer length in bytes (the footer sits immediately after it).
+    trailer: u64,
+}
+
+impl Writer {
+    /// Begin control for a freshly allocated file whose data region is already `set_len` to `total`:
+    /// write the footer for an empty trailer.
+    pub(crate) async fn create(path: &Path, total: u64) -> Result<Writer, Error> {
+        let file = open_rw(path).await?;
+        let mut writer = Writer {
+            file,
+            total,
+            trailer: 0,
+        };
+        writer.write_footer().await?;
+        Ok(writer)
+    }
+
+    /// Reopen control for a resumed file, positioned to append after its existing trailer. The caller has
+    /// already validated the footer (via [`read`]) and that its total matches.
+    pub(crate) async fn open(path: &Path, total: u64) -> Result<Writer, Error> {
+        let file = open_rw(path).await?;
+        let size = file.metadata().await.map_err(io)?.len();
+        let trailer = size
+            .checked_sub(total)
+            .and_then(|rest| rest.checked_sub(FOOTER))
+            .ok_or_else(|| detail("control file is smaller than its own layout"))?;
+        Ok(Writer {
+            file,
+            total,
+            trailer,
+        })
+    }
+
+    /// Append `range` as written and rewrite the footer. Recording a range twice, or a prefix then a
+    /// longer one, is harmless: the planner merges them.
+    pub(crate) async fn append(&mut self, range: ByteRange) -> Result<(), Error> {
+        let line = format!("done {} {}\n", range.start, range.end);
+        self.file
+            .seek(SeekFrom::Start(self.total + self.trailer))
+            .await
+            .map_err(io)?;
+        self.file.write_all(line.as_bytes()).await.map_err(io)?;
+        self.trailer += line.len() as u64;
+        self.write_footer().await
+    }
+
+    /// Write the fixed footer at the current end of the trailer and flush, so an interrupt leaves a
+    /// findable control.
+    async fn write_footer(&mut self) -> Result<(), Error> {
+        self.file
+            .seek(SeekFrom::Start(self.total + self.trailer))
+            .await
+            .map_err(io)?;
+        let mut footer = [0u8; FOOTER as usize];
+        footer[0..8].copy_from_slice(&MAGIC);
+        footer[8..16].copy_from_slice(&self.total.to_le_bytes());
+        footer[16..24].copy_from_slice(&self.trailer.to_le_bytes());
+        self.file.write_all(&footer).await.map_err(io)?;
+        self.file.flush().await.map_err(io)
+    }
+
+    /// Truncate the trailer and footer away, leaving the file a byte-exact image of the resource, and
+    /// flush. The caller renames it into place afterward.
+    pub(crate) async fn finish(&mut self) -> Result<(), Error> {
+        self.file.set_len(self.total).await.map_err(io)?;
+        self.file.flush().await.map_err(io)
+    }
+}
+
+/// Open a `.xget` file for reading and writing without truncating it.
+async fn open_rw(path: &Path) -> Result<File, Error> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
         .await
         .map_err(io)
-}
-
-/// Record `range` as fully written by appending a line, so two completions never clobber.
-pub(crate) async fn mark_done(part: &Path, range: ByteRange) -> Result<(), Error> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(path(part))
-        .await
-        .map_err(io)?;
-    file.write_all(format!("done {} {}\n", range.start, range.end).as_bytes())
-        .await
-        .map_err(io)
-}
-
-/// Delete the control file once the download is complete. Best effort.
-pub(crate) async fn remove(part: &Path) {
-    let _ = tokio::fs::remove_file(path(part)).await;
 }
 
 fn io(error: std::io::Error) -> Error {
     Error::Transport(Box::new(error))
+}
+
+fn detail(message: &str) -> Error {
+    Error::Transport(Box::new(std::io::Error::other(message.to_owned())))
 }

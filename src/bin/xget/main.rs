@@ -149,7 +149,7 @@ async fn run() -> eyre::Result<()> {
     // their presence is the signal to continue where the last run stopped, so a re-run resumes without
     // needing -c. Resume is independent of -f (which only permits replacing the destination), so a
     // corrupt finished file can be overwritten by resuming its partial; --restart forces a fresh start.
-    let resume = !cli.restart && (cli.resume || has_resumable_partial(&output));
+    let resume = !cli.restart && (cli.resume || libxget::resumable(&output).await);
     if mode == ProgressMode::Bar {
         preamble(&cli, probe.as_ref(), &output, resume);
     }
@@ -420,17 +420,6 @@ fn resolve_output(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<PathBuf> {
         }
     }
     Ok(path)
-}
-
-/// Whether an interrupted download left a resumable partial beside `output`: both the `.part` data file
-/// and its `.part.st` control file (which records what is safely on disk). Their presence together is
-/// what lets a re-run continue without an explicit `-c`; a `.part` without its control is not trusted.
-fn has_resumable_partial(output: &Path) -> bool {
-    let mut part = output.as_os_str().to_owned();
-    part.push(".part");
-    let mut control = part.clone();
-    control.push(".st");
-    Path::new(&part).exists() && Path::new(&control).exists()
 }
 
 /// Infer an output filename: the resource's `Content-Disposition` if the server offered one in the

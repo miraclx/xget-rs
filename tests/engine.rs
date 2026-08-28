@@ -103,8 +103,8 @@ fn pieces(data: &[u8]) -> ByteStream {
     Box::pin(stream::iter(chunks))
 }
 
-/// A unique scratch path under the OS temp dir, removed on drop along with its `.part` siblings, so
-/// tests never collide or leak files.
+/// A unique scratch path under the OS temp dir, removed on drop along with its `.xget` partial, so tests
+/// never collide or leak files.
 struct Scratch {
     path: PathBuf,
 }
@@ -117,18 +117,19 @@ impl Scratch {
         let path = std::env::temp_dir().join(format!("libxget-{tag}-{pid}-{unique}.bin"));
         Self { path }
     }
+
+    /// The `.xget` partial the engine writes beside the output before finalizing it.
+    fn part(&self) -> PathBuf {
+        let mut part = self.path.clone().into_os_string();
+        part.push(".xget");
+        PathBuf::from(part)
+    }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
-        let mut part = self.path.clone().into_os_string();
-        part.push(".part");
-        let part = PathBuf::from(part);
-        let _ = std::fs::remove_file(&part);
-        let mut control = part.into_os_string();
-        control.push(".st");
-        let _ = std::fs::remove_file(PathBuf::from(control));
+        let _ = std::fs::remove_file(self.part());
     }
 }
 
@@ -258,7 +259,7 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
     };
 
     // First pass: every chunk but the last is honest, the last is short, so the download fails partway
-    // and leaves a `.part` plus its control file recording the completed chunks.
+    // and leaves a `.xget` partial whose control trailer records the completed chunks.
     struct PartialSource {
         body: Arc<Vec<u8>>,
         fail_from: u64,
@@ -291,10 +292,8 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
     };
     let first = download(&partial, &scratch.path, options, &()).await;
     assert!(first.is_err(), "the first pass fails on the dropped tail");
-    let mut part = scratch.path.clone().into_os_string();
-    part.push(".part");
     assert!(
-        PathBuf::from(&part).exists(),
+        scratch.part().exists(),
         "the partial file is kept for a resume"
     );
 

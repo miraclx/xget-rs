@@ -20,11 +20,20 @@ use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
+use xbytes::ByteSize;
+use xbytes::sizes::MEBI_BYTE;
 
 use crate::checksum::Hasher;
+use crate::control::Writer;
 use crate::plan::{plan_range, plan_resume};
 use crate::{ByteRange, Checksum, Error, Options, Progress, Source, control};
+
+/// How many freshly downloaded bytes a chunk accumulates before it checkpoints its flushed prefix to the
+/// control trailer, so an interrupt loses at most this much of an in-flight chunk's progress.
+fn checkpoint_bytes() -> u64 {
+    ByteSize::of(4, MEBI_BYTE).byte_count() as u64
+}
 
 /// The outcome of a completed download.
 #[derive(Clone, Debug)]
@@ -48,9 +57,9 @@ pub async fn download<S: Source, P: Progress>(
     progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
-    // Write to a sibling `.part` and only rename it into place once the length and hash gates pass, so
-    // an interrupted download never leaves a truncated file masquerading as complete. The `.part` is
-    // also what a `--continue` resume picks up.
+    // Write to a sibling `.xget` and only rename it into place once the length and hash gates pass, so an
+    // interrupted download never leaves a truncated file masquerading as complete. That same file carries
+    // the resume control in a trailer past the data, and is what a resume picks up.
     let part = part_path(output);
 
     tracing::debug!(
@@ -68,11 +77,28 @@ pub async fn download<S: Source, P: Progress>(
             resumed = plan.resumed,
             "planned download"
         );
-        allocate(&part, probe.length, !plan.resumed).await?;
-        if !plan.resumed {
-            control::begin(&part, probe.length).await?;
-        }
-        fetch_scatter(source, &part, probe.length, &plan, options, progress).await?
+        // The control writer lives in the `.xget` file itself: a resume reopens its trailer to append
+        // to, a fresh run allocates the sparse data region and writes an empty trailer.
+        let writer = if plan.resumed {
+            Writer::open(&part, probe.length).await?
+        } else {
+            allocate_fresh(&part, probe.length).await?;
+            Writer::create(&part, probe.length).await?
+        };
+        let writer = Rc::new(Mutex::new(writer));
+        let hash = fetch_scatter(
+            source,
+            &part,
+            probe.length,
+            &plan,
+            options,
+            progress,
+            &writer,
+        )
+        .await?;
+        // Strip the control trailer and footer, leaving a byte-exact image to rename into place.
+        writer.lock().await.finish().await?;
+        hash
     } else {
         if options.resume && file_len(&part).await > 0 {
             return Err(detail(
@@ -83,7 +109,6 @@ pub async fn download<S: Source, P: Progress>(
     };
 
     tokio::fs::rename(&part, output).await.map_err(io)?;
-    control::remove(&part).await;
     progress.finish();
     Ok(Report {
         length: probe.length,
@@ -91,11 +116,12 @@ pub async fn download<S: Source, P: Progress>(
     })
 }
 
-/// The sibling `.part` path a download writes to before it is renamed into place: the output name with
-/// `.part` appended, so a multi-part extension like `.tar.gz` is preserved.
-fn part_path(output: &Path) -> PathBuf {
+/// The sibling `.xget` path a download writes to before it is renamed into place: the output name with
+/// `.xget` appended, so a multi-part extension like `.tar.gz` is preserved. The file holds the sparse
+/// data and, until it is finalized, the resume control in a trailer past the data.
+pub(crate) fn part_path(output: &Path) -> PathBuf {
     let mut name = output.as_os_str().to_owned();
-    name.push(".part");
+    name.push(".xget");
     PathBuf::from(name)
 }
 
@@ -112,10 +138,10 @@ struct ResumePlan {
 }
 
 /// Work out how a download is laid out. Fresh, it is the whole resource in `options.parts` chunks.
-/// Resuming, the control file beside the `.part` lists the byte ranges already written, and the plan is
-/// rebuilt around them with `options.parts` chunks over what remains, so a resume may use a different
-/// parallelism than the run that started it. A `.part` with no control file cannot be safely resumed
-/// (its holes are unknown), so it is an error rather than a corrupt result.
+/// Resuming, the `.xget` file's control trailer lists the byte ranges already written, and the plan is
+/// rebuilt around them with `options.parts` chunks, so a resume may use a different parallelism than the
+/// run that started it. A file with no valid control cannot be safely resumed (its holes are unknown),
+/// so it is an error rather than a corrupt result.
 async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<ResumePlan, Error> {
     let fresh = || ResumePlan {
         ranges: plan_range(0, total, options.parts),
@@ -139,7 +165,7 @@ async fn resume_plan(part: &Path, total: u64, options: &Options) -> Result<Resum
         Ok(fresh())
     } else {
         Err(detail(
-            "cannot resume: no saved state for this partial (delete the .part to start over)",
+            "cannot resume: no saved state in the partial file (use --restart to start over)",
         ))
     }
 }
@@ -152,18 +178,11 @@ async fn file_len(part: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Preallocate `part` to `total` bytes as a sparse file so every chunk offset exists to be written. A
-/// `fresh` download truncates first; a resume keeps the bytes already there and extends.
-async fn allocate(part: &Path, total: u64, fresh: bool) -> Result<(), Error> {
-    let file = if fresh {
-        File::create(part).await.map_err(io)?
-    } else {
-        OpenOptions::new()
-            .write(true)
-            .open(part)
-            .await
-            .map_err(io)?
-    };
+/// Create `part` and preallocate it to `total` bytes as a sparse file, so every chunk offset exists to
+/// be written. Only for a fresh download: a resume keeps its existing file (data and control trailer)
+/// untouched, since truncating here would strip the trailer.
+async fn allocate_fresh(part: &Path, total: u64) -> Result<(), Error> {
+    let file = File::create(part).await.map_err(io)?;
     file.set_len(total).await.map_err(io)?;
     Ok(())
 }
@@ -179,6 +198,7 @@ async fn fetch_scatter<S: Source, P: Progress>(
     plan: &ResumePlan,
     options: Options,
     progress: &P,
+    writer: &Rc<Mutex<Writer>>,
 ) -> Result<Option<String>, Error> {
     let ranges = &plan.ranges;
     let completed = &plan.completed;
@@ -211,12 +231,15 @@ async fn fetch_scatter<S: Source, P: Progress>(
         .enumerate()
         .map(|(index, range)| {
             let done = completed.contains(&index);
-            let shared = Rc::clone(&shared);
+            let scatter = Scatter {
+                shared: Rc::clone(&shared),
+                writer: Rc::clone(writer),
+            };
             async move {
                 if done {
                     Ok(())
                 } else {
-                    scatter_one(source, part, index, range, options, &shared, progress).await
+                    scatter_one(source, part, index, range, options, progress, &scatter).await
                 }
             }
         })
@@ -251,18 +274,31 @@ struct Shared {
     failed: Cell<bool>,
 }
 
-/// One chunk's write target: its own file handle, its range, and the shared state it reports into.
+/// The shared handles one fetching chunk needs: the state it reports into and the control writer it
+/// records completed and checkpointed ranges through. Each fetcher gets its own clones of the shared
+/// `Rc`s, all pointing at the one download's state.
+struct Scatter {
+    shared: Rc<Shared>,
+    writer: Rc<Mutex<Writer>>,
+}
+
+/// One chunk's write target: its own file handle, its range, the shared state it reports into, and the
+/// control writer it checkpoints its flushed prefix to.
 struct Sink<'a> {
     index: usize,
     range: ByteRange,
     file: File,
     shared: &'a Rc<Shared>,
+    writer: &'a Rc<Mutex<Writer>>,
+    /// The offset last written to the control trailer, so this chunk checkpoints only every so often.
+    checkpointed: u64,
 }
 
 impl Sink<'_> {
     /// Stream `[*offset, range.end)` from `source` into the file at that offset, advancing `offset`,
-    /// recording each write into the shared received count, and nudging the verifier. On a mid-stream
-    /// error `offset` reflects how far it got, so the caller can seek back and resume.
+    /// recording each write into the shared received count, nudging the verifier, and checkpointing the
+    /// flushed prefix to the control trailer every so often. On a mid-stream error `offset` reflects how
+    /// far it got, so the caller can seek back and resume.
     async fn fill<S: Source, P: Progress>(
         &mut self,
         source: &S,
@@ -290,6 +326,19 @@ impl Sink<'_> {
             self.shared.received.borrow_mut()[self.index] = *offset - self.range.start;
             self.shared.notify.notify_one();
             progress.received(self.index, len);
+            // Persist this chunk's flushed prefix now and then, so a resume keeps partial progress and
+            // does not refetch it. The bytes are already flushed, so the recorded range is on disk.
+            if *offset - self.checkpointed >= checkpoint_bytes() {
+                self.writer
+                    .lock()
+                    .await
+                    .append(ByteRange {
+                        start: self.range.start,
+                        end: *offset,
+                    })
+                    .await?;
+                self.checkpointed = *offset;
+            }
         }
         Ok(())
     }
@@ -303,8 +352,8 @@ async fn scatter_one<S: Source, P: Progress>(
     index: usize,
     range: ByteRange,
     options: Options,
-    shared: &Rc<Shared>,
     progress: &P,
+    scatter: &Scatter,
 ) -> Result<(), Error> {
     let file = OpenOptions::new()
         .write(true)
@@ -315,7 +364,9 @@ async fn scatter_one<S: Source, P: Progress>(
         index,
         range,
         file,
-        shared,
+        shared: &scatter.shared,
+        writer: &scatter.writer,
+        checkpointed: range.start,
     };
     let mut offset = range.start;
     let mut last_error = None;
@@ -352,7 +403,7 @@ async fn scatter_one<S: Source, P: Progress>(
     }
     tracing::debug!(chunk = index, "chunk complete");
     // Record the whole chunk's byte range as on disk, so a later run skips it however it re-chunks.
-    control::mark_done(part, range).await?;
+    scatter.writer.lock().await.append(range).await?;
     Ok(())
 }
 

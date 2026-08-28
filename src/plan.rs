@@ -36,10 +36,12 @@ pub fn plan_range(start: u64, end: u64, parts: u32) -> Vec<ByteRange> {
     ranges
 }
 
-/// Plan a resume: tile `[0, total)` into contiguous chunks that align to the byte ranges already on
-/// disk, so no chunk ever straddles a done/missing boundary. Each already-done range passes through as
-/// its own chunk (its index is returned in the second field), and the gaps between them are split toward
-/// `parts` chunks in proportion to their size, at least one chunk per gap.
+/// Plan a resume: tile `[0, total)` into ~`parts` uniform chunks, cutting at every boundary of the byte
+/// ranges already on disk so no chunk ever straddles a done/missing edge, and returning the indices of
+/// the chunks that are fully on disk. Both the done regions and the gaps are subdivided to the same
+/// target size, so a resume shows the same uniform chunks a fresh run would, with some already complete
+/// (five chunks with two done stays five chunks, two done; switching to ten makes ten, with the covered
+/// ones marked done).
 ///
 /// This is what lets a resume re-chunk with a different `parts` than the run that started it: the plan
 /// is rebuilt from the bytes actually present, not from the old chunk count. The returned ranges tile
@@ -58,39 +60,34 @@ pub fn plan_resume(total: u64, parts: u32, done: &[ByteRange]) -> (Vec<ByteRange
         .filter(|range| range.start < range.end)
         .collect();
     let done = merge_ranges(clamped);
-    let missing = total - done.iter().map(ByteRange::len).sum::<u64>();
+
+    // The target chunk size that ~`parts` chunks over the whole resource would use, so every subdivided
+    // segment lands near it and the plan reads as uniform chunks regardless of what is already done.
+    let target = total.div_ceil(u64::from(parts.max(1))).max(1);
 
     let mut ranges = Vec::new();
     let mut completed = Vec::new();
     let mut cursor = 0;
     for range in done {
         if cursor < range.start {
-            push_gap(&mut ranges, cursor, range.start, parts, missing);
+            subdivide(&mut ranges, cursor, range.start, target);
         }
-        ranges.push(range);
-        completed.push(ranges.len() - 1);
+        let first = ranges.len();
+        subdivide(&mut ranges, range.start, range.end, target);
+        completed.extend(first..ranges.len());
         cursor = range.end;
     }
     if cursor < total {
-        push_gap(&mut ranges, cursor, total, parts, missing);
+        subdivide(&mut ranges, cursor, total, target);
     }
     (ranges, completed)
 }
 
-/// Split a missing gap `[start, end)` into chunks in proportion to its share of the `missing` bytes,
-/// toward a total of `parts` chunks across all gaps, and append them. Always at least one chunk, so no
-/// gap is skipped.
-fn push_gap(ranges: &mut Vec<ByteRange>, start: u64, end: u64, parts: u32, missing: u64) {
-    let length = end - start;
-    let share = if missing == 0 {
-        1
-    } else {
-        // Round parts * length / missing, clamped into a u32 chunk count of at least one.
-        let scaled = (u128::from(parts) * u128::from(length) + u128::from(missing) / 2)
-            / u128::from(missing);
-        scaled.min(u128::from(u32::MAX)) as u32
-    };
-    ranges.extend(plan_range(start, end, share.max(1)));
+/// Split `[start, end)` into contiguous chunks of about `target` bytes each and append them, so a done
+/// region or a gap is tiled at the same granularity as the rest of the plan.
+fn subdivide(ranges: &mut Vec<ByteRange>, start: u64, end: u64, target: u64) {
+    let pieces = (end - start).div_ceil(target).clamp(1, u64::from(u32::MAX)) as u32;
+    ranges.extend(plan_range(start, end, pieces));
 }
 
 /// Sort and coalesce ranges so the result is non-overlapping and gap-free between touching ranges, which

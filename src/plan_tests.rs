@@ -88,12 +88,25 @@ fn a_resume_with_nothing_done_matches_a_fresh_plan() {
 }
 
 #[test]
-fn a_resume_tiles_the_whole_resource_and_marks_the_done_range() {
-    // 500 bytes already on disk at the front; the remainder is re-split into fresh chunks.
+fn a_resume_tiles_the_whole_resource_into_uniform_chunks_with_some_done() {
+    // 500 bytes already on disk at the front. The whole resource re-splits into ~uniform chunks, and the
+    // pieces inside the on-disk range are the ones marked done (not one merged chunk).
     let (ranges, completed) = plan_resume(1000, 4, &[ByteRange { start: 0, end: 500 }]);
     covers_exactly(&ranges, 1000);
-    assert_eq!(completed.len(), 1);
-    assert_eq!(ranges[completed[0]], ByteRange { start: 0, end: 500 });
+    let done_bytes: u64 = completed.iter().map(|&index| ranges[index].len()).sum();
+    assert_eq!(
+        done_bytes, 500,
+        "the done pieces cover exactly the on-disk range"
+    );
+    assert!(
+        completed.iter().all(|&index| ranges[index].end <= 500),
+        "every done piece lies within the on-disk range"
+    );
+    // With a target near 1000/4, half the resource is more than one chunk.
+    assert!(
+        completed.len() >= 2,
+        "the done region is uniform chunks, not one"
+    );
 }
 
 #[test]
@@ -135,17 +148,18 @@ fn a_resume_merges_overlapping_and_unsorted_done_ranges() {
     ];
     let (ranges, completed) = plan_resume(1000, 4, &done);
     covers_exactly(&ranges, 1000);
-    let done_ranges: Vec<_> = completed.iter().map(|&index| ranges[index]).collect();
+    // Merged to [0, 400) and [600, 800); the done pieces cover exactly those 600 bytes and nothing in
+    // the gaps between them.
+    let done_bytes: u64 = completed.iter().map(|&index| ranges[index].len()).sum();
     assert_eq!(
-        done_ranges,
-        [
-            ByteRange { start: 0, end: 400 },
-            ByteRange {
-                start: 600,
-                end: 800
-            },
-        ],
+        done_bytes, 600,
         "overlapping and out-of-order ranges are clamped and merged"
+    );
+    assert!(
+        completed
+            .iter()
+            .all(|&index| ranges[index].end <= 400 || ranges[index].start >= 600),
+        "every done piece lies within a merged on-disk region"
     );
 }
 
@@ -159,12 +173,10 @@ fn a_fully_downloaded_resume_is_all_done_and_still_tiles() {
             end: 1000,
         }],
     );
+    covers_exactly(&ranges, 1000);
     assert_eq!(
-        ranges,
-        [ByteRange {
-            start: 0,
-            end: 1000
-        }]
+        completed.len(),
+        ranges.len(),
+        "every chunk is already on disk"
     );
-    assert_eq!(completed, [0]);
 }

@@ -41,9 +41,11 @@ tokio-util = { version = "0.7", optional = true, features = ["io"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
-# Sibling crates from the same rewrite effort.
-xbytes = { path = "../xbytes-rs" }
-xprogress = { path = "../xprogress-rs" }
+# Sibling crates from the same rewrite effort. Git dependencies so the crate builds standalone (and in
+# CI); a gitignored .cargo/config.toml overrides these with the neighbouring working copies for local
+# co-development, so edits across the three repos are picked up without a push.
+xbytes = { git = "https://github.com/miraclx/xbytes-rs" }
+xprogress = { git = "https://github.com/miraclx/xprogress-rs" }
 
 [dev-dependencies]
 # An in-process mock HTTP server for the HttpSource integration tests: it lets a test answer a range

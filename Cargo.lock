@@ -3237,6 +3237,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "xbytes"
 version = "0.1.1"
+source = "git+https://github.com/miraclx/xbytes-rs#51a2de8da34ee2dcd253d788eca1703cac16152b"
 dependencies = [
  "bitflags",
  "fraction",
@@ -3252,6 +3253,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 [[package]]
 name = "xprogress"
 version = "0.1.0"
+source = "git+https://github.com/miraclx/xprogress-rs#0d218529ccf91f69c4f4f43244d3866978edfa2a"
 dependencies = [
  "anstyle",
  "terminal_size",

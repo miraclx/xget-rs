@@ -15,7 +15,7 @@ Honest tracking of libxget-js against xget-rs, so "done" means done. ✅ done ·
 | single-stream fetch for non-range sources | ✅ | one stream, hashed inline |
 | configurable checksum algorithm | ✅ | none/md5/sha1/sha256/sha512/blake3 |
 | resume a partial FILE across runs | ✅ | auto-resumes a partial; `-c` forces, `--restart` fresh; prefix folded into the verify pass |
-| start from offset (`-i, --start-pos`) | ⬜ | |
+| start from offset (`-i, --start-pos`) | ➖ | resume is range-based and automatic; a raw start offset yields a partial that can't be verified against a whole-resource checksum, so it is a non-goal (see below) |
 | inactivity timeout (`--timeout`) | ✅ | per-read; a ranged chunk's retry resumes it |
 | pluggable sources | ✅ | `Source` seam with HTTP, S3, and IPFS impls; a bifrost peer planned |
 | S3 / S3-compatible source (`s3` feature) | ✅ | signs or anonymous, workdir `.env`, `--endpoint-url`, adopts a stored checksum |
@@ -31,7 +31,7 @@ Honest tracking of libxget-js against xget-rs, so "done" means done. ✅ done ·
 | `-H, --header <H>` (repeatable) | ✅ | custom request headers |
 | output filename inference | ✅ | Content-Disposition (RFC 5987), else URL basename |
 | `-D, --directory-prefix`, `--no-directories` | ✅ | |
-| `-f, --overwrite` | ✅ | refuses to clobber without `-f`; `--force-append` TODO |
+| `-f, --overwrite` | ✅ | refuses to clobber without `-f`; `--force-append` is a deliberate non-goal (see below) |
 | `--progress <bar\|plain\|json\|none>`, `--no-bar` | ✅ | auto-detects a TTY |
 | `--raw-sizes` | ✅ | raw byte counts |
 | `-s, --checksum <algo>` reporting | ✅ | none/md5/sha1/sha256/sha512/blake3 |
@@ -42,7 +42,7 @@ Honest tracking of libxget-js against xget-rs, so "done" means done. ✅ done ·
 | `--mirror <url>` (repeatable) | ✅ | failover for the same resource |
 | `--endpoint-url <url>` | ✅ | S3-compatible endpoint (with the `s3` feature) |
 | `--ipfs-gateway <url>` | ✅ | HTTP gateway for `ipfs://` (with the `ipfs` feature) |
-| `--start-pos` | ⬜ | `-c` covers the real resume case |
+| `--start-pos` | ➖ | `-c` covers the real resume case; a raw offset is a non-goal (see below) |
 
 ## Progress
 
@@ -51,7 +51,7 @@ Honest tracking of libxget-js against xget-rs, so "done" means done. ✅ done ·
 | live segmented bar, one segment per chunk | ✅ | xprogress |
 | human size readout (done / total) | ✅ | xbytes |
 | speed and ETA | ✅ | rolling readout |
-| per-chunk detail / labels | ⬜ | |
+| per-chunk detail / labels | 🟡 | the segmented bar shows each chunk's state; a per-chunk numeric readout is not built |
 | plain / json output modes | ✅ | `--progress plain\|json`, throttled |
 
 ## Deliberately different (➖)
@@ -60,3 +60,10 @@ Honest tracking of libxget-js against xget-rs, so "done" means done. ✅ done ·
   sparse file, so nothing is buffered in memory and there is no cache to size. Verification is a single
   in-order read-back of the file (giving up the JS "never touch the disk twice" for unbounded
   parallelism and connections that never idle).
+- No `-i, --start-pos` (arbitrary start offset): xget downloads a whole resource and certifies its
+  digest. Fetching only a suffix would produce bytes that cannot be verified against a whole-resource
+  checksum, and the real reason to start mid-file, resuming an interrupted download, is handled properly
+  by the range-based control file (`-c` / automatic). A raw offset is therefore a non-goal, not a todo.
+- No `--force-append` (append to an existing file): appending bytes to a file the engine never wrote and
+  cannot account for is exactly the "certify bytes we did not verify" failure the whole design refuses.
+  Resuming a genuine partial goes through the verified `.xget` control instead.

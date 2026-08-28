@@ -36,6 +36,10 @@ jobs:
       run: cargo clippy --all-targets -- -D warnings
     - name: clippy (s3 feature)
       run: cargo clippy --all-targets --features s3 -- -D warnings
+    - name: clippy (ipfs feature)
+      run: cargo clippy --all-targets --features ipfs -- -D warnings
+    - name: clippy (all features)
+      run: cargo clippy --all-targets --features "s3 ipfs" -- -D warnings
 
   test:
     name: test
@@ -51,6 +55,12 @@ jobs:
     # never a live network.
     - name: test (s3 feature)
       run: cargo test --all-targets --features s3
+    # The ipfs source resolves a CID to a gateway HTTP request; its unit tests parse CIDs and derive the
+    # verifiable checksum with no network. All features together must also build and test cleanly.
+    - name: test (ipfs feature)
+      run: cargo test --all-targets --features ipfs
+    - name: test (all features)
+      run: cargo test --all-targets --features "s3 ipfs" && cargo test --doc --features "s3 ipfs"
 
 # Note: the docker harness under harness/ (go-httpbin + minio + toxiproxy) is a manual dev tool for
 # fault-injection and real-object-store testing. It needs containers and is intentionally not run in

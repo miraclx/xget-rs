@@ -11,6 +11,7 @@
 //! serve ranges is fetched as one stream, hashed inline as it is written.
 
 use core::cell::{Cell, RefCell};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ use std::time::Instant;
 use futures::StreamExt as _;
 use futures::stream::FuturesUnordered;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Mutex, Notify};
 use xbytes::ByteSize;
 use xbytes::sizes::MEBI_BYTE;
@@ -28,7 +29,11 @@ use xbytes::sizes::MEBI_BYTE;
 use crate::checksum::Hasher;
 use crate::control::Writer;
 use crate::plan::{plan_range, plan_resume};
-use crate::{ByteRange, Checksum, Error, Options, Progress, Source, control};
+use crate::{ByteRange, Checksum, Error, Options, Output, Progress, Source, control};
+
+/// Bumped for each temp scratch a `Writer`/`Discard` download needs, so concurrent downloads in one
+/// process never collide on the same `.xget` scratch name.
+static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A chunk checkpoints its flushed prefix to the control trailer after this many freshly downloaded
 /// bytes, so a fast large chunk records often without a checkpoint per write.
@@ -51,20 +56,29 @@ pub struct Report {
 /// Download the resource behind `source` into `output` per `options`, reporting to `progress`, and
 /// return its verified length and checksum.
 ///
-/// A range-capable resource is scattered into a sparse `.part` in parallel and verified in order; one
-/// that is not is streamed and hashed inline. Every chunk's range is validated, a dropped chunk resumes
-/// from its offset, and the total length is gated, so the returned digest certifies the resource.
+/// The verified bytes go where [`Output`] says: an [`Output::File`] scatters into a sibling `.xget` and
+/// atomic-renames it into place (and alone may resume); an [`Output::Writer`] streams the confirmed bytes
+/// to any [`tokio::io::AsyncWrite`]; an [`Output::Discard`] keeps nothing. A range-capable resource is
+/// scattered into a seekable scratch in parallel and verified in order; one that is not is streamed and
+/// hashed inline. Every chunk's range is validated, a dropped chunk resumes from its offset, and the
+/// total length is gated, so the returned digest certifies the resource.
 pub async fn download<S: Source, P: Progress>(
     source: &S,
-    output: &Path,
+    mut output: Output<'_>,
     options: Options,
     progress: &P,
 ) -> Result<Report, Error> {
     let probe = source.probe().await?;
-    // Write to a sibling `.xget` and only rename it into place once the length and hash gates pass, so an
-    // interrupted download never leaves a truncated file masquerading as complete. That same file carries
-    // the resume control in a trailer past the data, and is what a resume picks up.
-    let part = part_path(output);
+    // The scratch is a seekable `.xget`: for a file it sits beside the output so it can be renamed into
+    // place, carrying the resume control in a trailer past the data until it is finalized; for a writer or
+    // a discard, which have no persistent artifact to resume, it is a throwaway under the temp dir. Only a
+    // file may resume, so a writer or a discard forces no-resume regardless of `options`.
+    let part = scratch_path(&output);
+    let can_resume = matches!(output, Output::File(_));
+    let options = Options {
+        resume: options.resume && can_resume,
+        ..options
+    };
 
     tracing::debug!(
         length = probe.length,
@@ -105,8 +119,21 @@ pub async fn download<S: Source, P: Progress>(
             &writer,
         )
         .await?;
-        // Strip the control trailer and footer, leaving a byte-exact image to rename into place.
+        // Strip the control trailer and footer, leaving the scratch a byte-exact image `[0, total)`.
         writer.lock().await.finish().await?;
+        // Finalize by sink: a file becomes the output by rename; a writer copies the finalized scratch out
+        // then drops it; a discard just drops it. (A writer re-reads the scratch for now; it could later
+        // stream during verify.)
+        match output {
+            Output::File(path) => tokio::fs::rename(&part, path).await.map_err(io)?,
+            Output::Writer(sink) => {
+                copy_out(&part, probe.length, sink).await?;
+                let _ = tokio::fs::remove_file(&part).await;
+            }
+            Output::Discard => {
+                let _ = tokio::fs::remove_file(&part).await;
+            }
+        }
         hash
     } else {
         if options.resume && file_len(&part).await > 0 {
@@ -114,15 +141,60 @@ pub async fn download<S: Source, P: Progress>(
                 "cannot resume: the source does not support byte ranges",
             ));
         }
-        fetch_stream(source, &part, probe.length, options, progress).await?
+        // The single-stream path writes straight to the sink: a file to its scratch (renamed after), a
+        // writer live with no scratch, a discard nowhere.
+        let hash =
+            fetch_stream(source, &mut output, &part, probe.length, options, progress).await?;
+        if let Output::File(path) = output {
+            tokio::fs::rename(&part, path).await.map_err(io)?;
+        }
+        hash
     };
 
-    tokio::fs::rename(&part, output).await.map_err(io)?;
     progress.finish();
     Ok(Report {
         length: probe.length,
         hash,
     })
+}
+
+/// The `.xget` scratch a download scatters into: beside the output for a [`Output::File`] (so it can be
+/// renamed into place), or a unique throwaway under the temp dir for a [`Output::Writer`] or
+/// [`Output::Discard`] (which have no persistent artifact and so are copied out or dropped after verify).
+fn scratch_path(output: &Output<'_>) -> PathBuf {
+    match output {
+        Output::File(path) => part_path(path),
+        Output::Writer(_) | Output::Discard => std::env::temp_dir().join(format!(
+            "xget-{}-{}.xget",
+            std::process::id(),
+            SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )),
+    }
+}
+
+/// Copy the finalized scratch's `[0, total)` to `sink` and flush it. Used to stream a range download's
+/// verified image out to a writer once the scatter and verify have certified it.
+async fn copy_out(
+    part: &Path,
+    total: u64,
+    sink: &mut (dyn AsyncWrite + Unpin),
+) -> Result<(), Error> {
+    let mut reader = File::open(part).await.map_err(io)?;
+    let mut buffer = vec![0u8; 128 * 1024];
+    let mut remaining = total;
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..want]).await.map_err(io)?;
+        if read == 0 {
+            return Err(Error::LengthMismatch {
+                expected: total,
+                received: total - remaining,
+            });
+        }
+        sink.write_all(&buffer[..read]).await.map_err(io)?;
+        remaining -= read as u64;
+    }
+    sink.flush().await.map_err(io)
 }
 
 /// The sibling `.xget` path a download writes to before it is renamed into place: the output name with
@@ -533,16 +605,23 @@ async fn read_into(
 }
 
 /// Fetch a resource that does not support ranges as one stream, hashing and writing each byte in one
-/// in-order pass (no scatter, no re-read: a single stream is already in order).
+/// in-order pass (no scatter, no re-read: a single stream is already in order). The bytes go straight to
+/// the sink: a file to its scratch (renamed after by the caller), a writer live as they arrive, a discard
+/// nowhere. Either way the stream is hashed inline and gated on the declared length.
 async fn fetch_stream<S: Source, P: Progress>(
     source: &S,
+    output: &mut Output<'_>,
     part: &Path,
     total: u64,
     options: Options,
     progress: &P,
 ) -> Result<Option<String>, Error> {
     progress.start(&[total]);
-    let mut file = File::create(part).await.map_err(io)?;
+    // The scratch a file streams to, kept open only for that case; a writer and a discard write elsewhere.
+    let mut file = match output {
+        Output::File(_) => Some(File::create(part).await.map_err(io)?),
+        Output::Writer(_) | Output::Discard => None,
+    };
     let mut hasher = options.checksum.hasher();
     let mut stream = source.fetch(None).await?;
     let mut written = 0u64;
@@ -551,12 +630,28 @@ async fn fetch_stream<S: Source, P: Progress>(
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(&chunk);
         }
-        file.write_all(&chunk).await.map_err(io)?;
+        match output {
+            Output::File(_) => {
+                if let Some(file) = file.as_mut() {
+                    file.write_all(&chunk).await.map_err(io)?;
+                }
+            }
+            Output::Writer(sink) => sink.write_all(&chunk).await.map_err(io)?,
+            Output::Discard => {}
+        }
         written += len;
         progress.received(0, len);
         progress.wrote(0, len);
     }
-    file.flush().await.map_err(io)?;
+    match output {
+        Output::File(_) => {
+            if let Some(file) = file.as_mut() {
+                file.flush().await.map_err(io)?;
+            }
+        }
+        Output::Writer(sink) => sink.flush().await.map_err(io)?,
+        Output::Discard => {}
+    }
     if written != total {
         return Err(Error::LengthMismatch {
             expected: total,

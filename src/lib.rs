@@ -83,6 +83,33 @@ impl Default for Options {
     }
 }
 
+/// Where a download's verified bytes go.
+///
+/// A [`download`] scatters and verifies into a seekable scratch, then finalizes to the chosen sink. Only
+/// [`Output::File`] leaves a persistent artifact and so is resumable; a [`Output::Writer`] or
+/// [`Output::Discard`] has nothing to come back to and always runs fresh.
+// TODO: composition (tee) via a Many variant
+pub enum Output<'a> {
+    /// Persist to a file: scatter into `<path>.xget`, atomic-rename on success. Resumable.
+    File(&'a std::path::Path),
+    /// Stream verified bytes to a writer (stdout, a socket, a child's stdin). Not resumable.
+    Writer(&'a mut (dyn tokio::io::AsyncWrite + Unpin)),
+    /// Verify and keep nothing (a speed test, or /dev/null). Not resumable.
+    Discard,
+}
+
+impl<'a> Output<'a> {
+    /// Persist the download to `path`, scattering into `<path>.xget` and atomic-renaming on success.
+    pub fn file(path: &'a std::path::Path) -> Self {
+        Output::File(path)
+    }
+
+    /// Stream the download's verified bytes to `writer` as they are confirmed.
+    pub fn writer(writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin)) -> Self {
+        Output::Writer(writer)
+    }
+}
+
 /// A half-open byte range `[start, end)`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ByteRange {

@@ -147,14 +147,28 @@ async fn run() -> eyre::Result<()> {
 
     // Probe once up front for the preamble and the output name; the download re-probes authoritatively.
     let probe = source.probe().await.ok();
-    let output = resolve_output(&cli, probe.as_ref())?;
+    // Where the bytes go: `-` streams to stdout, `/dev/null` discards (a verify-only speed test), anything
+    // else is a file whose name is resolved and inferred as before. Only a file has a persistent artifact
+    // to resume, so `-` and `/dev/null` never resume.
+    let sink = resolve_sink(&cli);
+    let output = match sink {
+        Sink::File => Some(resolve_output(&cli, probe.as_ref())?),
+        Sink::Stdout | Sink::Discard => None,
+    };
     // Auto-resume: an interrupted download leaves a `.part` and its control file beside the output, and
     // their presence is the signal to continue where the last run stopped, so a re-run resumes without
     // needing -c. Resume is independent of -f (which only permits replacing the destination), so a
     // corrupt finished file can be overwritten by resuming its partial; --restart forces a fresh start.
-    let resume = !cli.restart && (cli.resume || xget::resumable(&output).await);
+    // Only a file resumes; `-` and `/dev/null` have nothing to come back to.
+    let resume = match &output {
+        Some(output) => !cli.restart && (cli.resume || xget::resumable(output).await),
+        None => false,
+    };
     if mode == ProgressMode::Bar {
-        preamble(&cli, probe.as_ref(), &output, resume);
+        // For a file, print the block before the bar as usual. For `-`, still print it (to stderr, since
+        // stdout is the data). A path label makes sense only for a file; show the destination stream
+        // otherwise.
+        preamble(&cli, probe.as_ref(), output.as_deref(), sink, resume);
     }
 
     // `--expect` was parsed to a literal digest or a checksum-file URL at parse time; resolve it now,
@@ -194,7 +208,16 @@ async fn run() -> eyre::Result<()> {
         resume,
     };
     let started = Instant::now();
-    let report = xget::download(&source, &output, options, &reporter).await?;
+    // Build the sink and run. Stdout is held in a binding so a `Writer` can borrow it for the whole call.
+    let mut stdout = tokio::io::stdout();
+    let out = match (sink, &output) {
+        (Sink::File, Some(path)) => xget::Output::File(path),
+        (Sink::Stdout, _) => xget::Output::Writer(&mut stdout),
+        (Sink::Discard, _) => xget::Output::Discard,
+        // A file sink always resolves an output above; this arm is unreachable but keeps the match total.
+        (Sink::File, None) => eyre::bail!("no output path resolved for a file download"),
+    };
+    let report = xget::download(&source, out, options, &reporter).await?;
 
     if let Some((_, want)) = &expected {
         match &report.hash {
@@ -300,8 +323,9 @@ fn build_ipfs_source(_rest: &str, _gateway: Option<String>) -> eyre::Result<AnyS
 }
 
 /// Print the block shown before a live bar: the URL, how many chunks, the length and media type, and
-/// where the file is being written, noting when the run is continuing a partial.
-fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path, resume: bool) {
+/// where the bytes are going, noting when the run is continuing a partial. Always to stderr, so it does
+/// not corrupt a `-` download whose data is on stdout.
+fn preamble(cli: &Cli, probe: Option<&Probe>, output: Option<&Path>, sink: Sink, resume: bool) {
     eprintln!("{}URL:{} {}", DIM.render(), DIM.render_reset(), cli.url);
     let chunks = match probe {
         Some(probe) if probe.supports_ranges => xget::plan(probe.length, cli.chunks).len().max(1),
@@ -323,12 +347,18 @@ fn preamble(cli: &Cli, probe: Option<&Probe>, output: &Path, resume: bool) {
         }
         None => eprintln!("{}Length:{} unknown", DIM.render(), DIM.render_reset()),
     }
-    eprintln!(
-        "{}Saving:{} '{}'",
-        DIM.render(),
-        DIM.render_reset(),
-        output.display()
-    );
+    match (sink, output) {
+        (Sink::File, Some(output)) => eprintln!(
+            "{}Saving:{} '{}'",
+            DIM.render(),
+            DIM.render_reset(),
+            output.display()
+        ),
+        (Sink::Stdout, _) => eprintln!("{}Saving:{} <stdout>", DIM.render(), DIM.render_reset()),
+        (Sink::Discard, _) | (Sink::File, None) => {
+            eprintln!("{}Saving:{} <discarded>", DIM.render(), DIM.render_reset())
+        }
+    }
     if resume {
         eprintln!(
             "{}Resuming a previous download{}",
@@ -414,6 +444,28 @@ fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
         .parse()
         .map_err(|_| format!("invalid header value: {value}"))?;
     Ok((name, value))
+}
+
+/// Where a run's bytes go, chosen from the output argument: a file (the default), stdout for `-`, or
+/// discarded for `/dev/null`. Only a file leaves a persistent artifact, so only it resumes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sink {
+    /// Write to a file whose path is resolved and inferred as usual.
+    File,
+    /// Stream to stdout (the output argument was `-`).
+    Stdout,
+    /// Verify and keep nothing (the output argument was `/dev/null`).
+    Discard,
+}
+
+/// Read the output argument to decide the sink: `-` is stdout, the exact path `/dev/null` is a discard,
+/// anything else (or no argument) is a file.
+fn resolve_sink(cli: &Cli) -> Sink {
+    match cli.output.as_deref() {
+        Some(path) if path == Path::new("-") => Sink::Stdout,
+        Some(path) if path == Path::new("/dev/null") => Sink::Discard,
+        _ => Sink::File,
+    }
 }
 
 /// Resolve where to write: an explicit file, a name inside an explicit directory, or a name inferred

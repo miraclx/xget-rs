@@ -13,7 +13,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::stream;
 use sha2::{Digest as _, Sha256};
-use xget::{ByteRange, ByteStream, Checksum, Error, Options, Probe, Report, Source, download};
+use xget::{
+    ByteRange, ByteStream, Checksum, Error, Options, Output, Probe, Report, Source, download,
+};
 
 /// A deterministic in-memory resource, served either range by range (honestly) or with an injected
 /// fault, so the engine's guarantees can be asserted without a server.
@@ -156,7 +158,7 @@ async fn a_clean_parallel_download_verifies_to_the_right_hash() {
         ..Options::default()
     };
 
-    let report: Report = download(&source, &scratch.path, options, &())
+    let report: Report = download(&source, Output::File(&scratch.path), options, &())
         .await
         .expect("a clean parallel download succeeds");
 
@@ -182,7 +184,7 @@ async fn a_source_that_ignores_the_range_is_a_typed_error() {
         ..Options::default()
     };
 
-    let error = download(&source, &scratch.path, options, &())
+    let error = download(&source, Output::File(&scratch.path), options, &())
         .await
         .expect_err("a range-ignoring source must not be certified");
 
@@ -208,7 +210,7 @@ async fn a_short_served_chunk_becomes_a_length_mismatch() {
         ..Options::default()
     };
 
-    let error = download(&source, &scratch.path, options, &())
+    let error = download(&source, Output::File(&scratch.path), options, &())
         .await
         .expect_err("a chunk that never reaches its end cannot complete");
 
@@ -231,7 +233,7 @@ async fn a_dropped_chunk_resumes_and_still_verifies() {
         ..Options::default()
     };
 
-    let report = download(&source, &scratch.path, options, &())
+    let report = download(&source, Output::File(&scratch.path), options, &())
         .await
         .expect("the retry recovers the dropped chunk");
 
@@ -290,7 +292,7 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
         // Fail the final quarter, so the first three chunks land and are recorded as done.
         fail_from: 3072,
     };
-    let first = download(&partial, &scratch.path, options, &()).await;
+    let first = download(&partial, Output::File(&scratch.path), options, &()).await;
     assert!(first.is_err(), "the first pass fails on the dropped tail");
     assert!(
         scratch.part().exists(),
@@ -300,7 +302,7 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
     // Second pass: the same source now serves everything. Resume must reuse the recorded chunks, fetch
     // only the remainder, fold the on-disk prefix into the hash, and verify to the full digest.
     let full = FakeSource::honest(body.clone());
-    let report = download(&full, &scratch.path, options, &())
+    let report = download(&full, Output::File(&scratch.path), options, &())
         .await
         .expect("the resume completes the download");
 
@@ -354,7 +356,7 @@ async fn resume_re_chunks_with_a_different_parts_count() {
     };
     let first = download(
         &partial,
-        &scratch.path,
+        Output::File(&scratch.path),
         Options {
             parts: 8,
             retries: 1,
@@ -371,7 +373,7 @@ async fn resume_re_chunks_with_a_different_parts_count() {
     let full = FakeSource::honest(body.clone());
     let report = download(
         &full,
-        &scratch.path,
+        Output::File(&scratch.path),
         Options {
             parts: 3,
             retries: 1,
@@ -405,7 +407,7 @@ async fn a_non_range_source_streams_and_verifies() {
         ..Options::default()
     };
 
-    let report = download(&source, &scratch.path, options, &())
+    let report = download(&source, Output::File(&scratch.path), options, &())
         .await
         .expect("a non-range source is fetched as a single stream");
 
@@ -428,7 +430,7 @@ async fn no_checksum_requested_returns_no_hash() {
         ..Options::default()
     };
 
-    let report = download(&source, &scratch.path, options, &())
+    let report = download(&source, Output::File(&scratch.path), options, &())
         .await
         .expect("a download with hashing off still completes");
 
@@ -437,4 +439,74 @@ async fn no_checksum_requested_returns_no_hash() {
         report.hash, None,
         "no digest is certified when none is asked"
     );
+}
+
+#[tokio::test]
+async fn discard_verifies_but_writes_no_file() {
+    let body = sample_body(4096);
+    let source = FakeSource::honest(body.clone());
+    let scratch = Scratch::new("discard");
+    let options = Options {
+        parts: 5,
+        checksum: Checksum::Sha256,
+        ..Options::default()
+    };
+
+    // A discard scatters and verifies exactly as a file would, so the report is identical, but it keeps
+    // nothing: no output file and no `.xget` beside the (unused) scratch path.
+    let report = download(&source, Output::Discard, options, &())
+        .await
+        .expect("a discard download verifies");
+
+    assert_eq!(report.length, body.len() as u64, "the whole resource");
+    assert_eq!(
+        report.hash.as_deref(),
+        Some(sha256_hex(&body).as_str()),
+        "a discard certifies the same digest a file would"
+    );
+    assert!(!scratch.path.exists(), "a discard leaves no output file");
+    assert!(
+        !scratch.part().exists(),
+        "a discard leaves no partial beside the output"
+    );
+}
+
+#[tokio::test]
+async fn writer_streams_the_exact_bytes_and_hash() {
+    let body = sample_body(4096);
+    let options = Options {
+        parts: 5,
+        checksum: Checksum::Sha256,
+        ..Options::default()
+    };
+
+    // Stream the verified bytes into an in-memory buffer.
+    let mut buf: Vec<u8> = Vec::new();
+    let streamed = {
+        let source = FakeSource::honest(body.clone());
+        download(&source, Output::Writer(&mut buf), options, &())
+            .await
+            .expect("a writer download streams the verified bytes")
+    };
+
+    // The same source written to a file, to compare the reports side by side.
+    let scratch = Scratch::new("writer-ref");
+    let file = {
+        let source = FakeSource::honest(body.clone());
+        download(&source, Output::File(&scratch.path), options, &())
+            .await
+            .expect("the reference file download succeeds")
+    };
+
+    assert_eq!(buf, body, "the writer received every byte in order");
+    assert_eq!(
+        streamed.hash, file.hash,
+        "a writer certifies the same digest a file does"
+    );
+    assert_eq!(
+        streamed.hash.as_deref(),
+        Some(sha256_hex(&body).as_str()),
+        "the streamed digest matches the known bytes"
+    );
+    assert_eq!(streamed.length, body.len() as u64);
 }

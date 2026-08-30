@@ -153,22 +153,27 @@ async fn run() -> eyre::Result<()> {
     let sink = resolve_sink(&cli);
     let output = match sink {
         Sink::File => Some(resolve_output(&cli, probe.as_ref())?),
+        // A stream sink writes to the special file exactly as given: no name inference, no clobber check
+        // (writing to the pipe or device is the point), no `.xget` beside it.
+        Sink::Stream => cli.output.clone(),
         Sink::Stdout | Sink::Discard => None,
     };
-    // Auto-resume: an interrupted download leaves a `.part` and its control file beside the output, and
-    // their presence is the signal to continue where the last run stopped, so a re-run resumes without
-    // needing -c. Resume is independent of -f (which only permits replacing the destination), so a
-    // corrupt finished file can be overwritten by resuming its partial; --restart forces a fresh start.
-    // Only a file resumes; `-` and `/dev/null` have nothing to come back to.
-    let resume = match &output {
-        Some(output) => !cli.restart && (cli.resume || xget::resumable(output).await),
-        None => false,
+    // Auto-resume: an interrupted download leaves a `.xget` control file beside the output, and its
+    // presence is the signal to continue where the last run stopped, so a re-run resumes without needing
+    // -c. A partial actually on disk is what we resume; -c only asks to, so with nothing to come back to
+    // there is nothing to resume (and no "resuming" notice). Resume is independent of -f (which only
+    // permits replacing the destination); --restart forces a fresh start. Only a file resumes; `-`,
+    // `/dev/null`, and a stream have nothing to come back to.
+    let partial = match (sink, &output) {
+        (Sink::File, Some(output)) => !cli.restart && xget::resumable(output).await,
+        _ => false,
     };
+    let resume = partial || (matches!(sink, Sink::File) && cli.resume && !cli.restart);
     if mode == ProgressMode::Bar {
         // For a file, print the block before the bar as usual. For `-`, still print it (to stderr, since
         // stdout is the data). A path label makes sense only for a file; show the destination stream
-        // otherwise.
-        preamble(&cli, probe.as_ref(), output.as_deref(), sink, resume);
+        // otherwise. The "resuming" notice keys off a real partial, not the -c flag.
+        preamble(&cli, probe.as_ref(), output.as_deref(), sink, partial);
     }
 
     // `--expect` was parsed to a literal digest or a checksum-file URL at parse time; resolve it now,
@@ -210,10 +215,26 @@ async fn run() -> eyre::Result<()> {
     let started = Instant::now();
     // Build the sink and run. Stdout is held in a binding so a `Writer` can borrow it for the whole call.
     let mut stdout = tokio::io::stdout();
+    // A stream sink (pipe, device, or process substitution) is opened for writing up front and held in a
+    // binding so the download can borrow it for the whole call, the same way stdout is.
+    let mut stream_sink = match (sink, &output) {
+        (Sink::Stream, Some(path)) => Some(
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .await
+                .map_err(|err| eyre::eyre!("cannot open {} for writing: {err}", path.display()))?,
+        ),
+        _ => None,
+    };
     let out = match (sink, &output) {
         (Sink::File, Some(path)) => xget::Output::File(path),
         (Sink::Stdout, _) => xget::Output::Writer(&mut stdout),
         (Sink::Discard, _) => xget::Output::Discard,
+        (Sink::Stream, _) => match stream_sink.as_mut() {
+            Some(file) => xget::Output::Writer(file),
+            None => eyre::bail!("no stream sink opened for a stream download"),
+        },
         // A file sink always resolves an output above; this arm is unreachable but keeps the match total.
         (Sink::File, None) => eyre::bail!("no output path resolved for a file download"),
     };
@@ -354,8 +375,14 @@ fn preamble(cli: &Cli, probe: Option<&Probe>, output: Option<&Path>, sink: Sink,
             DIM.render_reset(),
             output.display()
         ),
+        (Sink::Stream, Some(output)) => eprintln!(
+            "{}Saving:{} '{}' <stream>",
+            DIM.render(),
+            DIM.render_reset(),
+            output.display()
+        ),
         (Sink::Stdout, _) => eprintln!("{}Saving:{} <stdout>", DIM.render(), DIM.render_reset()),
-        (Sink::Discard, _) | (Sink::File, None) => {
+        (Sink::Discard, _) | (Sink::File, None) | (Sink::Stream, None) => {
             eprintln!("{}Saving:{} <discarded>", DIM.render(), DIM.render_reset())
         }
     }
@@ -448,25 +475,54 @@ fn parse_header(raw: &str) -> Result<(HeaderName, HeaderValue), String> {
 }
 
 /// Where a run's bytes go, chosen from the output argument: a file (the default), stdout for `-`, or
-/// discarded for `/dev/null`. Only a file leaves a persistent artifact, so only it resumes.
+/// discarded for `/dev/null`, or streamed to a special file (a pipe or device). Only a regular file
+/// leaves a persistent artifact, so only it resumes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Sink {
-    /// Write to a file whose path is resolved and inferred as usual.
+    /// Write to a regular file whose path is resolved and inferred as usual.
     File,
     /// Stream to stdout (the output argument was `-`).
     Stdout,
     /// Verify and keep nothing (the output argument was `/dev/null`).
     Discard,
+    /// Stream to an existing special file: a named pipe, a device, or a shell process substitution
+    /// (`>(cmd)`, seen as `/dev/fd/N`). It cannot host a sibling `.xget` or be finalized by rename, so it
+    /// is written sequentially like stdout, with no resume.
+    Stream,
 }
 
 /// Read the output argument to decide the sink: `-` is stdout, the exact path `/dev/null` is a discard,
-/// anything else (or no argument) is a file.
+/// an existing special file (pipe/device/process-substitution) is a stream, anything else (or no
+/// argument) is a regular file.
 fn resolve_sink(cli: &Cli) -> Sink {
     match cli.output.as_deref() {
         Some(path) if path == Path::new("-") => Sink::Stdout,
         Some(path) if path == Path::new("/dev/null") => Sink::Discard,
+        Some(path) if is_special_file(path) => Sink::Stream,
         _ => Sink::File,
     }
+}
+
+/// Whether `path` names an existing special file: not a regular file or directory, but a FIFO, a
+/// character or block device, or a socket. Such a target cannot host a sibling `.xget` scratch or be
+/// finalized by an atomic rename, so a download streams to it (like stdout) with no resume, instead of
+/// the scatter-and-rename a regular file gets. This is what routes a named pipe or a shell process
+/// substitution (`>(cmd)`, which the shell passes as `/dev/fd/N`) to the stream path.
+#[cfg(unix)]
+fn is_special_file(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    std::fs::metadata(path).is_ok_and(|meta| {
+        let file_type = meta.file_type();
+        file_type.is_fifo()
+            || file_type.is_char_device()
+            || file_type.is_block_device()
+            || file_type.is_socket()
+    })
+}
+
+#[cfg(not(unix))]
+fn is_special_file(_path: &Path) -> bool {
+    false
 }
 
 /// Resolve where to write: an explicit file, a name inside an explicit directory, or a name inferred

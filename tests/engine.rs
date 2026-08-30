@@ -200,7 +200,7 @@ async fn a_dropped_chunk_reports_a_retry_to_progress() {
     // renders above itself) and not only that the download recovers.
     #[derive(Default)]
     struct Recorder {
-        retries: std::cell::Cell<u32>,
+        retries: core::cell::Cell<u32>,
     }
     impl Progress for Recorder {
         fn retry(&self, _index: usize, _retry: u32, _max: u32, _resume_from: u64, _error: &str) {

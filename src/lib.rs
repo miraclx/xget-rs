@@ -8,6 +8,13 @@
 //! The byte source is pluggable behind [`Source`]: HTTP range GET today, S3 or a theia/bifrost peer
 //! tomorrow. The engine is written once and works over any source that can report a length and serve a
 //! byte range; a source that cannot serve ranges is fetched as a single stream.
+//!
+//! Where things live: this root holds the public vocabulary ([`Source`], [`Progress`], [`Options`],
+//! [`Output`], [`Probe`], [`Error`]) that everything else speaks. The `source` module holds the shipped
+//! sources ([`HttpSource`] is the reference one); `engine` is the machine that drives any source; and
+//! `plan`, `control`, and `checksum` are the parts it leans on (chunk planning, the `.xget` resume
+//! trailer, and the hashing). A good reading order is this doc, then [`Source`] and [`HttpSource`], then
+//! the engine.
 
 use core::time::Duration;
 
@@ -17,20 +24,9 @@ use futures::stream::BoxStream;
 mod checksum;
 mod control;
 mod engine;
-mod http;
-#[cfg(feature = "ipfs")]
-mod ipfs;
-mod mirror;
 mod plan;
-#[cfg(feature = "s3")]
-mod s3;
+mod source;
 
-#[cfg(test)]
-mod http_tests;
-#[cfg(all(test, feature = "ipfs"))]
-mod ipfs_tests;
-#[cfg(test)]
-mod mirror_tests;
 #[cfg(test)]
 mod plan_tests;
 
@@ -44,13 +40,12 @@ pub async fn resumable(output: &std::path::Path) -> bool {
     crate::control::is_resumable(&crate::engine::part_path(output)).await
 }
 
-pub use crate::http::HttpSource;
-#[cfg(feature = "ipfs")]
-pub use crate::ipfs::IpfsSource;
-pub use crate::mirror::Mirrors;
 pub use crate::plan::plan;
+#[cfg(feature = "ipfs")]
+pub use crate::source::IpfsSource;
 #[cfg(feature = "s3")]
-pub use crate::s3::S3Source;
+pub use crate::source::S3Source;
+pub use crate::source::{HttpSource, Mirrors};
 
 /// How a [`download`] is tuned: parallelism, retries, which checksum to verify with, and an optional
 /// inactivity timeout.

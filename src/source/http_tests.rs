@@ -1,4 +1,4 @@
-use crate::http::{content_disposition_name, content_range_start, content_range_total};
+use super::http::{content_disposition_name, content_range_start, content_range_total};
 
 #[test]
 fn total_is_the_number_after_the_slash() {

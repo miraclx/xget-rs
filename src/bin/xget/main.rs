@@ -2,7 +2,6 @@
 
 mod expect;
 mod progress;
-mod speedometer;
 
 use core::time::Duration;
 use std::io::IsTerminal as _;

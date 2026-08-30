@@ -1,8 +1,8 @@
 use cid::Cid;
 use cid::multihash::Multihash;
 
+use super::ipfs::{IpfsSource, checksum_from_cid, resolve_gateway};
 use crate::Checksum;
-use crate::ipfs::{IpfsSource, checksum_from_cid, resolve_gateway};
 
 /// A boxed error so a test can `?` a fallible constructor rather than unwrap it.
 type TestResult = Result<(), Box<dyn core::error::Error>>;

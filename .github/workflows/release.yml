@@ -1,0 +1,50 @@
+name: Release
+
+# Build the `xget` binary for the common desktop targets on a version tag and attach the archives to a
+# GitHub release. Push a tag like `v0.1.0` to trigger it.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-13 }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # S3 and IPFS are shipped in the released binary so a downloaded xget can reach every source.
+      - name: Build
+        run: cargo build --release --locked --bin xget --features "s3 ipfs" --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          bin="target/${{ matrix.target }}/release/xget"
+          strip "$bin" || true
+          tar -C "target/${{ matrix.target }}/release" -czf "xget-${{ matrix.target }}.tar.gz" xget
+          shasum -a 256 "xget-${{ matrix.target }}.tar.gz" > "xget-${{ matrix.target }}.tar.gz.sha256"
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            xget-${{ matrix.target }}.tar.gz
+            xget-${{ matrix.target }}.tar.gz.sha256

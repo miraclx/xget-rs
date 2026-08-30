@@ -1,60 +1,56 @@
 # xget
 
-A chunked, parallel, resumable, verified fetch engine over a pluggable byte source, with a command-line
-downloader (`xget`) built on top of it.
+A fast, resumable, **verified** file downloader. It splits a download into parallel chunks, writes each
+straight to its place on disk, and hashes the result as it goes, so the digest it prints certifies the
+bytes you actually got. Ships as a command-line tool (`xget`) and a Rust library.
 
 ![xget downloading a file in parallel chunks](media/download.gif)
 
-## What it is
+## Why xget
 
-xget plans a resource into chunks and fetches them in parallel, each written straight to its own
-offset in a sparse file. A single verifier reads that file back in order, hashing the contiguous prefix
-as it grows, gated on the exact length. The digest it reports certifies the bytes on disk, not "the
-bytes we glued together": a source that ignores a range, or serves a length that does not match, is a
-typed error, never a silent bad file.
+- **Verified by construction.** A source that ignores a range, or serves the wrong length, is a hard
+  error, never a silent bad file. The reported hash is of the bytes on disk.
+- **Parallel and resumable.** Chunks download at once; an interrupted download resumes from exactly where
+  it stopped, and the resumed file is still fully verified.
+- **More than HTTP.** The same engine reads from HTTP, S3 (and S3-compatible stores), and IPFS.
 
-The byte source is pluggable behind the `Source` trait. The engine is written once and works over any
-source that can report a length and serve a byte range; a source that cannot serve ranges is fetched as
-a single stream and still hashed. Sources today are HTTP range GET (default), S3 and S3-compatible
-stores (behind the `s3` feature), and IPFS through an HTTP gateway (behind the `ipfs` feature).
-
-This is a Rust rewrite of the Node.js [`libxget`](https://github.com/miraclx/libxget-js). It works. The
-feature-by-feature comparison against the original lives in [PARITY.md](PARITY.md), and the design and
-the failure modes it is built to prevent are in [DECISIONS.md](DECISIONS.md).
+This is a Rust rewrite of the Node.js [`libxget`](https://github.com/miraclx/libxget-js); see
+[what is intentionally different](#differences-from-libxget-js).
 
 ## Install
 
-Build the `xget` binary from source:
+**Prebuilt binary** (Linux and macOS, x86-64 and arm64) from the
+[latest release](https://github.com/miraclx/xget-rs/releases/latest). For example, on Apple silicon:
 
 ```console
-cargo build --release --bin xget
+curl -L https://github.com/miraclx/xget-rs/releases/latest/download/xget-aarch64-apple-darwin.tar.gz | tar xz
+./xget --version
 ```
 
-The S3 and IPFS sources are optional features, off by default:
+**With cargo**, from the repository:
+
+```console
+cargo install --git https://github.com/miraclx/xget-rs --features "s3 ipfs"
+```
+
+**From source:**
 
 ```console
 cargo build --release --bin xget --features "s3 ipfs"
 ```
 
-As a library dependency:
-
-```toml
-[dependencies]
-xget = { git = "https://github.com/miraclx/xget-rs" }
-# or with optional sources:
-# xget = { git = "https://github.com/miraclx/xget-rs", features = ["s3", "ipfs"] }
-```
+The `s3` and `ipfs` sources are optional features, off by default; drop them for an HTTP-only build.
 
 ## Quick start
 
-Download over HTTP in parallel chunks:
+Download a file. It is fetched in parallel chunks and the SHA-256 is printed at the end:
 
 ```console
 xget https://example.com/big.iso
 ```
 
-Verify against a known checksum. `--expect` takes an inline `algo:hex`, a bare hex digest (using
-`--checksum`'s algorithm), or a URL to a checksum file. It exits non-zero on mismatch:
+Verify against a known checksum. `--expect` takes an inline `algo:hex`, a bare hex digest, or a URL to a
+checksum file, and exits non-zero on mismatch:
 
 ```console
 xget https://example.com/big.iso --expect sha256:9f86d0818...
@@ -63,144 +59,106 @@ xget https://example.com/big.iso --expect https://example.com/big.iso.sha256sum
 
 ![a checksum mismatch fails loudly and exits non-zero](media/expect.gif)
 
-Resume an interrupted download. A partial resumes automatically on a re-run with no flag; `-c` forces
-resuming and `--restart` forces a fresh start:
+Interrupt it and run it again: it resumes automatically, no flag needed.
+
+![xget interrupted and auto-resuming](media/resume.gif)
+
+Stream to stdout with `-`, or to a pipe or process substitution, and it streams instead of saving:
 
 ```console
-xget https://example.com/big.iso        # resumes a partial if one is present
-xget https://example.com/big.iso -c     # force resume
-xget https://example.com/big.iso --restart
+xget https://example.com/big.iso - | sha256sum
+xget https://example.com/big.iso >(tar xz)
 ```
 
-Download from S3 or an S3-compatible store (needs the `s3` feature). It signs when credentials resolve
-and goes anonymous when they do not, reads a workdir `.env`, and takes `--endpoint-url` for a
-non-AWS store. If the object carries a stored checksum, it is verified automatically:
+Download from S3 (with the `s3` feature). It signs when credentials resolve and goes anonymous when they
+do not, and verifies against the object's stored checksum if it has one:
 
 ```console
 xget s3://my-bucket/big.iso
-xget s3://my-bucket/big.iso --endpoint-url https://s3.example.com
+xget s3://my-bucket/big.iso --endpoint-url https://s3.example.com   # R2, MinIO, Backblaze, ...
 ```
 
 ![an S3 object verified automatically against its stored checksum](media/s3.gif)
 
-Download from IPFS through an HTTP gateway (needs the `ipfs` feature). A CID that addresses raw bytes is
-verified against its own hash for free:
+Download from IPFS through a gateway (with the `ipfs` feature). A CID that addresses raw bytes verifies
+against its own hash for free:
 
 ```console
 xget ipfs://bafybeih... --ipfs-gateway http://127.0.0.1:8080
 ```
 
-## CLI overview
+## Common options
 
 ```console
 xget [OPTIONS] <URL> [OUTPUT]
 ```
 
-`<URL>` is an `http(s)://`, `s3://`, or `ipfs://` URL. `OUTPUT` is where to write the file; if omitted
-or a directory, the name is taken from the HTTP `Content-Disposition` or the URL, and the file is
-renamed into place atomically on success.
-
-The flags that matter most:
+`<URL>` is `http(s)://`, `s3://`, or `ipfs://`. `OUTPUT` is where to write; if omitted or a directory, the
+name comes from the server (`Content-Disposition`) or the URL. The full list is `xget --help`.
 
 | flag | what it does |
 | ---- | ------------ |
-| `-n, --chunks <N>` | maximum concurrent chunk connections (default 5) |
+| `-n, --chunks <N>` | number of parallel chunks (default 5) |
 | `-t, --tries <N>` | retries per chunk, each resuming from its offset; `inf` for unlimited |
-| `-s, --checksum <ALGO>` | hash to verify with: `none`, `md5`, `sha1`, `sha256`, `sha512`, `blake3` |
+| `-s, --checksum <ALGO>` | hash to report: `none`, `md5`, `sha1`, `sha256`, `sha512`, `blake3` |
 | `--expect <[ALGO:]HEX>` | require a known checksum: inline, bare hex, or a URL to a checksum file |
-| `-c, --continue` | force resuming a partial (a partial resumes automatically without it) |
-| `--restart` | ignore a resumable partial and download from scratch |
+| `-c, --continue` | resume a partial (partials resume automatically without it) |
+| `--restart` | ignore a partial and download from scratch |
 | `-f, --overwrite` | permit replacing an existing complete file |
-| `--mirror <URL>` | a mirror for the same resource, tried when the primary fails a chunk (repeatable) |
-| `--endpoint-url <URL>` | endpoint for an `s3://` URL (R2, MinIO, Backblaze, ...) |
+| `--mirror <URL>` | another source for the same file, tried when a chunk fails (repeatable) |
+| `--endpoint-url <URL>` | endpoint for an `s3://` URL |
 | `--ipfs-gateway <URL>` | gateway for an `ipfs://` URL |
 | `-H, --header <H>` | set a request header (repeatable) |
 | `--timeout <SECS>` | fail a chunk if no data arrives for this long, so its retry can resume it |
-| `--progress <MODE>` | `auto`, `bar`, `plain`, `json`, or `none`; `--no-bar` and `--raw-sizes` also apply |
-| `-v, -vv` | verbose diagnostics on stderr: chunk ranges, retries, and errors |
-
-Run `xget --help` for the full list.
-
-## Resume
-
-![xget interrupted and auto-resuming](media/resume.gif)
-
-An interrupted download leaves a single `<output>.xget` file: the data, a control trailer recording the
-byte ranges written and flushed, and a fixed footer. A re-run finds it and resumes automatically with no
-flag, keeping the same chunk count and picking each partial chunk up from the prefix already on disk.
-In-flight progress is checkpointed (every few MiB and on a short time interval), so a resume starts near
-where it stopped rather than from zero. The bytes already on disk are folded into the same in-order
-verify pass, so a resumed file is still fully verified. The GIF above shows a download interrupted
-partway and re-run with no flag: it picks up from where it stopped and verifies to the end.
-
-## Progress
-
-`xget` shows a live two-tone bar over per-chunk segments, distinguishing bytes confirmed by the verifier
-from bytes buffered ahead, with a windowed speed and ETA readout. `--progress` selects `bar`, `plain`
-(a single updating line), `json` (one event per update on stderr), or `none`; `auto` (the default) uses
-the bar on a terminal and plain lines otherwise.
+| `--progress <MODE>` | `auto`, `bar`, `plain`, `json`, or `none` |
+| `-v, -vv` | verbose diagnostics on stderr |
 
 ## Library usage
 
-The engine is `download`, driven over anything that implements the `Source` trait. A built-in source is
-used here; you can supply your own for any protocol that can probe a length and serve a byte range.
+The engine is `download`, driven over any `Source` (HTTP is built in; implement `Source` for your own
+protocol). Output goes to a file, a writer, or nowhere.
 
 ```rust
-use xget::{download, HttpSource, Options};
+use std::path::Path;
+use xget::{download, HttpSource, Options, Output};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = HttpSource::new("https://example.com/big.iso", Default::default())?;
     let report = download(
         &source,
-        std::path::Path::new("big.iso"),
+        Output::file(Path::new("big.iso")),
         Options::default(),
         &(), // no progress reporting
     )
     .await?;
 
-    println!("{} bytes, {:?}", report.length, report.hash);
+    println!("{} bytes, hash {:?}", report.length, report.hash);
     Ok(())
 }
 ```
 
-`Options` tunes parallelism (`parts`), retries, the `checksum` algorithm, an inactivity `timeout`, and
-whether to `resume`. `Progress` is an opt-in trait with a no-op `()` implementation; implement it to
-observe bytes as they are received and verified. Whether a resumable partial exists beside an output can
-be checked with `resumable`.
+`Options` tunes the chunk count, retries, checksum, timeout, and resume. `Output` is `file(path)` (the
+only resumable sink), `writer(w)` to stream, `Discard`, or `tee(file, w)` to keep a file and stream at
+once. `Progress` is an opt-in trait (pass `&()` for none) to observe bytes as they are received and
+verified.
+
+## How it works
+
+Chunks are written straight to their offsets in a sparse `<file>.xget`; one verifier reads it back in
+order, hashing the contiguous prefix and gating on the exact length, then it is renamed into place. That
+same `.xget` is the resume control: it records the ranges already written, so a re-run picks up each
+chunk where it stopped and folds the existing bytes into the same verify pass. Before resuming, xget
+checks the resource has not changed (via its `ETag`/`Last-Modified`, or an IPFS CID); if it has, the
+partial is discarded rather than stitched. The design and the failure modes it prevents are in
+[DECISIONS.md](DECISIONS.md).
 
 ## Differences from libxget-js
 
-xget is a rewrite, not a port: it keeps the shape of the original (chunked parallel range GET, a
-segmented progress bar, checksum reporting) but changes some behavior on purpose. If you are coming from
-[`libxget-js`](https://github.com/miraclx/libxget-js), the differences that matter:
-
-- **Verification is structural, not a stream you happen to hash.** Chunks scatter into a sparse file at
-  their offsets; one verifier reads the file back in order, hashing the contiguous prefix and gating on
-  the exact length. A reported digest certifies the bytes on disk, not a stream that was glued together
-  in memory.
-- **No `StreamCache`, no `--cache-size`.** Positioned writes mean there is no in-memory buffer to size
-  and parallelism is not bounded by it. A slow or dropped connection just resumes its chunk; the others
-  never idle waiting on it.
-- **Resume is range-based, automatic, and validated.** An interrupted download leaves a single
-  `<file>.xget` (data, a control trailer of the ranges written, and a footer). A re-run resumes it with
-  no flag, keeps the same chunk count, and picks each chunk up from its on-disk prefix. Before resuming
-  it checks a validator (HTTP `ETag`/`Last-Modified`, an S3 `ETag`, or an IPFS CID): if the resource
-  changed, the partial is discarded and the download restarts clean rather than splicing old and new
-  bytes. `-c` forces resuming, `--restart` forces fresh.
-- **No `--start-pos` or `--force-append`.** Both would produce bytes that cannot be verified against a
-  whole-resource checksum (a bare suffix, or an append to a file the engine never wrote), so they are
-  deliberate non-goals. The real reason to start mid-file, resuming, is handled by the control file
-  above.
-- **More than HTTP behind one engine.** The same engine drives S3 and S3-compatible stores (signing when
-  credentials resolve, anonymous when they do not) and IPFS through an HTTP gateway, behind the `s3` and
-  `ipfs` features. An S3 object's stored checksum, or a raw-bytes IPFS CID, verifies the download for
-  free.
-- **Sinks are explicit.** Write to a file, stream to stdout with `-`, discard for a speed test with
-  `/dev/null`, or (as a library) keep a resumable file and pipe the verified bytes onward at once with
-  `Output::tee`.
-
-The full feature-by-feature table, including what is intentionally different, is in [PARITY.md](PARITY.md).
+xget keeps the shape of the original but changes some behavior on purpose: verification is structural
+(not an optional cache), resume is range-based and validated against the resource, and there is no
+`--start-pos` or `--force-append` (both would produce bytes that cannot be verified). The full
+feature-by-feature comparison is in [PARITY.md](PARITY.md).
 
 ## License
 

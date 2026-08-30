@@ -49,6 +49,10 @@ struct Cli {
     /// Ignore any resumable partial and download from scratch.
     #[arg(long)]
     restart: bool,
+    /// Print what a `.xget` control file records (source, size, progress) and exit, without downloading
+    /// or touching the network. The argument may be the `.xget` file or the output it belongs to.
+    #[arg(long)]
+    info: bool,
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header", value_parser = parse_header)]
     headers: Vec<(HeaderName, HeaderValue)>,
@@ -135,6 +139,11 @@ async fn run() -> eyre::Result<()> {
     // live there instead of being exported by hand. A missing file is not an error.
     let _ = dotenvy::dotenv();
     let mut cli = Cli::parse();
+    // Inspect a control file and exit, before any network setup: `xget --info file.xget` reads the local
+    // partial and prints what it records, nothing more.
+    if cli.info {
+        return show_info(&cli).await;
+    }
     // Resume straight from a control file: `xget path/to/file.xget` reads the URL saved inside the
     // partial, rebuilds the source, and finishes writing `path/to/file`, with no URL retyped.
     if let Some((url, output)) = control_resume_target(&cli).await {
@@ -510,6 +519,51 @@ enum Sink {
 /// Read the output argument to decide the sink: `-` is stdout, the exact path `/dev/null` is a discard,
 /// an existing special file (pipe/device/process-substitution) is a stream, anything else (or no
 /// argument) is a regular file.
+/// Print a summary of the `.xget` control file named by the argument (the `.xget` itself, or the output
+/// it belongs to) and exit. Offline: reads only the local file. Powers `xget --info`.
+async fn show_info(cli: &Cli) -> eyre::Result<()> {
+    let path = Path::new(&cli.url);
+    let control_path = if path.extension().and_then(|ext| ext.to_str()) == Some("xget") {
+        path.to_path_buf()
+    } else {
+        let mut with_suffix = path.as_os_str().to_owned();
+        with_suffix.push(".xget");
+        PathBuf::from(with_suffix)
+    };
+    let Some(info) = xget::inspect(&control_path).await else {
+        eyre::bail!(
+            "{} is not a resumable xget control file",
+            control_path.display()
+        );
+    };
+
+    let raw = cli.raw_sizes;
+    let percent = if info.total > 0 {
+        info.downloaded as f64 * 100.0 / info.total as f64
+    } else {
+        0.0
+    };
+    println!(
+        "Source:     {}",
+        info.source.as_deref().unwrap_or("(unknown)")
+    );
+    println!("Size:       {}", fmt_size(info.total, raw));
+    println!(
+        "Downloaded: {}  ({percent:.1}%)",
+        fmt_size(info.downloaded, raw)
+    );
+    if let Some(validator) = &info.validator {
+        println!("Validator:  {validator}");
+    }
+    // The output the partial belongs to is the control path without its `.xget` suffix.
+    let output = control_path.with_extension("");
+    match info.source {
+        Some(_) => println!("Status:     resumable   ->  xget {}", output.display()),
+        None => println!("Status:     resumable (re-run with the original URL to resume)"),
+    }
+    Ok(())
+}
+
 /// If the URL argument is actually a `.xget` control file (and no separate output was given), resolve
 /// the resume it describes: the source URL saved inside it, and the output it belongs to (its path
 /// without the `.xget` suffix). Returns `None` for a normal download. This powers `xget path/to/file.xget`.

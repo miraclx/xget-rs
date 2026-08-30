@@ -66,6 +66,12 @@ at the leftover control file and it finishes the job, no URL to retype:
 xget big.iso.xget
 ```
 
+To see what a leftover `.xget` is without touching the network, ask:
+
+```console
+xget --info big.iso.xget
+```
+
 ![xget interrupted and auto-resuming](media/resume.gif)
 
 Stream to stdout with `-`, or to a pipe or process substitution, and it streams instead of saving:

@@ -52,6 +52,49 @@ pub async fn control_source(control_path: &std::path::Path) -> Option<String> {
         .and_then(|control| control.source)
 }
 
+/// A read-only summary of a `.xget` control file, for inspecting a partial without touching the network.
+#[derive(Clone, Debug)]
+pub struct Inspection {
+    /// The source URL recorded in the control, if the source had a re-openable one.
+    pub source: Option<String>,
+    /// The resource's total length in bytes.
+    pub total: u64,
+    /// Bytes already on disk: the union of the ranges recorded as written (overlaps counted once).
+    pub downloaded: u64,
+    /// The resource validator (an `ETag`/`Last-Modified`/CID), if one was recorded.
+    pub validator: Option<String>,
+}
+
+/// Summarize a `.xget` control file, or `None` if `control_path` is not a valid control. Offline: it
+/// reads only the local file and never probes the network, so it can identify a stray partial. Powers
+/// `xget --info`.
+pub async fn inspect(control_path: &std::path::Path) -> Option<Inspection> {
+    let control = crate::control::read(control_path).await?;
+    Some(Inspection {
+        source: control.source,
+        total: control.total,
+        downloaded: union_len(&control.done),
+        validator: control.validator,
+    })
+}
+
+/// The number of distinct bytes covered by `ranges`, merging any overlaps so a byte recorded twice (a
+/// checkpoint then a completion) is counted once.
+fn union_len(ranges: &[ByteRange]) -> u64 {
+    let mut sorted: Vec<ByteRange> = ranges.iter().copied().filter(|r| !r.is_empty()).collect();
+    sorted.sort_by_key(|range| range.start);
+    let mut total = 0u64;
+    let mut covered_to = 0u64;
+    for range in sorted {
+        let start = range.start.max(covered_to);
+        if range.end > start {
+            total += range.end - start;
+        }
+        covered_to = covered_to.max(range.end);
+    }
+    total
+}
+
 pub use crate::plan::plan;
 #[cfg(feature = "ipfs")]
 pub use crate::source::IpfsSource;

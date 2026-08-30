@@ -690,6 +690,25 @@ async fn the_control_file_records_the_source_url_for_a_standalone_resume() {
         Some("https://example.com/thing.bin"),
         "the .xget records the source URL so a standalone resume can rebuild the source"
     );
+
+    // The offline inspection reads the same control without any network.
+    let info = xget::inspect(&scratch.part())
+        .await
+        .expect("a valid control inspects");
+    assert_eq!(
+        info.source.as_deref(),
+        Some("https://example.com/thing.bin")
+    );
+    assert_eq!(info.total, 4096);
+    assert!(
+        info.downloaded >= 3072 && info.downloaded < info.total,
+        "the completed chunks are recorded as downloaded, got {}",
+        info.downloaded
+    );
+    assert!(
+        xget::inspect(&scratch.path).await.is_none(),
+        "a plain (non-control) file does not inspect as one"
+    );
 }
 
 #[tokio::test]

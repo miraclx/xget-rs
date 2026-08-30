@@ -115,33 +115,30 @@ name comes from the server (`Content-Disposition`) or the URL. The full list is 
 
 ## Library usage
 
-The engine is `download`, driven over any `Source` (HTTP is built in; implement `Source` for your own
-protocol). Output goes to a file, a writer, or nowhere.
+Start with `get(url)` and finish with `.write(output)`:
 
 ```rust
 use std::path::Path;
-use xget::{download, HttpSource, Options, Output};
+use xget::{Checksum, Output};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = HttpSource::new("https://example.com/big.iso", Default::default())?;
-    let report = download(
-        &source,
-        Output::file(Path::new("big.iso")),
-        Options::default(),
-        &(), // no progress reporting
-    )
-    .await?;
+    let report = xget::get("https://example.com/big.iso")?
+        .chunks(8)
+        .checksum(Checksum::Sha256)
+        .write(Output::file(Path::new("big.iso")))
+        .await?;
 
     println!("{} bytes, hash {:?}", report.length, report.hash);
     Ok(())
 }
 ```
 
-`Options` tunes the chunk count, retries, checksum, timeout, and resume. `Output` is `file(path)` (the
-only resumable sink), `writer(w)` to stream, `Discard`, or `tee(file, w)` to keep a file and stream at
-once. `Progress` is an opt-in trait (pass `&()` for none) to observe bytes as they are received and
-verified.
+`get(url)` is the HTTP entry; `from(source)` starts from any `Source` (S3, IPFS, a `Mirrors` set, or your
+own). Both chain `.chunks`, `.tries`, `.checksum`, `.timeout`, `.resume`, and `.progress`, then finish
+with `.write(output)`. `Output` is `file(path)` (the only resumable sink), `writer(w)` to stream,
+`Discard`, or `tee(file, w)` to keep a file and stream at once. For full control the underlying
+`download(source, output, options, progress)` is also public.
 
 ## How it works
 

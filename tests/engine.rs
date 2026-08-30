@@ -635,3 +635,29 @@ async fn a_tee_delivers_the_same_bytes_to_a_file_and_a_writer() {
         "the scratch was renamed away, not left beside the output"
     );
 }
+
+#[tokio::test]
+async fn the_builder_drives_a_download_like_the_function() {
+    let body = sample_body(4096);
+    let scratch = Scratch::new("builder");
+
+    // The URL-first builder over any Source: from(source).chunks(..).checksum(..).write(output).
+    let report = xget::from(FakeSource::honest(body.clone()))
+        .chunks(4)
+        .checksum(Checksum::Sha256)
+        .write(Output::File(&scratch.path))
+        .await
+        .expect("the builder download succeeds");
+
+    assert_eq!(report.length, body.len() as u64);
+    assert_eq!(
+        report.hash.as_deref(),
+        Some(sha256_hex(&body).as_str()),
+        "the builder verifies to the same digest the function does"
+    );
+    assert_eq!(
+        std::fs::read(&scratch.path).expect("output present"),
+        body,
+        "the builder wrote every byte"
+    );
+}

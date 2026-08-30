@@ -62,7 +62,7 @@ pub struct Report {
 /// scattered into a seekable scratch in parallel and verified in order; one that is not is streamed and
 /// hashed inline. Every chunk's range is validated, a dropped chunk resumes from its offset, and the
 /// total length is gated, so the returned digest certifies the resource.
-pub async fn download<S: Source, P: Progress>(
+pub async fn download<S: Source, P: Progress + ?Sized>(
     source: &S,
     mut output: Output<'_>,
     options: Options,
@@ -331,7 +331,7 @@ async fn allocate_fresh(part: &Path, total: u64) -> Result<(), Error> {
 /// write to their own offsets and report how far each has reached; the verifier reads the file back
 /// from zero and hashes the contiguous, hole-free prefix as it grows, so the verified frontier follows
 /// the earliest unfinished chunk rather than jumping a whole chunk at a time.
-async fn fetch_scatter<S: Source, P: Progress>(
+async fn fetch_scatter<S: Source, P: Progress + ?Sized>(
     source: &S,
     part: &Path,
     total: u64,
@@ -450,7 +450,7 @@ impl Sink<'_> {
     /// recording each write into the shared received count, nudging the verifier, and checkpointing the
     /// flushed prefix to the control trailer every so often. On a mid-stream error `offset` reflects how
     /// far it got, so the caller can seek back and resume.
-    async fn fill<S: Source, P: Progress>(
+    async fn fill<S: Source, P: Progress + ?Sized>(
         &mut self,
         source: &S,
         offset: &mut u64,
@@ -503,7 +503,7 @@ impl Sink<'_> {
 /// Download `chunk`'s range into `part` at its offset, starting from `chunk.resume_from` (past any
 /// on-disk prefix) and resuming from where it drops with backoff. Each chunk holds its own file handle,
 /// so concurrent writes to different offsets never contend.
-async fn scatter_one<S: Source, P: Progress>(
+async fn scatter_one<S: Source, P: Progress + ?Sized>(
     source: &S,
     part: &Path,
     chunk: Chunk,
@@ -574,7 +574,7 @@ async fn scatter_one<S: Source, P: Progress>(
 /// prefix first, then bytes as the earliest unfinished chunk receives them. Reports `wrote` per chunk so
 /// the verified frontier advances continuously, and gates the total length so the digest certifies the
 /// whole file.
-async fn verify<P: Progress>(
+async fn verify<P: Progress + ?Sized>(
     part: &Path,
     ranges: &[ByteRange],
     shared: &Rc<Shared>,
@@ -663,7 +663,7 @@ async fn read_into(
 /// in-order pass (no scatter, no re-read: a single stream is already in order). The bytes go straight to
 /// the sink: a file to its scratch (renamed after by the caller), a writer live as they arrive, a discard
 /// nowhere. Either way the stream is hashed inline and gated on the declared length.
-async fn fetch_stream<S: Source, P: Progress>(
+async fn fetch_stream<S: Source, P: Progress + ?Sized>(
     source: &S,
     output: &mut Output<'_>,
     part: &Path,

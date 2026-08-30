@@ -21,6 +21,7 @@ use core::time::Duration;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 
+mod builder;
 mod checksum;
 mod control;
 mod engine;
@@ -30,6 +31,7 @@ mod source;
 #[cfg(test)]
 mod plan_tests;
 
+pub use crate::builder::{Download, from, get};
 pub use crate::checksum::{Checksum, UnknownChecksum};
 pub use crate::engine::{Report, download};
 

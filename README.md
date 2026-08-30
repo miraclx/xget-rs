@@ -59,8 +59,15 @@ xget https://example.com/big.iso --expect https://example.com/big.iso.sha256sum
 
 ![a checksum mismatch fails loudly and exits non-zero](media/expect.gif)
 
-Interrupt it and run it again: it resumes automatically, no flag needed. You can also point xget straight
-at the leftover control file and it finishes the job, no URL to retype:
+Bad networks are the normal case, and xget is built for them. Within a run, a dropped chunk retries from
+the byte it reached, and the retry is reported above the bar so a stall explains itself instead of a
+silently frozen bar:
+
+![chunks dropping and retrying, reported above the bar](media/retry.gif)
+
+Across runs it is just as forgiving. Interrupt it and run it again: it resumes automatically, no flag
+needed. You can also point xget straight at the leftover control file and it finishes the job, no URL to
+retype:
 
 ```console
 xget big.iso.xget
@@ -80,6 +87,10 @@ Stream to stdout with `-`, or to a pipe or process substitution, and it streams 
 xget https://example.com/big.iso - | sha256sum
 xget https://example.com/big.iso >(tar xz)
 ```
+
+A piped download that would not fit in the temp dir, or is simply huge, streams straight through in one
+ordered pass rather than buffering to a scratch file first, so you can pipe an arbitrarily large file to a
+consumer. Pass `--stream` to force that single-stream mode for any download.
 
 Download from S3 (with the `s3` feature). It signs when credentials resolve and goes anonymous when they
 do not, and verifies against the object's stored checksum if it has one:

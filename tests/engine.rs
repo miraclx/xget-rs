@@ -258,6 +258,29 @@ async fn the_sweep_removes_dead_pid_scratches_and_keeps_live_ones() {
 }
 
 #[tokio::test]
+async fn sequential_mode_streams_a_range_source_and_still_verifies() {
+    // A range-capable source, but forced sequential: it goes through the single-stream path (fetch the
+    // whole resource in order) instead of scattering, and must still verify to the same digest.
+    let body = sample_body(4096);
+    let source = FakeSource::honest(body.clone());
+    let scratch = Scratch::new("sequential");
+    let report = xget::from(source)
+        .sequential()
+        .checksum(Checksum::Sha256)
+        .write(Output::File(&scratch.path))
+        .await
+        .expect("a sequential download of a range source verifies");
+
+    assert_eq!(report.length, body.len() as u64);
+    assert_eq!(
+        report.hash.as_deref(),
+        Some(sha256_hex(&body).as_str()),
+        "sequential streaming certifies the same digest as the parallel path"
+    );
+    assert_eq!(std::fs::read(&scratch.path).expect("output present"), body);
+}
+
+#[tokio::test]
 async fn a_source_that_ignores_the_range_is_a_typed_error() {
     let body = sample_body(2048);
     let source = FakeSource::new(body, true, Behavior::IgnoreRange);

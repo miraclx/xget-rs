@@ -93,7 +93,9 @@ pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
         "probed resource"
     );
 
-    let hash = if probe.supports_ranges {
+    // A sequential download uses the single-stream path even for a range source: one ordered connection,
+    // no scatter, no scratch for a writer/discard sink. It trades parallel speed for zero holding space.
+    let hash = if probe.supports_ranges && !options.sequential {
         let plan = resume_plan(&part, probe.length, probe.validator.as_deref(), &options).await?;
         tracing::debug!(
             chunks = plan.ranges.len(),

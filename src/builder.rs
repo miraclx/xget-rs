@@ -91,6 +91,14 @@ impl<'p, S: Source> Download<'p, S> {
         self
     }
 
+    /// Fetch as a single ordered stream instead of parallel chunks: one connection, hashed inline,
+    /// written straight to the sink with no scratch. Slower than the parallel default, but it holds no
+    /// bytes on disk and delivers live, so a huge download can be piped to a consumer.
+    pub fn sequential(mut self) -> Self {
+        self.options.sequential = true;
+        self
+    }
+
     /// Report progress to `progress` as bytes are received and verified. Pass any [`Progress`] impl;
     /// with none set, nothing is reported.
     pub fn progress<Q: Progress>(self, progress: &Q) -> Download<'_, S> {

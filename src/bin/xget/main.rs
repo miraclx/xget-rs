@@ -11,7 +11,7 @@ use std::time::Instant;
 use clap::Parser;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use xbytes::ByteSize;
-use xbytes::sizes::BYTE;
+use xbytes::sizes::{BYTE, GIBI_BYTE};
 use xget::{ByteRange, ByteStream, Checksum, Error, HttpSource, Mirrors, Probe, Source};
 
 use crate::expect::{Expect, parse_expect, resolve_expect};
@@ -53,6 +53,11 @@ struct Cli {
     /// or touching the network. The argument may be the `.xget` file or the output it belongs to.
     #[arg(long)]
     info: bool,
+    /// Fetch as a single ordered stream instead of parallel chunks: no scratch, live delivery, so an
+    /// arbitrarily large download can be piped to a consumer. Auto-selected for a pipe/stdout/discard
+    /// output that would not fit in the temp dir or exceeds the buffer cap.
+    #[arg(long)]
+    stream: bool,
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header", value_parser = parse_header)]
     headers: Vec<(HeaderName, HeaderValue)>,
@@ -264,6 +269,11 @@ async fn run() -> eyre::Result<()> {
     }
     if let Some(timeout) = cli.timeout {
         plan = plan.timeout(timeout);
+    }
+    // Stream sequentially when asked, or when a pipe/discard output would not fit in (or would exhaust)
+    // the temp dir it buffers into. A file output always buffers into its own `.xget`, so it is exempt.
+    if choose_sequential(&cli, probe.as_ref(), sink, mode) {
+        plan = plan.sequential();
     }
     let report = plan.progress(&reporter).write(out).await?;
 
@@ -593,6 +603,73 @@ async fn control_resume_target(cli: &Cli) -> Option<(String, PathBuf, Option<Che
     let info = xget::inspect(path).await?;
     let url = info.source?;
     Some((url, path.with_extension(""), info.checksum))
+}
+
+/// A pipe/discard download above this size streams sequentially rather than buffering the whole thing
+/// into the temp dir: scattering many GiB to disk just to feed a consumer is not worth it.
+const BUFFER_CAP: u64 = ByteSize::of_int(4, GIBI_BYTE).byte_count_lossy() as u64;
+/// Keep at least this much free in the temp dir: a download that would not fit with this to spare
+/// streams sequentially instead, and one that would leave less than this warns.
+const FREE_MARGIN: u64 = ByteSize::of_int(1, GIBI_BYTE).byte_count_lossy() as u64;
+
+/// Whether to stream sequentially (one connection, no scratch) instead of buffering into a temp scratch.
+/// Forced by `--stream`. Otherwise auto-selected only for a pipe/stdout/discard output of a range-capable
+/// source: sequential when the download exceeds [`BUFFER_CAP`], or (where free space is known) when it
+/// would not fit in the temp dir with [`FREE_MARGIN`] to spare, each with a note. A file output buffers
+/// into its own `.xget` on its own volume and is never auto-switched.
+fn choose_sequential(cli: &Cli, probe: Option<&Probe>, sink: Sink, mode: ProgressMode) -> bool {
+    if cli.stream {
+        return true;
+    }
+    if !matches!(sink, Sink::Stream | Sink::Stdout | Sink::Discard) {
+        return false;
+    }
+    let Some(probe) = probe else {
+        return false;
+    };
+    if !probe.supports_ranges {
+        return false;
+    }
+    let note = |message: &str| {
+        if mode != ProgressMode::Json {
+            eprintln!("{}{message}{}", DIM.render(), DIM.render_reset());
+        }
+    };
+    if probe.length > BUFFER_CAP {
+        note("large download; streaming sequentially instead of buffering it to the temp dir");
+        return true;
+    }
+    if let Some(free) = available_space(&std::env::temp_dir()) {
+        if probe.length.saturating_add(FREE_MARGIN) > free {
+            note("this would not fit in the temp dir; streaming sequentially");
+            return true;
+        }
+        if free.saturating_sub(probe.length) < FREE_MARGIN {
+            note("buffering this download will use most of the free space in the temp dir");
+        }
+    }
+    false
+}
+
+/// Bytes available to a non-root user on the filesystem holding `path`, or `None` when it cannot be
+/// determined (a non-unix platform, or a failed query).
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // statvfs field widths differ across unix platforms.
+fn available_space(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs fills the zeroed struct with the filesystem stats for the path; a non-zero return
+    // means it failed, which we treat as "unknown".
+    let mut stat: libc::statvfs = unsafe { core::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn available_space(_path: &Path) -> Option<u64> {
+    None
 }
 
 fn resolve_sink(cli: &Cli) -> Sink {

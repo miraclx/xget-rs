@@ -122,6 +122,10 @@ pub(crate) struct Options {
     /// fold the existing prefix into the checksum during the in-order verify pass. Requires a
     /// range-capable source.
     pub resume: bool,
+    /// Fetch as a single ordered stream even when the source supports ranges: one connection, hashed
+    /// inline, written straight to the sink with no scratch. Trades parallel speed for zero holding
+    /// space and live delivery, so an arbitrarily large download can be piped to a consumer.
+    pub sequential: bool,
 }
 
 impl Default for Options {
@@ -132,6 +136,7 @@ impl Default for Options {
             checksum: Checksum::Sha256,
             timeout: None,
             resume: false,
+            sequential: false,
         }
     }
 }

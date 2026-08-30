@@ -33,7 +33,7 @@ mod plan_tests;
 
 pub use crate::builder::{Download, from, get};
 pub use crate::checksum::{Checksum, UnknownChecksum};
-pub use crate::engine::{Report, download};
+pub use crate::engine::Report;
 
 /// Whether an interrupted download left a resumable partial beside `output`: its `.xget` file with a
 /// valid control trailer. A caller can use this to resume automatically without an explicit request. The
@@ -105,10 +105,10 @@ pub use crate::source::IpfsSource;
 pub use crate::source::S3Source;
 pub use crate::source::{HttpSource, Mirrors};
 
-/// How a [`download`] is tuned: parallelism, retries, which checksum to verify with, and an optional
-/// inactivity timeout.
+/// How a download is tuned: parallelism, retries, which checksum to verify with, and an optional
+/// inactivity timeout. Internal: the [`Download`] builder is the public way to set these.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Options {
+pub(crate) struct Options {
     /// Maximum number of chunks fetched in parallel. A source that cannot serve ranges ignores this and
     /// is fetched as one stream.
     pub parts: u32,

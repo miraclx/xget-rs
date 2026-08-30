@@ -225,13 +225,6 @@ async fn run() -> eyre::Result<()> {
     };
 
     let reporter = Reporter::new(mode, cli.raw_sizes);
-    let options = xget::Options {
-        parts: cli.chunks,
-        retries: cli.tries,
-        checksum,
-        timeout: cli.timeout,
-        resume,
-    };
     let started = Instant::now();
     // Build the sink and run. Stdout is held in a binding so a `Writer` can borrow it for the whole call.
     let mut stdout = tokio::io::stdout();
@@ -258,7 +251,18 @@ async fn run() -> eyre::Result<()> {
         // A file sink always resolves an output above; this arm is unreachable but keeps the match total.
         (Sink::File, None) => eyre::bail!("no output path resolved for a file download"),
     };
-    let report = xget::download(&source, out, options, &reporter).await?;
+    // Configure the download through the builder (the library's entry point), then run it.
+    let mut plan = xget::from(source)
+        .chunks(cli.chunks)
+        .tries(cli.tries)
+        .checksum(checksum);
+    if resume {
+        plan = plan.resume();
+    }
+    if let Some(timeout) = cli.timeout {
+        plan = plan.timeout(timeout);
+    }
+    let report = plan.progress(&reporter).write(out).await?;
 
     if let Some((_, want)) = &expected {
         match &report.hash {

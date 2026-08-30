@@ -9,7 +9,7 @@
 use sha2::{Digest as _, Sha256};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-use xget::{Checksum, Error, HttpSource, Options, Output, Source, download};
+use xget::{Checksum, Error, HttpSource, Output, Source};
 
 /// A deterministic body large enough to span several chunks under the default plan.
 fn sample_body(len: usize) -> Vec<u8> {
@@ -96,12 +96,10 @@ async fn a_clean_parallel_http_download_verifies_to_the_right_hash() {
         std::process::id(),
         line!()
     ));
-    let options = Options {
-        parts: 4,
-        checksum: Checksum::Sha256,
-        ..Options::default()
-    };
-    let report = download(&source(&server), Output::File(&dir), options, &())
+    let report = xget::from(source(&server))
+        .chunks(4)
+        .checksum(Checksum::Sha256)
+        .write(Output::File(&dir))
         .await
         .expect("a parallel HTTP download succeeds");
 

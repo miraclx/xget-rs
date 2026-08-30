@@ -148,8 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `get(url)` is the HTTP entry; `from(source)` starts from any `Source` (S3, IPFS, a `Mirrors` set, or your
 own). Both chain `.chunks`, `.tries`, `.checksum`, `.timeout`, `.resume`, and `.progress`, then finish
 with `.write(output)`. `Output` is `file(path)` (the only resumable sink), `writer(w)` to stream,
-`Discard`, or `tee(file, w)` to keep a file and stream at once. For full control the underlying
-`download(source, output, options, progress)` is also public.
+`Discard`, or `tee(file, w)` to keep a file and stream at once. To reuse a configuration across
+downloads, wrap the chain in a small function: `let dl = |u| xget::get(u)?.chunks(8); dl(a)?.write(...)`.
 
 ## How it works
 

@@ -62,7 +62,7 @@ pub struct Report {
 /// scattered into a seekable scratch in parallel and verified in order; one that is not is streamed and
 /// hashed inline. Every chunk's range is validated, a dropped chunk resumes from its offset, and the
 /// total length is gated, so the returned digest certifies the resource.
-pub async fn download<S: Source, P: Progress + ?Sized>(
+pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
     source: &S,
     mut output: Output<'_>,
     options: Options,

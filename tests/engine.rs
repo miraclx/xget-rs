@@ -13,9 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::stream;
 use sha2::{Digest as _, Sha256};
-use xget::{
-    ByteRange, ByteStream, Checksum, Error, Options, Output, Probe, Report, Source, download,
-};
+use xget::{ByteRange, ByteStream, Checksum, Error, Output, Probe, Report, Source};
 
 /// A deterministic in-memory resource, served either range by range (honestly) or with an injected
 /// fault, so the engine's guarantees can be asserted without a server.
@@ -24,8 +22,9 @@ struct FakeSource {
     supports_ranges: bool,
     behavior: Behavior,
     /// How many range fetches have been issued, so a test can drop the first attempt of a chunk and
-    /// assert the retry resumes it.
-    fetches: AtomicU32,
+    /// assert the retry resumes it. Shared so a test can keep a handle after moving the source into a
+    /// download.
+    fetches: Arc<AtomicU32>,
 }
 
 /// How a [`FakeSource`] answers a range fetch: honestly, or with a specific injected fault.
@@ -49,7 +48,7 @@ impl FakeSource {
             body: Arc::new(body),
             supports_ranges,
             behavior,
-            fetches: AtomicU32::new(0),
+            fetches: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -148,20 +147,42 @@ fn sample_body(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 31 + 7) as u8).collect()
 }
 
+/// Run a download through the public builder with the given knobs. The engine tests used to call the
+/// now-internal `download` function directly; this keeps them concise while exercising the real entry
+/// point. Defaults matched to `Options`: parts 5, retries 10, checksum SHA-256, no resume.
+async fn run<S: Source>(
+    source: S,
+    output: Output<'_>,
+    parts: u32,
+    retries: u32,
+    checksum: Checksum,
+    resume: bool,
+) -> Result<Report, Error> {
+    let mut plan = xget::from(source)
+        .chunks(parts)
+        .tries(retries)
+        .checksum(checksum);
+    if resume {
+        plan = plan.resume();
+    }
+    plan.write(output).await
+}
+
 #[tokio::test]
 async fn a_clean_parallel_download_verifies_to_the_right_hash() {
     let body = sample_body(4096);
     let source = FakeSource::honest(body.clone());
     let scratch = Scratch::new("clean");
-    let options = Options {
-        parts: 5,
-        checksum: Checksum::Sha256,
-        ..Options::default()
-    };
-
-    let report: Report = download(&source, Output::File(&scratch.path), options, &())
-        .await
-        .expect("a clean parallel download succeeds");
+    let report: Report = run(
+        source,
+        Output::File(&scratch.path),
+        5,
+        10,
+        Checksum::Sha256,
+        false,
+    )
+    .await
+    .expect("a clean parallel download succeeds");
 
     assert_eq!(report.length, body.len() as u64, "the whole resource");
     assert_eq!(
@@ -180,14 +201,16 @@ async fn a_source_that_ignores_the_range_is_a_typed_error() {
     let scratch = Scratch::new("ignore-range");
     // Few retries: every attempt is rejected, so there is nothing to recover and the backoff should
     // not dominate the test.
-    let options = Options {
-        retries: 1,
-        ..Options::default()
-    };
-
-    let error = download(&source, Output::File(&scratch.path), options, &())
-        .await
-        .expect_err("a range-ignoring source must not be certified");
+    let error = run(
+        source,
+        Output::File(&scratch.path),
+        5,
+        1,
+        Checksum::Sha256,
+        false,
+    )
+    .await
+    .expect_err("a range-ignoring source must not be certified");
 
     assert!(
         matches!(error, Error::RangeNotHonored { .. }),
@@ -205,15 +228,16 @@ async fn a_short_served_chunk_becomes_a_length_mismatch() {
     // One part, so the single chunk is served one byte short and the engine exhausts its retries.
     let source = FakeSource::new(body, true, Behavior::ShortByOne);
     let scratch = Scratch::new("short");
-    let options = Options {
-        parts: 1,
-        retries: 1,
-        ..Options::default()
-    };
-
-    let error = download(&source, Output::File(&scratch.path), options, &())
-        .await
-        .expect_err("a chunk that never reaches its end cannot complete");
+    let error = run(
+        source,
+        Output::File(&scratch.path),
+        1,
+        1,
+        Checksum::Sha256,
+        false,
+    )
+    .await
+    .expect_err("a chunk that never reaches its end cannot complete");
 
     assert!(
         matches!(error, Error::LengthMismatch { .. }),
@@ -226,17 +250,18 @@ async fn a_dropped_chunk_resumes_and_still_verifies() {
     let body = sample_body(1024);
     // One part with one retry: the first fetch fails outright, the retry serves it honestly.
     let source = FakeSource::new(body.clone(), true, Behavior::FailFirstFetch);
+    let fetches = Arc::clone(&source.fetches);
     let scratch = Scratch::new("retry");
-    let options = Options {
-        parts: 1,
-        retries: 3,
-        checksum: Checksum::Sha256,
-        ..Options::default()
-    };
-
-    let report = download(&source, Output::File(&scratch.path), options, &())
-        .await
-        .expect("the retry recovers the dropped chunk");
+    let report = run(
+        source,
+        Output::File(&scratch.path),
+        1,
+        3,
+        Checksum::Sha256,
+        false,
+    )
+    .await
+    .expect("the retry recovers the dropped chunk");
 
     assert_eq!(
         report.hash.as_deref(),
@@ -244,7 +269,7 @@ async fn a_dropped_chunk_resumes_and_still_verifies() {
         "the recovered download still verifies to the known hash"
     );
     assert!(
-        source.fetches.load(Ordering::SeqCst) >= 2,
+        fetches.load(Ordering::SeqCst) >= 2,
         "the first fetch was dropped and a retry was issued"
     );
 }
@@ -253,13 +278,6 @@ async fn a_dropped_chunk_resumes_and_still_verifies() {
 async fn resume_via_the_control_file_completes_a_partial_download() {
     let body = sample_body(4096);
     let scratch = Scratch::new("resume");
-    let options = Options {
-        parts: 4,
-        retries: 1,
-        checksum: Checksum::Sha256,
-        resume: true,
-        ..Options::default()
-    };
 
     // First pass: every chunk but the last is honest, the last is short, so the download fails partway
     // and leaves a `.xget` partial whose control trailer records the completed chunks.
@@ -294,7 +312,15 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
         // Fail the final quarter, so the first three chunks land and are recorded as done.
         fail_from: 3072,
     };
-    let first = download(&partial, Output::File(&scratch.path), options, &()).await;
+    let first = run(
+        partial,
+        Output::File(&scratch.path),
+        4,
+        1,
+        Checksum::Sha256,
+        true,
+    )
+    .await;
     assert!(first.is_err(), "the first pass fails on the dropped tail");
     assert!(
         scratch.part().exists(),
@@ -304,9 +330,16 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
     // Second pass: the same source now serves everything. Resume must reuse the recorded chunks, fetch
     // only the remainder, fold the on-disk prefix into the hash, and verify to the full digest.
     let full = FakeSource::honest(body.clone());
-    let report = download(&full, Output::File(&scratch.path), options, &())
-        .await
-        .expect("the resume completes the download");
+    let report = run(
+        full,
+        Output::File(&scratch.path),
+        4,
+        1,
+        Checksum::Sha256,
+        true,
+    )
+    .await
+    .expect("the resume completes the download");
 
     assert_eq!(report.length, body.len() as u64);
     assert_eq!(
@@ -357,16 +390,13 @@ async fn resume_re_chunks_with_a_different_parts_count() {
         body: Arc::new(body.clone()),
         fail_from: 5000,
     };
-    let first = download(
-        &partial,
+    let first = run(
+        partial,
         Output::File(&scratch.path),
-        Options {
-            parts: 8,
-            retries: 1,
-            resume: true,
-            ..Options::default()
-        },
-        &(),
+        8,
+        1,
+        Checksum::Sha256,
+        true,
     )
     .await;
     assert!(first.is_err(), "the first pass fails on the dropped tail");
@@ -374,16 +404,13 @@ async fn resume_re_chunks_with_a_different_parts_count() {
     // Resume with a different parallelism. The plan is rebuilt from the bytes present, so the new chunk
     // count re-tiles only what is missing, and the download still verifies to the full digest.
     let full = FakeSource::honest(body.clone());
-    let report = download(
-        &full,
+    let report = run(
+        full,
         Output::File(&scratch.path),
-        Options {
-            parts: 3,
-            retries: 1,
-            resume: true,
-            ..Options::default()
-        },
-        &(),
+        3,
+        1,
+        Checksum::Sha256,
+        true,
     )
     .await
     .expect("the resume completes with a different chunk count");
@@ -432,25 +459,20 @@ async fn a_changed_validator_discards_the_partial_and_restarts_clean() {
     }
 
     let scratch = Scratch::new("validator-change");
-    let options = Options {
-        parts: 4,
-        retries: 1,
-        checksum: Checksum::Sha256,
-        resume: true,
-        ..Options::default()
-    };
 
     // First pass: version one lands its early chunks then drops, leaving a partial tagged "v1".
     let v1 = sample_body(4096);
-    let first = download(
-        &TaggedSource {
+    let first = run(
+        TaggedSource {
             body: Arc::new(v1.clone()),
             validator: "\"v1\"".to_owned(),
             fail_from: 3072,
         },
         Output::File(&scratch.path),
-        options,
-        &(),
+        4,
+        1,
+        Checksum::Sha256,
+        true,
     )
     .await;
     assert!(first.is_err(), "the first pass drops its tail");
@@ -461,15 +483,17 @@ async fn a_changed_validator_discards_the_partial_and_restarts_clean() {
     // splice v1 and v2 bytes into a corrupt file. The validator mismatch must force a clean restart, so
     // the output is exactly v2.
     let v2: Vec<u8> = v1.iter().map(|byte| byte ^ 0xff).collect();
-    let report = download(
-        &TaggedSource {
+    let report = run(
+        TaggedSource {
             body: Arc::new(v2.clone()),
             validator: "\"v2\"".to_owned(),
             fail_from: u64::MAX,
         },
         Output::File(&scratch.path),
-        options,
-        &(),
+        4,
+        1,
+        Checksum::Sha256,
+        true,
     )
     .await
     .expect("the restart completes against the new version");
@@ -491,14 +515,16 @@ async fn a_non_range_source_streams_and_verifies() {
     let body = sample_body(3000);
     let source = FakeSource::new(body.clone(), false, Behavior::Honest);
     let scratch = Scratch::new("stream");
-    let options = Options {
-        checksum: Checksum::Sha256,
-        ..Options::default()
-    };
-
-    let report = download(&source, Output::File(&scratch.path), options, &())
-        .await
-        .expect("a non-range source is fetched as a single stream");
+    let report = run(
+        source,
+        Output::File(&scratch.path),
+        5,
+        10,
+        Checksum::Sha256,
+        false,
+    )
+    .await
+    .expect("a non-range source is fetched as a single stream");
 
     assert_eq!(report.length, body.len() as u64);
     assert_eq!(
@@ -514,14 +540,16 @@ async fn no_checksum_requested_returns_no_hash() {
     let body = sample_body(512);
     let source = FakeSource::honest(body.clone());
     let scratch = Scratch::new("nohash");
-    let options = Options {
-        checksum: Checksum::None,
-        ..Options::default()
-    };
-
-    let report = download(&source, Output::File(&scratch.path), options, &())
-        .await
-        .expect("a download with hashing off still completes");
+    let report = run(
+        source,
+        Output::File(&scratch.path),
+        5,
+        10,
+        Checksum::None,
+        false,
+    )
+    .await
+    .expect("a download with hashing off still completes");
 
     assert_eq!(report.length, body.len() as u64);
     assert_eq!(
@@ -535,15 +563,9 @@ async fn discard_verifies_but_writes_no_file() {
     let body = sample_body(4096);
     let source = FakeSource::honest(body.clone());
     let scratch = Scratch::new("discard");
-    let options = Options {
-        parts: 5,
-        checksum: Checksum::Sha256,
-        ..Options::default()
-    };
-
     // A discard scatters and verifies exactly as a file would, so the report is identical, but it keeps
     // nothing: no output file and no `.xget` beside the (unused) scratch path.
-    let report = download(&source, Output::Discard, options, &())
+    let report = run(source, Output::Discard, 5, 10, Checksum::Sha256, false)
         .await
         .expect("a discard download verifies");
 
@@ -563,28 +585,37 @@ async fn discard_verifies_but_writes_no_file() {
 #[tokio::test]
 async fn writer_streams_the_exact_bytes_and_hash() {
     let body = sample_body(4096);
-    let options = Options {
-        parts: 5,
-        checksum: Checksum::Sha256,
-        ..Options::default()
-    };
 
     // Stream the verified bytes into an in-memory buffer.
     let mut buf: Vec<u8> = Vec::new();
     let streamed = {
         let source = FakeSource::honest(body.clone());
-        download(&source, Output::Writer(&mut buf), options, &())
-            .await
-            .expect("a writer download streams the verified bytes")
+        run(
+            source,
+            Output::Writer(&mut buf),
+            5,
+            10,
+            Checksum::Sha256,
+            false,
+        )
+        .await
+        .expect("a writer download streams the verified bytes")
     };
 
     // The same source written to a file, to compare the reports side by side.
     let scratch = Scratch::new("writer-ref");
     let file = {
         let source = FakeSource::honest(body.clone());
-        download(&source, Output::File(&scratch.path), options, &())
-            .await
-            .expect("the reference file download succeeds")
+        run(
+            source,
+            Output::File(&scratch.path),
+            5,
+            10,
+            Checksum::Sha256,
+            false,
+        )
+        .await
+        .expect("the reference file download succeeds")
     };
 
     assert_eq!(buf, body, "the writer received every byte in order");
@@ -605,18 +636,13 @@ async fn a_tee_delivers_the_same_bytes_to_a_file_and_a_writer() {
     let body = sample_body(4096);
     let source = FakeSource::honest(body.clone());
     let scratch = Scratch::new("tee");
-    let options = Options {
-        parts: 5,
-        checksum: Checksum::Sha256,
-        ..Options::default()
-    };
 
     // Tee the verified bytes to a file and an in-memory writer at once. The file is finalized by
     // rename; the writer receives every byte. Both must be byte-exact and share the one digest.
     let mut buf: Vec<u8> = Vec::new();
     let report = {
         let sink = Output::tee(&scratch.path, &mut buf);
-        download(&source, sink, options, &())
+        run(source, sink, 5, 10, Checksum::Sha256, false)
             .await
             .expect("a tee download verifies and finalizes")
     };
@@ -667,20 +693,16 @@ async fn the_control_file_records_the_source_url_for_a_standalone_resume() {
     }
 
     let scratch = Scratch::new("control-url");
-    let options = Options {
-        parts: 4,
-        retries: 1,
-        resume: true,
-        ..Options::default()
-    };
-    let _ = download(
-        &TaggedSource {
+    let _ = run(
+        TaggedSource {
             body: Arc::new(sample_body(4096)),
             fail_from: 3072,
         },
         Output::File(&scratch.path),
-        options,
-        &(),
+        4,
+        1,
+        Checksum::Sha256,
+        true,
     )
     .await;
 

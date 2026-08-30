@@ -1,5 +1,5 @@
-//! A URL-first builder over [`download`]. [`get`] (HTTP) or [`from`] (any [`Source`]) starts a download,
-//! option methods chain, and [`Download::write`] runs it against a chosen [`Output`]:
+//! The URL-first builder, the public way to run a download. [`get`] (HTTP) or [`from`] (any [`Source`])
+//! starts one, option methods chain, and [`Download::write`] runs it against a chosen [`Output`]:
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), xget::Error> {
@@ -17,11 +17,12 @@
 //! # }
 //! ```
 //!
-//! It is a thin layer over [`download`], which stays available for full control.
+//! It is a thin layer over the engine's internal download routine; this builder is the entry point.
 
 use core::time::Duration;
 
-use crate::{Checksum, Error, HttpSource, Options, Output, Progress, Report, Source, download};
+use crate::engine::download;
+use crate::{Checksum, Error, HttpSource, Options, Output, Progress, Report, Source};
 
 /// Start a download from an HTTP(S) `url`. For custom headers or another protocol, build the source
 /// yourself and use [`from`].
@@ -87,12 +88,6 @@ impl<'p, S: Source> Download<'p, S> {
     /// range-capable source and a file output.
     pub fn resume(mut self) -> Self {
         self.options.resume = true;
-        self
-    }
-
-    /// Replace all [`Options`] at once, for a caller that already has a set in hand.
-    pub fn options(mut self, options: Options) -> Self {
-        self.options = options;
         self
     }
 

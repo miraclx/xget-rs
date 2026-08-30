@@ -228,6 +228,36 @@ async fn a_dropped_chunk_reports_a_retry_to_progress() {
 }
 
 #[tokio::test]
+async fn the_sweep_removes_dead_pid_scratches_and_keeps_live_ones() {
+    let tmp = std::env::temp_dir();
+    let me = std::process::id();
+    // A reliably-dead pid: spawn a trivial child and reap it, so its pid is gone.
+    let mut child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn a child");
+    let dead = child.id();
+    child.wait().expect("reap the child");
+
+    // High counters so these never collide with a real scratch from a concurrent test.
+    let dead_scratch = tmp.join(format!("xget-{dead}-99990001.xget"));
+    let live_scratch = tmp.join(format!("xget-{me}-99990002.xget"));
+    std::fs::write(&dead_scratch, b"x").expect("write dead scratch");
+    std::fs::write(&live_scratch, b"x").expect("write live scratch");
+
+    xget::sweep_orphans().await;
+
+    assert!(
+        !dead_scratch.exists(),
+        "a scratch owned by a dead process is swept"
+    );
+    assert!(
+        live_scratch.exists(),
+        "a scratch owned by a live process (ours) is left alone"
+    );
+    let _ = std::fs::remove_file(&live_scratch);
+}
+
+#[tokio::test]
 async fn a_source_that_ignores_the_range_is_a_typed_error() {
     let body = sample_body(2048);
     let source = FakeSource::new(body, true, Behavior::IgnoreRange);

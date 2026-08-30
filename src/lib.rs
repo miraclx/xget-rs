@@ -33,7 +33,7 @@ mod plan_tests;
 
 pub use crate::builder::{Download, from, get};
 pub use crate::checksum::{Checksum, UnknownChecksum};
-pub use crate::engine::Report;
+pub use crate::engine::{Report, sweep_orphans};
 
 /// Whether an interrupted download left a resumable partial beside `output`: its `.xget` file with a
 /// valid control trailer. A caller can use this to resume automatically without an explicit request. The

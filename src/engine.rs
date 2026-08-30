@@ -77,6 +77,10 @@ pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
     // writers happens after the download completes, so a resumed run simply delivers the full stream once.
     let part = scratch_path(&output);
     let can_resume = first_file(&output).is_some();
+    // A throwaway temp scratch (a writer/discard output) is removed on any early exit — an error or a
+    // dropped/cancelled future — so an interrupted stream does not leave a partial in the temp dir. A
+    // file's `.xget` is the resume artifact and is never guarded.
+    let _scratch_guard = (!can_resume).then(|| ScratchGuard(part.clone()));
     let options = Options {
         resume: options.resume && can_resume,
         ..options
@@ -763,6 +767,70 @@ fn short_error(error: &Error) -> String {
         current = next;
     }
     current.to_string()
+}
+
+/// Removes a throwaway temp scratch when a download drops without finishing (an error, or a cancelled
+/// future). A successful download has already delivered and removed the scratch, so the extra remove is
+/// a harmless no-op. Only ever guards a writer/discard scratch, never a file's `.xget` (the resume
+/// artifact), so a partial file download stays resumable.
+struct ScratchGuard(PathBuf);
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Remove throwaway scratch files (`xget-<pid>-<n>.xget`) left in the temp dir by earlier runs whose
+/// process is gone: best-effort startup housekeeping so interrupted writer/discard downloads (a Ctrl-C,
+/// a kill, a crash — cases the in-process guard cannot catch) do not pile up. A live download's scratch,
+/// including this process's own, is never touched. A no-op off unix, where the liveness check is
+/// unavailable.
+pub async fn sweep_orphans() {
+    let Ok(mut entries) = tokio::fs::read_dir(std::env::temp_dir()).await else {
+        return;
+    };
+    let me = std::process::id();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Some(pid) = entry.file_name().to_str().and_then(orphan_pid) else {
+            continue;
+        };
+        if pid == me || pid_alive(pid) {
+            continue;
+        }
+        let _ = tokio::fs::remove_file(entry.path()).await;
+    }
+}
+
+/// The pid embedded in a throwaway scratch name `xget-<pid>-<n>.xget`, if the name matches exactly (both
+/// fields numeric), so a user file that happens to sit in the temp dir is never matched.
+fn orphan_pid(name: &str) -> Option<u32> {
+    let (pid, counter) = name
+        .strip_prefix("xget-")?
+        .strip_suffix(".xget")?
+        .split_once('-')?;
+    if counter.parse::<u64>().is_err() {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Whether a process is still running: unix `kill(pid, 0)` is alive if it succeeds, or fails with EPERM
+/// (exists but owned by another user). ESRCH means gone.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: `kill` with signal 0 runs the existence/permission check without delivering a signal.
+    let checked = unsafe { libc::kill(pid, 0) };
+    checked == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Off unix there is no portable liveness check, so never sweep (conservative: never a wrongful delete).
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
 }
 
 fn io(error: std::io::Error) -> Error {

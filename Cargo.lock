@@ -3230,6 +3230,7 @@ dependencies = [
  "eyre",
  "futures",
  "hex",
+ "libc",
  "md-5",
  "reqwest",
  "sha1",

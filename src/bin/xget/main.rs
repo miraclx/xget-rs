@@ -157,6 +157,9 @@ async fn run() -> eyre::Result<()> {
         }
     }
     init_tracing(cli.verbose);
+    // Best-effort housekeeping: clear temp scratches left by earlier interrupted stream downloads (a
+    // Ctrl-C or kill the in-process guard cannot catch). Fire-and-forget so it never delays the download.
+    tokio::spawn(xget::sweep_orphans());
     // The headers were validated into typed pairs at parse time; assemble them into a map.
     let mut headers = HeaderMap::new();
     for (name, value) in &cli.headers {

@@ -637,6 +637,62 @@ async fn a_tee_delivers_the_same_bytes_to_a_file_and_a_writer() {
 }
 
 #[tokio::test]
+async fn the_control_file_records_the_source_url_for_a_standalone_resume() {
+    // A range source that advertises a re-openable identity (its URL) and drops its tail, so a first
+    // pass leaves a partial whose control should carry that URL for `xget path/to/file.xget`.
+    struct TaggedSource {
+        body: Arc<Vec<u8>>,
+        fail_from: u64,
+    }
+    impl Source for TaggedSource {
+        fn identity(&self) -> Option<String> {
+            Some("https://example.com/thing.bin".to_owned())
+        }
+        async fn probe(&self) -> Result<Probe, Error> {
+            Ok(Probe {
+                length: self.body.len() as u64,
+                supports_ranges: true,
+                ..Probe::default()
+            })
+        }
+        async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
+            let range = range.expect("a range fetch");
+            if range.start >= self.fail_from {
+                return Err(Error::Transport(Box::new(std::io::Error::other("drop"))));
+            }
+            let start = range.start as usize;
+            let end = (range.end as usize).min(self.body.len());
+            Ok(pieces(&self.body[start..end]))
+        }
+    }
+
+    let scratch = Scratch::new("control-url");
+    let options = Options {
+        parts: 4,
+        retries: 1,
+        resume: true,
+        ..Options::default()
+    };
+    let _ = download(
+        &TaggedSource {
+            body: Arc::new(sample_body(4096)),
+            fail_from: 3072,
+        },
+        Output::File(&scratch.path),
+        options,
+        &(),
+    )
+    .await;
+
+    assert!(scratch.part().exists(), "a partial is left behind");
+    assert_eq!(
+        xget::control_source(&scratch.part()).await.as_deref(),
+        Some("https://example.com/thing.bin"),
+        "the .xget records the source URL so a standalone resume can rebuild the source"
+    );
+}
+
+#[tokio::test]
 async fn the_builder_drives_a_download_like_the_function() {
     let body = sample_body(4096);
     let scratch = Scratch::new("builder");

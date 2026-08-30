@@ -134,7 +134,14 @@ async fn run() -> eyre::Result<()> {
     // Load a .env from the working directory if present, so credentials (e.g. for an s3:// URL) can
     // live there instead of being exported by hand. A missing file is not an error.
     let _ = dotenvy::dotenv();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // Resume straight from a control file: `xget path/to/file.xget` reads the URL saved inside the
+    // partial, rebuilds the source, and finishes writing `path/to/file`, with no URL retyped.
+    if let Some((url, output)) = control_resume_target(&cli).await {
+        cli.url = url;
+        cli.output = Some(output);
+        cli.resume = true;
+    }
     init_tracing(cli.verbose);
     // The headers were validated into typed pairs at parse time; assemble them into a map.
     let mut headers = HeaderMap::new();
@@ -268,6 +275,16 @@ enum AnySource {
 }
 
 impl Source for AnySource {
+    fn identity(&self) -> Option<String> {
+        match self {
+            Self::Http(source) => source.identity(),
+            #[cfg(feature = "s3")]
+            Self::S3(source) => source.identity(),
+            #[cfg(feature = "ipfs")]
+            Self::Ipfs(source) => source.identity(),
+        }
+    }
+
     async fn probe(&self) -> Result<Probe, Error> {
         match self {
             Self::Http(source) => source.probe().await,
@@ -493,6 +510,21 @@ enum Sink {
 /// Read the output argument to decide the sink: `-` is stdout, the exact path `/dev/null` is a discard,
 /// an existing special file (pipe/device/process-substitution) is a stream, anything else (or no
 /// argument) is a regular file.
+/// If the URL argument is actually a `.xget` control file (and no separate output was given), resolve
+/// the resume it describes: the source URL saved inside it, and the output it belongs to (its path
+/// without the `.xget` suffix). Returns `None` for a normal download. This powers `xget path/to/file.xget`.
+async fn control_resume_target(cli: &Cli) -> Option<(String, PathBuf)> {
+    if cli.output.is_some() {
+        return None;
+    }
+    let path = Path::new(&cli.url);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("xget") {
+        return None;
+    }
+    let url = xget::control_source(path).await?;
+    Some((url, path.with_extension("")))
+}
+
 fn resolve_sink(cli: &Cli) -> Sink {
     match cli.output.as_deref() {
         Some(path) if path == Path::new("-") => Sink::Stdout,

@@ -20,6 +20,11 @@ impl<S: Source> Mirrors<S> {
 }
 
 impl<S: Source> Source for Mirrors<S> {
+    fn identity(&self) -> Option<String> {
+        // The primary's identity names the resource; a resume comes back through the primary first.
+        self.sources.first().and_then(Source::identity)
+    }
+
     async fn probe(&self) -> Result<Probe, Error> {
         let mut last = None;
         for source in &self.sources {

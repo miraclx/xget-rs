@@ -42,6 +42,16 @@ pub async fn resumable(output: &std::path::Path) -> bool {
     crate::control::is_resumable(&crate::engine::part_path(output)).await
 }
 
+/// The source URL recorded inside a `.xget` control file, if `control_path` is a valid control that
+/// stored one. This lets a caller resume from the partial alone, with no URL given again: read the URL,
+/// rebuild the source from it, and finish the download. `control_path` is the `.xget` file itself, not
+/// the output it belongs to.
+pub async fn control_source(control_path: &std::path::Path) -> Option<String> {
+    crate::control::read(control_path)
+        .await
+        .and_then(|control| control.source)
+}
+
 pub use crate::plan::plan;
 #[cfg(feature = "ipfs")]
 pub use crate::source::IpfsSource;
@@ -194,6 +204,14 @@ pub trait Source {
     /// bytes, which is what makes a parallel chunked download trustworthy. A `None` fetch is the whole
     /// resource in one stream, used when [`Probe::supports_ranges`] is false.
     async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error>;
+
+    /// A re-openable reference to this resource (its URL, e.g. `https://…`, `s3://…`, `ipfs://…`), if the
+    /// source has one. The engine records it in the resume control file, so a later run can rebuild the
+    /// source from the `.xget` alone and finish the download without the URL being given again. Defaults
+    /// to `None`, for a source that cannot be named by a string; the engine then records nothing.
+    fn identity(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Reports download progress. The engine calls [`Progress::start`] once with the planned chunk sizes,

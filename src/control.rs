@@ -13,6 +13,7 @@
 //! resumable.
 
 use core::convert::TryInto as _;
+use core::fmt::Write as _;
 use std::io::SeekFrom;
 use std::path::Path;
 
@@ -36,6 +37,10 @@ pub(crate) struct Control {
     /// so the partial is discarded rather than stitched into a corrupt file. `None` when the source
     /// offered no validator, in which case resume falls back to the length alone.
     pub validator: Option<String>,
+    /// The source's re-openable reference (its URL) when it had one, so a resume can rebuild the source
+    /// from this file alone: `xget path/to/file.xget` finishes the download without the URL being given
+    /// again. `None` for a source with no string address.
+    pub source: Option<String>,
     /// The byte ranges recorded as written, each an absolute `[start, end)`. May overlap or be partial
     /// (a checkpoint of an in-flight chunk); the planner clamps and merges them.
     pub done: Vec<ByteRange>,
@@ -68,8 +73,14 @@ pub(crate) async fn read(path: &Path) -> Option<Control> {
 
     let mut done = Vec::new();
     let mut validator = None;
+    let mut source = None;
     for line in text.lines() {
-        // The validator is the rest of the line, so it may carry spaces (a `Last-Modified` date does).
+        // The value is the rest of the line, so it may carry spaces (a `Last-Modified` date does, and a
+        // URL may too once decoded).
+        if let Some(value) = line.strip_prefix("url ") {
+            source = Some(value.to_owned());
+            continue;
+        }
         if let Some(value) = line.strip_prefix("tag ") {
             validator = Some(value.to_owned());
             continue;
@@ -85,6 +96,7 @@ pub(crate) async fn read(path: &Path) -> Option<Control> {
     Some(Control {
         total,
         validator,
+        source,
         done,
     })
 }
@@ -106,17 +118,22 @@ pub(crate) struct Writer {
 
 impl Writer {
     /// Begin control for a freshly allocated file whose data region is already `set_len` to `total`:
-    /// seed the trailer with the resource `validator` (if any) as a `tag` line and write the footer.
+    /// seed the trailer with the resource `source` (its URL, if any) as a `url` line and the `validator`
+    /// (if any) as a `tag` line, then write the footer.
     pub(crate) async fn create(
         path: &Path,
         total: u64,
         validator: Option<&str>,
+        source: Option<&str>,
     ) -> Result<Writer, Error> {
         let mut file = open_rw(path).await?;
-        let trailer_text = match validator {
-            Some(value) => format!("tag {value}\n"),
-            None => String::new(),
-        };
+        let mut trailer_text = String::new();
+        if let Some(source) = source {
+            let _ = writeln!(trailer_text, "url {source}");
+        }
+        if let Some(value) = validator {
+            let _ = writeln!(trailer_text, "tag {value}");
+        }
         let trailer = trailer_text.len() as u64;
         file.seek(SeekFrom::Start(total)).await.map_err(io)?;
         let mut buffer = trailer_text.into_bytes();

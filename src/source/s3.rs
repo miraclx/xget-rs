@@ -60,6 +60,10 @@ impl S3Source {
 }
 
 impl Source for S3Source {
+    fn identity(&self) -> Option<String> {
+        Some(format!("s3://{}/{}", self.bucket, self.key))
+    }
+
     async fn probe(&self) -> Result<Probe, Error> {
         let head = self
             .client

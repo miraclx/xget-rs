@@ -59,7 +59,12 @@ xget https://example.com/big.iso --expect https://example.com/big.iso.sha256sum
 
 ![a checksum mismatch fails loudly and exits non-zero](media/expect.gif)
 
-Interrupt it and run it again: it resumes automatically, no flag needed.
+Interrupt it and run it again: it resumes automatically, no flag needed. You can also point xget straight
+at the leftover control file and it finishes the job, no URL to retype:
+
+```console
+xget big.iso.xget
+```
 
 ![xget interrupted and auto-resuming](media/resume.gif)
 

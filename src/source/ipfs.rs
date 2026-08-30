@@ -62,6 +62,10 @@ impl IpfsSource {
 }
 
 impl Source for IpfsSource {
+    fn identity(&self) -> Option<String> {
+        Some(format!("ipfs://{}", self.identity))
+    }
+
     async fn probe(&self) -> Result<Probe, Error> {
         let mut probe = self.http.probe().await?;
         // The CID is the content's address; when it hashes the raw bytes, adopt it so the download is

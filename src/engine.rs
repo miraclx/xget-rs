@@ -108,7 +108,13 @@ pub async fn download<S: Source, P: Progress + ?Sized>(
             Writer::open(&part, probe.length).await?
         } else {
             allocate_fresh(&part, probe.length).await?;
-            Writer::create(&part, probe.length, probe.validator.as_deref()).await?
+            Writer::create(
+                &part,
+                probe.length,
+                probe.validator.as_deref(),
+                source.identity().as_deref(),
+            )
+            .await?
         };
         let writer = Rc::new(Mutex::new(writer));
         let hash = fetch_scatter(

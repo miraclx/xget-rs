@@ -27,6 +27,10 @@ impl HttpSource {
 }
 
 impl Source for HttpSource {
+    fn identity(&self) -> Option<String> {
+        Some(self.url.to_string())
+    }
+
     async fn probe(&self) -> Result<Probe, Error> {
         // Ask for a single byte: a range-capable server answers 206 with the total in Content-Range.
         let response = self

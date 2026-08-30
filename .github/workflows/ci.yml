@@ -62,6 +62,18 @@ jobs:
     - name: test (all features)
       run: cargo test --all-targets --features "s3 ipfs" && cargo test --doc --features "s3 ipfs"
 
+  # Prove the crate and the binary compile on Windows too. A Windows runner has the MSVC toolchain the
+  # TLS backend's native crypto needs, so this catches any non-portable code (the one unix-only path,
+  # special-file detection, is cfg-gated and falls back on other platforms).
+  windows:
+    name: windows check
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.97.1
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo check --all-targets --features "s3 ipfs"
+
 # Note: the docker harness under harness/ (go-httpbin + minio + toxiproxy) is a manual dev tool for
 # fault-injection and real-object-store testing. It needs containers and is intentionally not run in
 # CI; the Rust integration tests above cover the engine and HttpSource without any of that.

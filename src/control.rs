@@ -14,13 +14,14 @@
 
 use core::convert::TryInto as _;
 use core::fmt::Write as _;
+use core::str::FromStr as _;
 use std::io::SeekFrom;
 use std::path::Path;
 
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 
-use crate::{ByteRange, Error};
+use crate::{ByteRange, Checksum, Error};
 
 /// Magic marking a valid xget control footer.
 const MAGIC: [u8; 8] = *b"XGETCTL1";
@@ -41,6 +42,9 @@ pub(crate) struct Control {
     /// from this file alone: `xget path/to/file.xget` finishes the download without the URL being given
     /// again. `None` for a source with no string address.
     pub source: Option<String>,
+    /// The checksum algorithm the download was verifying with, so a standalone resume reports the same
+    /// digest the original run would have rather than defaulting. `None` for an older control without it.
+    pub checksum: Option<Checksum>,
     /// The byte ranges recorded as written, each an absolute `[start, end)`. May overlap or be partial
     /// (a checkpoint of an in-flight chunk); the planner clamps and merges them.
     pub done: Vec<ByteRange>,
@@ -74,6 +78,7 @@ pub(crate) async fn read(path: &Path) -> Option<Control> {
     let mut done = Vec::new();
     let mut validator = None;
     let mut source = None;
+    let mut checksum = None;
     for line in text.lines() {
         // The value is the rest of the line, so it may carry spaces (a `Last-Modified` date does, and a
         // URL may too once decoded).
@@ -83,6 +88,10 @@ pub(crate) async fn read(path: &Path) -> Option<Control> {
         }
         if let Some(value) = line.strip_prefix("tag ") {
             validator = Some(value.to_owned());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("algo ") {
+            checksum = Checksum::from_str(value).ok();
             continue;
         }
         let mut fields = line.split_whitespace();
@@ -97,6 +106,7 @@ pub(crate) async fn read(path: &Path) -> Option<Control> {
         total,
         validator,
         source,
+        checksum,
         done,
     })
 }
@@ -125,6 +135,7 @@ impl Writer {
         total: u64,
         validator: Option<&str>,
         source: Option<&str>,
+        checksum: Checksum,
     ) -> Result<Writer, Error> {
         let mut file = open_rw(path).await?;
         let mut trailer_text = String::new();
@@ -134,6 +145,7 @@ impl Writer {
         if let Some(value) = validator {
             let _ = writeln!(trailer_text, "tag {value}");
         }
+        let _ = writeln!(trailer_text, "algo {}", checksum.name());
         let trailer = trailer_text.len() as u64;
         file.seek(SeekFrom::Start(total)).await.map_err(io)?;
         let mut buffer = trailer_text.into_bytes();

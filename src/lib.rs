@@ -63,6 +63,8 @@ pub struct Inspection {
     pub downloaded: u64,
     /// The resource validator (an `ETag`/`Last-Modified`/CID), if one was recorded.
     pub validator: Option<String>,
+    /// The checksum algorithm the download was verifying with, if the control recorded one.
+    pub checksum: Option<Checksum>,
 }
 
 /// Summarize a `.xget` control file, or `None` if `control_path` is not a valid control. Offline: it
@@ -75,6 +77,7 @@ pub async fn inspect(control_path: &std::path::Path) -> Option<Inspection> {
         total: control.total,
         downloaded: union_len(&control.done),
         validator: control.validator,
+        checksum: control.checksum,
     })
 }
 

@@ -113,6 +113,7 @@ pub async fn download<S: Source, P: Progress + ?Sized>(
                 probe.length,
                 probe.validator.as_deref(),
                 source.identity().as_deref(),
+                options.checksum,
             )
             .await?
         };

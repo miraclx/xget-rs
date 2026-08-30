@@ -699,6 +699,11 @@ async fn the_control_file_records_the_source_url_for_a_standalone_resume() {
         info.source.as_deref(),
         Some("https://example.com/thing.bin")
     );
+    assert_eq!(
+        info.checksum,
+        Some(Checksum::Sha256),
+        "the .xget records the algorithm so a standalone resume verifies the same way"
+    );
     assert_eq!(info.total, 4096);
     assert!(
         info.downloaded >= 3072 && info.downloaded < info.total,

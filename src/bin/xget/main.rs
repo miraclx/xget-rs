@@ -146,10 +146,15 @@ async fn run() -> eyre::Result<()> {
     }
     // Resume straight from a control file: `xget path/to/file.xget` reads the URL saved inside the
     // partial, rebuilds the source, and finishes writing `path/to/file`, with no URL retyped.
-    if let Some((url, output)) = control_resume_target(&cli).await {
+    if let Some((url, output, checksum)) = control_resume_target(&cli).await {
         cli.url = url;
         cli.output = Some(output);
         cli.resume = true;
+        // Verify with the same algorithm the interrupted run used, so a standalone resume reports the
+        // digest that run would have rather than defaulting.
+        if let Some(checksum) = checksum {
+            cli.checksum = checksum;
+        }
     }
     init_tracing(cli.verbose);
     // The headers were validated into typed pairs at parse time; assemble them into a map.
@@ -555,6 +560,9 @@ async fn show_info(cli: &Cli) -> eyre::Result<()> {
     if let Some(validator) = &info.validator {
         println!("Validator:  {validator}");
     }
+    if let Some(checksum) = info.checksum {
+        println!("Checksum:   {}", checksum.name());
+    }
     // The output the partial belongs to is the control path without its `.xget` suffix.
     let output = control_path.with_extension("");
     match info.source {
@@ -567,7 +575,7 @@ async fn show_info(cli: &Cli) -> eyre::Result<()> {
 /// If the URL argument is actually a `.xget` control file (and no separate output was given), resolve
 /// the resume it describes: the source URL saved inside it, and the output it belongs to (its path
 /// without the `.xget` suffix). Returns `None` for a normal download. This powers `xget path/to/file.xget`.
-async fn control_resume_target(cli: &Cli) -> Option<(String, PathBuf)> {
+async fn control_resume_target(cli: &Cli) -> Option<(String, PathBuf, Option<Checksum>)> {
     if cli.output.is_some() {
         return None;
     }
@@ -575,8 +583,9 @@ async fn control_resume_target(cli: &Cli) -> Option<(String, PathBuf)> {
     if path.extension().and_then(|ext| ext.to_str()) != Some("xget") {
         return None;
     }
-    let url = xget::control_source(path).await?;
-    Some((url, path.with_extension("")))
+    let info = xget::inspect(path).await?;
+    let url = info.source?;
+    Some((url, path.with_extension(""), info.checksum))
 }
 
 fn resolve_sink(cli: &Cli) -> Sink {

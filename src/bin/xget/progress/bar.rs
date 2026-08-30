@@ -64,15 +64,22 @@ impl Progress for BarProgress {
         // A two-line view is worth it for a few chunks; one chunk has nothing to aggregate and twenty
         // would not fit, so both collapse to a single aggregate bar.
         let multi = (2..20).contains(&chunks.len());
-        // A pip/rich color-only two-tone: one solid heavy line throughout, the regions told apart by
-        // hue, not glyph. Done is bright cyan, buffered-ahead a dimmer cyan, and the empty track gray,
-        // with a half-cell head on the frontier and a light separator between chunks.
-        let style = Style::default()
-            .with_filler('━')
-            .with_leader('━')
-            .with_blank('━')
-            .with_header('╸')
-            .with_separator('┆')
+        // On a UTF-8 terminal, a pip/rich color-only two-tone: one solid heavy line throughout, the
+        // regions told apart by hue (bright cyan done, dimmer cyan buffered-ahead, gray track), with a
+        // half-cell head and a light chunk separator. On a terminal that cannot render those glyphs,
+        // fall back to a plain-ascii bar (told apart by glyph too). The cyan colors are kept either way,
+        // since ANSI color is far more widely supported than the box-drawing glyphs.
+        let base = if terminal_supports_unicode() {
+            Style::default()
+                .with_filler('━')
+                .with_leader('━')
+                .with_blank('━')
+                .with_header('╸')
+                .with_separator('┆')
+        } else {
+            Style::ascii().with_separator('|')
+        };
+        let style = base
             .with_color(AnsiColor::BrightCyan)
             .with_lead_color(AnsiColor::Cyan)
             .with_blank_color(AnsiColor::BrightBlack);
@@ -200,6 +207,22 @@ fn frame(live: &Live) -> String {
     }
 }
 
+/// Whether the terminal can render the heavy block and box-drawing glyphs the bar prefers. A UTF-8
+/// locale is the usual signal; without one, fall back to a plain-ascii bar so the output stays legible.
+fn terminal_supports_unicode() -> bool {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(|var| std::env::var(var).ok())
+        .as_deref()
+        .is_some_and(locale_is_utf8)
+}
+
+/// Whether a locale string names a UTF-8 encoding (e.g. `en_US.UTF-8`, `C.utf8`).
+fn locale_is_utf8(locale: &str) -> bool {
+    let locale = locale.to_ascii_uppercase();
+    locale.contains("UTF-8") || locale.contains("UTF8")
+}
+
 /// A compact `1h2m` / `3m4s` / `5s` duration for the ETA readout.
 fn format_eta(seconds: u64) -> String {
     if seconds >= 3600 {
@@ -208,5 +231,18 @@ fn format_eta(seconds: u64) -> String {
         format!("{}m{}s", seconds / 60, seconds % 60)
     } else {
         format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locale_is_utf8;
+
+    #[test]
+    fn utf8_locales_are_recognized() {
+        assert!(locale_is_utf8("en_US.UTF-8"));
+        assert!(locale_is_utf8("C.utf8"));
+        assert!(!locale_is_utf8("C"));
+        assert!(!locale_is_utf8("en_US.ISO8859-1"));
     }
 }

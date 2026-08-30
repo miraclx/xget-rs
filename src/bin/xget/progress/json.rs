@@ -47,6 +47,14 @@ impl Progress for JsonProgress {
         }
     }
 
+    fn retry(&self, index: usize, retry: u32, max: u32, resume_from: u64, error: &str) {
+        // Escape the cause so the line stays valid JSON.
+        let error = error.replace('\\', "\\\\").replace('"', "\\\"");
+        eprintln!(
+            r#"{{"event":"retry","chunk":{index},"retry":{retry},"max":{max},"resume_from":{resume_from},"error":"{error}"}}"#
+        );
+    }
+
     fn finish(&self) {
         if let Some(meter) = self.meter.borrow().as_ref() {
             eprintln!(

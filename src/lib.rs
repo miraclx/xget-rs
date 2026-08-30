@@ -280,6 +280,11 @@ pub trait Progress {
     fn received(&self, _index: usize, _bytes: u64) {}
     /// `bytes` more bytes of chunk `index` were written to the output and folded into the hash.
     fn wrote(&self, _index: usize, _bytes: u64) {}
+    /// Chunk `index` dropped and is being retried: this is retry `retry` of at most `max`, resuming from
+    /// `resume_from` bytes already fetched into the chunk, after `error`. Called only when a retry
+    /// actually follows, so a clean download never reports one. A reporter can surface it (a line above
+    /// the bar) to explain a stall instead of a silently frozen bar. Defaults to nothing.
+    fn retry(&self, _index: usize, _retry: u32, _max: u32, _resume_from: u64, _error: &str) {}
     /// The download finished.
     fn finish(&self) {}
 }

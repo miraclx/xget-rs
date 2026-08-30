@@ -60,6 +60,15 @@ impl Progress for PlainProgress {
         }
     }
 
+    fn retry(&self, index: usize, retry: u32, max: u32, resume_from: u64, error: &str) {
+        // Clear the in-place progress line and drop the retry on its own line; the next update redraws.
+        eprintln!(
+            "\r\x1b[Kchunk {} retry {retry}/{max}: {error} (from {})",
+            index + 1,
+            fmt_size(resume_from, self.raw)
+        );
+    }
+
     fn finish(&self) {
         if let Some(meter) = self.meter.borrow().as_ref() {
             eprintln!("{}", self.line(meter));

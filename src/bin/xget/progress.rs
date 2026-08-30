@@ -83,6 +83,15 @@ impl Progress for Reporter {
         }
     }
 
+    fn retry(&self, index: usize, retry: u32, max: u32, resume_from: u64, error: &str) {
+        match self {
+            Self::Bar(bar) => bar.retry(index, retry, max, resume_from, error),
+            Self::Plain(plain) => plain.retry(index, retry, max, resume_from, error),
+            Self::Json(json) => json.retry(index, retry, max, resume_from, error),
+            Self::Silent => {}
+        }
+    }
+
     fn finish(&self) {
         match self {
             Self::Bar(bar) => bar.finish(),

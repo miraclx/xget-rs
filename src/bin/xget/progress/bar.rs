@@ -48,6 +48,10 @@ struct Live {
     prev_lines: usize,
     meter: Meter,
     raw: bool,
+    /// The chunk count, for a retry line's `chunk N/total`.
+    chunks: usize,
+    /// Whether the terminal renders unicode, so a retry line's marker and separators match the bar.
+    unicode: bool,
 }
 
 impl BarProgress {
@@ -69,7 +73,8 @@ impl Progress for BarProgress {
         // half-cell head and a light chunk separator. On a terminal that cannot render those glyphs,
         // fall back to a plain-ascii bar (told apart by glyph too). The cyan colors are kept either way,
         // since ANSI color is far more widely supported than the box-drawing glyphs.
-        let base = if terminal_supports_unicode() {
+        let unicode = terminal_supports_unicode();
+        let base = if unicode {
             Style::default()
                 .with_filler('━')
                 .with_leader('━')
@@ -101,6 +106,8 @@ impl Progress for BarProgress {
             prev_lines: 0,
             meter: Meter::new(total),
             raw: self.raw,
+            chunks: chunks.len(),
+            unicode,
         });
         if let Some(live) = slot.as_mut() {
             redraw(live);
@@ -145,12 +152,49 @@ impl Progress for BarProgress {
         }
     }
 
+    fn retry(&self, index: usize, retry: u32, max: u32, resume_from: u64, error: &str) {
+        if let Some(live) = self.inner.borrow_mut().as_mut() {
+            // Print the retry as a permanent line above the bar (only real retries reach here), so a
+            // stalled download explains itself instead of a silently frozen bar.
+            let line = retry_line(index, live, retry, max, resume_from, error);
+            let block = frame(live);
+            if let Ok(lines) = live.target.interject(&line, &block, live.prev_lines) {
+                live.prev_lines = lines;
+            }
+        }
+    }
+
     fn finish(&self) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
             let block = frame(live);
             let _ = live.target.finish_block(&block, live.prev_lines);
         }
     }
+}
+
+/// The retry line drawn above the bar, e.g. `▸ chunk 3/5 · retry 2/10 · connection reset · from 3.4 MiB`.
+/// The marker and separators track the bar's unicode/ascii choice; the marker and counts are dim-yellow,
+/// the cause plain, the resume point dim.
+fn retry_line(
+    index: usize,
+    live: &Live,
+    retry: u32,
+    max: u32,
+    resume_from: u64,
+    error: &str,
+) -> String {
+    let marker = if live.unicode { '▸' } else { '>' };
+    let sep = if live.unicode { '·' } else { '-' };
+    let size = fmt_size(resume_from, live.raw);
+    let chunks = live.chunks;
+    let chunk = index + 1;
+    format!(
+        "  {}{marker} chunk {chunk}/{chunks} {sep} retry {retry}/{max}{} {sep} {error} {sep} {}from {size}{}",
+        YELLOW.render(),
+        YELLOW.render_reset(),
+        DIM.render(),
+        DIM.render_reset(),
+    )
 }
 
 /// Redraw the bar block in place, remembering how many lines it drew for the next redraw.

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::stream;
 use sha2::{Digest as _, Sha256};
-use xget::{ByteRange, ByteStream, Checksum, Error, Output, Probe, Report, Source};
+use xget::{ByteRange, ByteStream, Checksum, Error, Output, Probe, Progress, Report, Source};
 
 /// A deterministic in-memory resource, served either range by range (honestly) or with an injected
 /// fault, so the engine's guarantees can be asserted without a server.
@@ -192,6 +192,39 @@ async fn a_clean_parallel_download_verifies_to_the_right_hash() {
     );
     let written = std::fs::read(&scratch.path).expect("the output file is in place");
     assert_eq!(written, body, "every byte landed at its offset");
+}
+
+#[tokio::test]
+async fn a_dropped_chunk_reports_a_retry_to_progress() {
+    // A reporter that just counts retry callbacks, to prove the engine surfaces a retry (what a bar
+    // renders above itself) and not only that the download recovers.
+    #[derive(Default)]
+    struct Recorder {
+        retries: std::cell::Cell<u32>,
+    }
+    impl Progress for Recorder {
+        fn retry(&self, _index: usize, _retry: u32, _max: u32, _resume_from: u64, _error: &str) {
+            self.retries.set(self.retries.get() + 1);
+        }
+    }
+
+    let body = sample_body(1024);
+    let source = FakeSource::new(body.clone(), true, Behavior::FailFirstFetch);
+    let scratch = Scratch::new("retry-report");
+    let recorder = Recorder::default();
+    xget::from(source)
+        .chunks(1)
+        .tries(3)
+        .checksum(Checksum::Sha256)
+        .progress(&recorder)
+        .write(Output::File(&scratch.path))
+        .await
+        .expect("the retry recovers the dropped chunk");
+
+    assert!(
+        recorder.retries.get() >= 1,
+        "the dropped first fetch was reported as a retry"
+    );
 }
 
 #[tokio::test]

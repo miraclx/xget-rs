@@ -560,6 +560,17 @@ async fn scatter_one<S: Source, P: Progress + ?Sized>(
             Ok(()) => {}
             Err(error) => {
                 tracing::warn!(chunk = index, attempt, resume_from = offset, error = %error, "chunk failed, retrying");
+                // Surface the retry to the reporter only when another attempt follows, resuming from the
+                // bytes already in this chunk (`offset - range.start`), so a display can explain a stall.
+                if attempt < options.retries {
+                    progress.retry(
+                        index,
+                        attempt + 1,
+                        options.retries,
+                        offset - range.start,
+                        &short_error(&error),
+                    );
+                }
                 last_error = Some(error);
             }
         }
@@ -742,6 +753,16 @@ async fn next_chunk(
 /// Exponential backoff before a retry, capped at a few seconds.
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(100u64.saturating_mul(1u64 << attempt.min(6)))
+}
+
+/// The message of the deepest source of `error`, so a retry line shows the concrete cause (e.g.
+/// "connection reset by peer") rather than the generic top-level wrapper ("fetch failed").
+fn short_error(error: &Error) -> String {
+    let mut current: &dyn core::error::Error = error;
+    while let Some(next) = core::error::Error::source(current) {
+        current = next;
+    }
+    current.to_string()
 }
 
 fn io(error: std::io::Error) -> Error {

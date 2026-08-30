@@ -74,6 +74,11 @@ xget --info big.iso.xget
 
 ![xget interrupted and auto-resuming](media/resume.gif)
 
+When the network flakes, a dropped chunk retries from where it stopped, and the retry is reported above
+the bar (only on a real retry) so a stall explains itself instead of a silently frozen bar:
+
+![chunks dropping and retrying, reported above the bar](media/retry.gif)
+
 Stream to stdout with `-`, or to a pipe or process substitution, and it streams instead of saving:
 
 ```console

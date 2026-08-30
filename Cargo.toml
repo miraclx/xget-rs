@@ -41,10 +41,14 @@ tokio-util = { version = "0.7", optional = true, features = ["io"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
-# Only for the startup sweep of orphaned temp scratches: a `kill(pid, 0)` liveness check so a partial
-# left by a since-dead process is cleaned up while a live download's scratch is never touched.
+# Only for the startup sweep of orphaned temp scratches: a process-liveness check so a partial left by a
+# since-dead process is cleaned up while a live download's scratch is never touched. Unix uses
+# `kill(pid, 0)`; Windows uses `OpenProcess`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 # Sibling crates from the same rewrite effort. Git dependencies so the crate builds standalone (and in
 # CI); a gitignored .cargo/config.toml overrides these with the neighbouring working copies for local

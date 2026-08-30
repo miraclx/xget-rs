@@ -827,8 +827,28 @@ fn pid_alive(pid: u32) -> bool {
     checked == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Off unix there is no portable liveness check, so never sweep (conservative: never a wrongful delete).
-#[cfg(not(unix))]
+/// Whether a process is still running on Windows: `OpenProcess` succeeds for a live process; a failure
+/// with `ERROR_ACCESS_DENIED` means it exists but is not queryable (alive), while a missing pid fails
+/// with `ERROR_INVALID_PARAMETER` (gone).
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: OpenProcess returns a valid handle for a running process or null on failure; we only test
+    // the handle and close it if it is valid.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if !handle.is_null() {
+        // SAFETY: closing a handle we just successfully opened.
+        unsafe { CloseHandle(handle) };
+        return true;
+    }
+    // SAFETY: reading the thread's last error immediately after the failed OpenProcess.
+    unsafe { GetLastError() == ERROR_ACCESS_DENIED }
+}
+
+/// On any other platform there is no portable liveness check, so never sweep (never a wrongful delete).
+#[cfg(not(any(unix, windows)))]
 fn pid_alive(_pid: u32) -> bool {
     true
 }

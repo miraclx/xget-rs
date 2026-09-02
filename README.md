@@ -65,9 +65,10 @@ silently frozen bar:
 
 ![chunks dropping and retrying, reported above the bar](media/retry.gif)
 
-Across runs it is just as forgiving. Interrupt it and run it again: it resumes automatically, no flag
-needed. You can also point xget straight at the leftover control file and it finishes the job, no URL to
-retype:
+Across runs it is just as forgiving. Interrupt it and run it again: it resumes from where it stopped,
+re-verifying the bytes already on disk from the start as it goes (a checksum cannot be resumed
+mid-stream, so the guarantee is worth the reread), no flag needed. You can also point xget straight at
+the leftover control file and it finishes the job, no URL to retype:
 
 ```console
 xget big.iso.xget

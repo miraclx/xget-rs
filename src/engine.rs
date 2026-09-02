@@ -19,7 +19,6 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use futures::StreamExt as _;
-use futures::stream::FuturesUnordered;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::{Mutex, Notify};
@@ -373,31 +372,32 @@ async fn fetch_scatter<S: Source, P: Progress + ?Sized>(
 
     // Structured concurrency on one task: the source's futures are not `Send`. The fetchers scatter
     // into the file and nudge the shared state while the verifier reads the contiguous prefix and hashes.
-    let mut fetchers: FuturesUnordered<_> = ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, range)| {
-            let chunk = Chunk {
-                index,
-                range,
-                resume_from: range.start + received[index],
-            };
-            let complete = received[index] >= range.len();
-            let scatter = Scatter {
-                shared: Rc::clone(&shared),
-                writer: Rc::clone(writer),
-            };
-            async move {
-                if complete {
-                    Ok(())
-                } else {
-                    scatter_one(source, part, chunk, options, progress, &scatter).await
-                }
+    let fetchers = ranges.iter().copied().enumerate().map(|(index, range)| {
+        let chunk = Chunk {
+            index,
+            range,
+            resume_from: range.start + received[index],
+        };
+        let complete = received[index] >= range.len();
+        let scatter = Scatter {
+            shared: Rc::clone(&shared),
+            writer: Rc::clone(writer),
+        };
+        async move {
+            if complete {
+                Ok(())
+            } else {
+                scatter_one(source, part, chunk, options, progress, &scatter).await
             }
-        })
-        .collect();
+        }
+    });
+    // A fresh run fetches every chunk at once: parallelism is the whole point. A resume instead fills its
+    // holes low-offset first, one at a time, so the verifier's contiguous prefix advances steadily from
+    // zero and the hash keeps pace with the download instead of bursting once the last hole closes. The
+    // resume tail is usually a fraction of the file, so the parallelism traded away is a fair price.
+    let concurrency = if plan.resumed { 1 } else { ranges.len().max(1) };
     let drive = async {
+        let mut fetchers = futures::stream::iter(fetchers).buffer_unordered(concurrency);
         let mut outcome = Ok(());
         while let Some(result) = fetchers.next().await {
             if let Err(error) = result {

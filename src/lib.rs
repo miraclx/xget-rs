@@ -173,8 +173,9 @@ pub enum Output<'a> {
 
 impl<'a> Output<'a> {
     /// Persist the download to `path`, scattering into `<path>.xget` and atomic-renaming on success.
-    pub fn file(path: &'a std::path::Path) -> Self {
-        Output::File(path)
+    /// Takes anything path-like by reference: a `&str`, `&Path`, or `&PathBuf`.
+    pub fn file<P: AsRef<std::path::Path> + ?Sized>(path: &'a P) -> Self {
+        Output::File(path.as_ref())
     }
 
     /// Stream the download's verified bytes to `writer` as they are confirmed.
@@ -183,12 +184,15 @@ impl<'a> Output<'a> {
     }
 
     /// Persist to a resumable `file` and also hand the verified bytes to `writer`: keep a copy and pipe
-    /// it onward at once.
-    pub fn tee(
-        file: &'a std::path::Path,
+    /// it onward at once. `file` takes anything path-like by reference, as [`Output::file`] does.
+    pub fn tee<P: AsRef<std::path::Path> + ?Sized>(
+        file: &'a P,
         writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin),
     ) -> Self {
-        Output::Tee { file, writer }
+        Output::Tee {
+            file: file.as_ref(),
+            writer,
+        }
     }
 }
 

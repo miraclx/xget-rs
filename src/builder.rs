@@ -3,14 +3,13 @@
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), xget::Error> {
-//! use std::path::Path;
 //! use xget::{Checksum, Output};
 //!
 //! let report = xget::get("https://example.com/big.iso")?
 //!     .chunks(8)
 //!     .checksum(Checksum::Blake3)
 //!     .resume()
-//!     .write(Output::file(Path::new("big.iso")))
+//!     .write(Output::file("big.iso"))
 //!     .await?;
 //! # let _ = report;
 //! # Ok(())

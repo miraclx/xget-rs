@@ -91,7 +91,7 @@ xget https://example.com/big.iso >(tar xz)
 
 A piped download that would not fit in the temp dir, or is simply huge, streams straight through in one
 ordered pass rather than buffering to a scratch file first, so you can pipe an arbitrarily large file to a
-consumer. Pass `--stream` to force that single-stream mode for any download.
+consumer. Pass `--sequential` to force that single-stream mode for any download.
 
 Download from S3 (with the `s3` feature). It signs when credentials resolve and goes anonymous when they
 do not, and verifies against the object's stored checksum if it has one:
@@ -125,8 +125,8 @@ name comes from the server (`Content-Disposition`) or the URL. The full list is 
 | `-t, --tries <N>` | retries per chunk, each resuming from its offset; `inf` for unlimited |
 | `-s, --checksum <ALGO>` | hash to report: `none`, `md5`, `sha1`, `sha256`, `sha512`, `blake3` |
 | `--expect <[ALGO:]HEX>` | require a known checksum: inline, bare hex, or a URL to a checksum file |
-| `-c, --continue` | resume a partial (partials resume automatically without it) |
-| `--restart` | ignore a partial and download from scratch |
+| `--restart` | ignore a resumable partial and download from scratch (partials resume automatically) |
+| `--sequential` | fetch as one ordered stream, no scratch (auto-selected for a huge or won't-fit pipe) |
 | `-f, --overwrite` | permit replacing an existing complete file |
 | `--mirror <URL>` | another source for the same file, tried when a chunk fails (repeatable) |
 | `--endpoint-url <URL>` | endpoint for an `s3://` URL |
@@ -170,15 +170,16 @@ order, hashing the contiguous prefix and gating on the exact length, then it is 
 same `.xget` is the resume control: it records the ranges already written, so a re-run picks up each
 chunk where it stopped and folds the existing bytes into the same verify pass. Before resuming, xget
 checks the resource has not changed (via its `ETag`/`Last-Modified`, or an IPFS CID); if it has, the
-partial is discarded rather than stitched. The design and the failure modes it prevents are in
-[DECISIONS.md](DECISIONS.md).
+partial is discarded rather than stitched.
 
 ## Differences from libxget-js
 
-xget keeps the shape of the original but changes some behavior on purpose: verification is structural
-(not an optional cache), resume is range-based and validated against the resource, and there is no
-`--start-pos` or `--force-append` (both would produce bytes that cannot be verified). The full
-feature-by-feature comparison is in [PARITY.md](PARITY.md).
+xget keeps the shape of the original but changes some behavior on purpose. Verification is structural,
+not an optional cache: every download is hashed and length-gated, and a source that ignores a range is a
+hard error. Resume is range-based and validated against the resource, rather than blindly appending. And
+there is no `--start-pos` or `--force-append`, because both would produce bytes that cannot be verified
+against the whole-resource checksum. Everything else from libxget-js is here: parallel chunks, retries,
+mirrors, custom headers, and pluggable sources (with S3 and IPFS added).
 
 ## License
 

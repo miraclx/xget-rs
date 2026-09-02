@@ -142,7 +142,7 @@ pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
         hash
     } else {
         // Only a genuine non-range source is unresumable for this reason. A range-capable source taken
-        // down this path was forced sequential (`--stream`, or the CLI auto-switch for a huge pipe); a
+        // down this path was forced sequential (`--sequential`, or the CLI auto-switch for a huge pipe); a
         // single stream simply cannot resume, so it restarts and the truncating create below discards any
         // leftover partial.
         if options.resume && !probe.supports_ranges && file_len(&part).await > 0 {

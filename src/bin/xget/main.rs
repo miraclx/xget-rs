@@ -42,10 +42,6 @@ struct Cli {
     /// resuming an interrupted download of it.
     #[arg(short = 'f', long)]
     overwrite: bool,
-    /// Force resuming a partial download. A partial left by an interrupted run resumes automatically, so
-    /// this is only needed to override.
-    #[arg(short = 'c', long = "continue", conflicts_with = "restart")]
-    resume: bool,
     /// Ignore any resumable partial and download from scratch.
     #[arg(long)]
     restart: bool,
@@ -57,7 +53,7 @@ struct Cli {
     /// arbitrarily large download can be piped to a consumer. Auto-selected for a pipe/stdout/discard
     /// output that would not fit in the temp dir or exceeds the buffer cap.
     #[arg(long)]
-    stream: bool,
+    sequential: bool,
     /// Set a request header, e.g. `Authorization: Bearer x` (repeatable).
     #[arg(short = 'H', long = "header", value_parser = parse_header)]
     headers: Vec<(HeaderName, HeaderValue)>,
@@ -85,9 +81,6 @@ struct Cli {
     /// Progress output: auto (a bar on a terminal, else plain lines), bar, plain, json, or none.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
-    /// Disable the live bar (same as `--progress plain`).
-    #[arg(long)]
-    no_bar: bool,
     /// Report raw byte counts instead of human-readable sizes.
     #[arg(long)]
     raw_sizes: bool,
@@ -154,8 +147,8 @@ async fn run() -> eyre::Result<()> {
     if let Some((url, output, checksum)) = control_resume_target(&cli).await {
         cli.url = url;
         cli.output = Some(output);
-        cli.resume = true;
-        // Verify with the same algorithm the interrupted run used, so a standalone resume reports the
+        // The `.xget` sits beside this output, so the resume is detected automatically below; no flag to
+        // set. Verify with the same algorithm the interrupted run used, so a standalone resume reports the
         // digest that run would have rather than defaulting.
         if let Some(checksum) = checksum {
             cli.checksum = checksum;
@@ -175,33 +168,19 @@ async fn run() -> eyre::Result<()> {
 
     // Probe once up front for the preamble and the output name; the download re-probes authoritatively.
     let probe = source.probe().await.ok();
-    // Where the bytes go: `-` streams to stdout, `/dev/null` discards (a verify-only speed test), anything
-    // else is a file whose name is resolved and inferred as before. Only a file has a persistent artifact
-    // to resume, so `-` and `/dev/null` never resume.
-    let sink = resolve_sink(&cli);
-    let output = match sink {
-        Sink::File => Some(resolve_output(&cli, probe.as_ref())?),
-        // A stream sink writes to the special file exactly as given: no name inference, no clobber check
-        // (writing to the pipe or device is the point), no `.xget` beside it.
-        Sink::Stream => Option::clone(&cli.output),
-        Sink::Stdout | Sink::Discard => None,
-    };
-    // Auto-resume: an interrupted download leaves a `.xget` control file beside the output, and its
-    // presence is the signal to continue where the last run stopped, so a re-run resumes without needing
-    // -c. A partial actually on disk is what we resume; -c only asks to, so with nothing to come back to
-    // there is nothing to resume (and no "resuming" notice). Resume is independent of -f (which only
-    // permits replacing the destination); --restart forces a fresh start. Only a file resumes; `-`,
-    // `/dev/null`, and a stream have nothing to come back to.
-    let partial = match (sink, &output) {
-        (Sink::File, Some(output)) => !cli.restart && xget::resumable(output).await,
-        _ => false,
-    };
-    let resume = partial || (matches!(sink, Sink::File) && cli.resume && !cli.restart);
+    // Resolve where the bytes go and whether this run resumes, once.
+    let dest = Destination::resolve(&cli, probe.as_ref()).await?;
     if mode == ProgressMode::Bar {
         // For a file, print the block before the bar as usual. For `-`, still print it (to stderr, since
         // stdout is the data). A path label makes sense only for a file; show the destination stream
-        // otherwise. The "resuming" notice keys off a real partial, not the -c flag.
-        preamble(&cli, probe.as_ref(), output.as_deref(), sink, partial);
+        // otherwise. The "resuming" notice keys off a real partial on disk.
+        preamble(
+            &cli,
+            probe.as_ref(),
+            dest.output.as_deref(),
+            dest.sink,
+            dest.resume,
+        );
     }
 
     // `--expect` was parsed to a literal digest or a checksum-file URL at parse time; resolve it now,
@@ -238,37 +217,14 @@ async fn run() -> eyre::Result<()> {
 
     let reporter = Reporter::new(mode, cli.raw_sizes);
     let started = Instant::now();
-    // Build the sink and run. Stdout is held in a binding so a `Writer` can borrow it for the whole call.
-    let mut stdout = tokio::io::stdout();
-    // A stream sink (pipe, device, or process substitution) is opened for writing up front and held in a
-    // binding so the download can borrow it for the whole call, the same way stdout is.
-    let mut stream_sink = match (sink, &output) {
-        (Sink::Stream, Some(path)) => Some(
-            tokio::fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .await
-                .map_err(|err| eyre::eyre!("cannot open {} for writing: {err}", path.display()))?,
-        ),
-        _ => None,
-    };
-    let out = match (sink, &output) {
-        (Sink::File, Some(path)) => xget::Output::File(path),
-        (Sink::Stdout, _) => xget::Output::Writer(&mut stdout),
-        (Sink::Discard, _) => xget::Output::Discard,
-        (Sink::Stream, _) => match stream_sink.as_mut() {
-            Some(file) => xget::Output::Writer(file),
-            None => eyre::bail!("no stream sink opened for a stream download"),
-        },
-        // A file sink always resolves an output above; this arm is unreachable but keeps the match total.
-        (Sink::File, None) => eyre::bail!("no output path resolved for a file download"),
-    };
+    // Open the write target up front and hold it for the whole download, so the engine can borrow it.
+    let mut handle = Handle::open(&dest).await?;
     // Configure the download through the builder (the library's entry point), then run it.
     let mut plan = xget::from(source)
         .chunks(cli.chunks)
         .tries(cli.tries)
         .checksum(checksum);
-    if resume {
+    if dest.resume {
         plan = plan.resume();
     }
     if let Some(timeout) = cli.timeout {
@@ -276,10 +232,10 @@ async fn run() -> eyre::Result<()> {
     }
     // Stream sequentially when asked, or when a pipe/discard output would not fit in (or would exhaust)
     // the temp dir it buffers into. A file output always buffers into its own `.xget`, so it is exempt.
-    if choose_sequential(&cli, probe.as_ref(), sink, mode) {
+    if choose_sequential(&cli, probe.as_ref(), dest.sink, mode) {
         plan = plan.sequential();
     }
-    let report = plan.progress(&reporter).write(out).await?;
+    let report = plan.progress(&reporter).write(handle.output()).await?;
 
     if let Some((_, want)) = &expected {
         match &report.hash {
@@ -293,6 +249,88 @@ async fn run() -> eyre::Result<()> {
 
     summary(mode, &cli, checksum, &report, started.elapsed());
     Ok(())
+}
+
+/// Where a run's bytes go and whether it resumes, resolved once from the CLI and the up-front probe. The
+/// sink/output cross-product is decided here so `run` reads as a straight line instead of re-deriving it.
+struct Destination {
+    sink: Sink,
+    /// The resolved file path (for a file or a stream sink); `None` for stdout or a discard.
+    output: Option<PathBuf>,
+    /// A resumable partial is on disk beside the output, so this run continues it (and the preamble says
+    /// so). Only a file sink can resume, and only when `--restart` was not given.
+    resume: bool,
+}
+
+impl Destination {
+    async fn resolve(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<Self> {
+        // `-` streams to stdout, `/dev/null` discards (a verify-only speed test), an existing special file
+        // is a stream, anything else is a regular file.
+        let sink = resolve_sink(cli);
+        let output = match sink {
+            Sink::File => Some(resolve_output(cli, probe)?),
+            // A stream sink writes to the special file exactly as given: no name inference, no clobber
+            // check (writing to the pipe or device is the point), no `.xget` beside it.
+            Sink::Stream => Option::clone(&cli.output),
+            Sink::Stdout | Sink::Discard => None,
+        };
+        // An interrupted download leaves a `.xget` beside its output; its presence (absent --restart) is
+        // the resume signal, so a plain re-run continues where the last stopped, no flag needed. Only a
+        // file has that artifact; stdout, a discard, and a stream have nothing to come back to.
+        let resume = match (sink, &output) {
+            (Sink::File, Some(output)) => !cli.restart && xget::resumable(output).await,
+            _ => false,
+        };
+        Ok(Self {
+            sink,
+            output,
+            resume,
+        })
+    }
+}
+
+/// Owns the write target for the life of the download and lends the engine an [`xget::Output`]. Stdout
+/// and an opened stream file must outlive the borrow the engine holds, so they live here rather than
+/// having their lifetimes choreographed inline in `run`.
+enum Handle {
+    File(PathBuf),
+    Stdout(tokio::io::Stdout),
+    Stream(tokio::fs::File),
+    Discard,
+}
+
+impl Handle {
+    /// Open the write target for a resolved [`Destination`].
+    async fn open(dest: &Destination) -> eyre::Result<Self> {
+        Ok(match (dest.sink, &dest.output) {
+            (Sink::File, Some(path)) => Handle::File(PathBuf::clone(path)),
+            (Sink::Stdout, _) => Handle::Stdout(tokio::io::stdout()),
+            (Sink::Discard, _) => Handle::Discard,
+            (Sink::Stream, Some(path)) => Handle::Stream(
+                tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .await
+                    .map_err(|err| {
+                        eyre::eyre!("cannot open {} for writing: {err}", path.display())
+                    })?,
+            ),
+            // A file always resolves an output, and a stream sink always has a path; these keep the match
+            // total.
+            (Sink::File, None) => eyre::bail!("no output path resolved for a file download"),
+            (Sink::Stream, None) => eyre::bail!("no stream path resolved for a stream download"),
+        })
+    }
+
+    /// Lend the engine an [`xget::Output`] that writes to this handle for the duration of the download.
+    fn output(&mut self) -> xget::Output<'_> {
+        match self {
+            Handle::File(path) => xget::Output::File(path.as_path()),
+            Handle::Stdout(stdout) => xget::Output::Writer(stdout),
+            Handle::Stream(file) => xget::Output::Writer(file),
+            Handle::Discard => xget::Output::Discard,
+        }
+    }
 }
 
 /// The byte source for this run, chosen from the URL scheme. `Source` is not object-safe (it has async
@@ -466,8 +504,7 @@ fn summary(
     }
 }
 
-/// Resolve the effective progress mode: `auto` becomes a bar on a terminal and plain lines otherwise,
-/// and `--no-bar` downgrades a bar to plain.
+/// Resolve the effective progress mode: `auto` becomes a bar on a terminal and plain lines otherwise.
 fn resolve_mode(cli: &Cli) -> ProgressMode {
     let mut mode = cli.progress;
     if mode == ProgressMode::Auto {
@@ -476,9 +513,6 @@ fn resolve_mode(cli: &Cli) -> ProgressMode {
         } else {
             ProgressMode::Plain
         };
-    }
-    if cli.no_bar && mode == ProgressMode::Bar {
-        mode = ProgressMode::Plain;
     }
     mode
 }
@@ -617,12 +651,12 @@ const BUFFER_CAP: u64 = ByteSize::of_int(4, GIBI_BYTE).byte_count_lossy() as u64
 const FREE_MARGIN: u64 = ByteSize::of_int(1, GIBI_BYTE).byte_count_lossy() as u64;
 
 /// Whether to stream sequentially (one connection, no scratch) instead of buffering into a temp scratch.
-/// Forced by `--stream`. Otherwise auto-selected only for a pipe/stdout/discard output of a range-capable
+/// Forced by `--sequential`. Otherwise auto-selected only for a pipe/stdout/discard output of a range-capable
 /// source: sequential when the download exceeds [`BUFFER_CAP`], or (where free space is known) when it
 /// would not fit in the temp dir with [`FREE_MARGIN`] to spare, each with a note. A file output buffers
 /// into its own `.xget` on its own volume and is never auto-switched.
 fn choose_sequential(cli: &Cli, probe: Option<&Probe>, sink: Sink, mode: ProgressMode) -> bool {
-    if cli.stream {
+    if cli.sequential {
         return true;
     }
     if !matches!(sink, Sink::Stream | Sink::Stdout | Sink::Discard) {

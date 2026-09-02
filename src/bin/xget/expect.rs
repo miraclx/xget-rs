@@ -1,3 +1,6 @@
+//! `--expect`: parse a checksum expectation (a literal `algo:hex`, a bare hex, or a checksum-file URL)
+//! and resolve it to the pinned algorithm and expected digest the download must match.
+
 use xget::Checksum;
 
 /// An `--expect` value: either a checksum given inline, or a URL to a checksum file to fetch. Both

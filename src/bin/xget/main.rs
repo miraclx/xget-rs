@@ -538,9 +538,6 @@ enum Sink {
     Stream,
 }
 
-/// Read the output argument to decide the sink: `-` is stdout, the exact path `/dev/null` is a discard,
-/// an existing special file (pipe/device/process-substitution) is a stream, anything else (or no
-/// argument) is a regular file.
 /// Print a summary of the `.xget` control file named by the argument (the `.xget` itself, or the output
 /// it belongs to) and exit. Offline: reads only the local file. Powers `xget --info`.
 async fn show_info(cli: &Cli) -> eyre::Result<()> {
@@ -672,6 +669,9 @@ fn available_space(_path: &Path) -> Option<u64> {
     None
 }
 
+/// Read the output argument to decide the sink: `-` is stdout, the exact path `/dev/null` is a discard,
+/// an existing special file (pipe/device/process-substitution) is a stream, anything else (or no
+/// argument) is a regular file.
 fn resolve_sink(cli: &Cli) -> Sink {
     match cli.output.as_deref() {
         Some(path) if path == Path::new("-") => Sink::Stdout,

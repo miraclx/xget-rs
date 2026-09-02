@@ -1,3 +1,6 @@
+//! A sliding-window speedometer: the download rate over the last few seconds, so the readout tracks the
+//! current speed instead of a lifetime average that lags a stall or a burst.
+
 use core::time::Duration;
 use std::time::Instant;
 

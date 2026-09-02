@@ -12,7 +12,6 @@
 //! into place. A file whose footer does not validate (a foreign or truncated file) is simply not
 //! resumable.
 
-use core::convert::TryInto as _;
 use core::fmt::Write as _;
 use core::str::FromStr as _;
 use std::io::SeekFrom;

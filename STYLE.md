@@ -125,6 +125,11 @@ to flag the same smell twice._
   by value. Reserve bare
   free functions for genuinely standalone pure helpers, and even then prefer a local trait for a
   cohesive family of conversions (see the wire/domain/storage section).
+- **A one-shot private pipeline may stay as free functions.** When several stages run once in sequence,
+  thread the same handful of values, and never escape a single task (so their shared state is `Rc`/`Cell`,
+  not a reusable object), leaving them as free functions is fine. Making them methods on a `Self` whose
+  `&self` only holds those same threaded values relocates parameters into fields without buying
+  composability. This is a narrow exception, not license to scatter helpers.
 - **Wrap a foreign stack once, at the composition root; everything downstream speaks your own vocabulary.**
   An app names a concrete external implementation (a specific transport, driver, or backend) exactly once,
   where it builds its root object. Every subsequent operation is generic over your own traits. If a file

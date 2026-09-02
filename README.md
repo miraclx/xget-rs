@@ -175,7 +175,9 @@ partial is discarded rather than stitched.
 ## Differences from libxget-js
 
 xget keeps the shape of the original but changes some behavior on purpose. Verification is structural,
-not an optional cache: every download is hashed and length-gated, and a source that ignores a range is a
+not a cache you size: where libxget-js buffered chunks in memory (`--cache-size`, `--show-cache`), xget
+writes each chunk straight to its offset and reads the file back once to hash it, trading that for
+unbounded parallelism. Every download is hashed and length-gated, and a source that ignores a range is a
 hard error. Resume is range-based and validated against the resource, rather than blindly appending. And
 there is no `--start-pos` or `--force-append`, because both would produce bytes that cannot be verified
 against the whole-resource checksum. Everything else from libxget-js is here: parallel chunks, retries,

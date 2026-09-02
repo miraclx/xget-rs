@@ -19,7 +19,7 @@ use crate::progress::{DIM, Reporter};
 
 /// Download a URL in parallel chunks, verify it, and print its SHA-256.
 #[derive(Parser)]
-#[command(name = "xget", version, about)]
+#[command(name = "xget", version)]
 struct Cli {
     /// The URL to download.
     url: String,
@@ -580,10 +580,10 @@ async fn show_info(cli: &Cli) -> eyre::Result<()> {
     if let Some(checksum) = info.checksum {
         println!("Checksum:   {}", checksum.name());
     }
-    // The output the partial belongs to is the control path without its `.xget` suffix.
-    let output = control_path.with_extension("");
+    // Point at the control file itself: `xget <file>.xget` reads the URL it records and finishes the
+    // download. (Handing the output path would be read as a URL and fail.)
     match info.source {
-        Some(_) => println!("Status:     resumable   ->  xget {}", output.display()),
+        Some(_) => println!("Status:     resumable   ->  xget {}", control_path.display()),
         None => println!("Status:     resumable (re-run with the original URL to resume)"),
     }
     Ok(())

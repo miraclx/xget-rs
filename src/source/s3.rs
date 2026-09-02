@@ -90,7 +90,7 @@ impl Source for S3Source {
             .filter(|value| !value.is_empty());
         let filename = head
             .content_disposition()
-            .and_then(content_disposition_name);
+            .and_then(super::http::content_disposition_name);
         // A stored checksum, if the object was uploaded with one. S3 gives it base64-encoded; the engine
         // works in hex, so decode and re-encode. Skip a composite multipart checksum (a `-N` suffix): it
         // is a checksum of part checksums, not of the whole object, so it cannot verify the download.
@@ -128,21 +128,6 @@ impl Source for S3Source {
             ReaderStream::new(reader).map(|chunk| chunk.map_err(Error::transport)),
         ))
     }
-}
-
-/// Extract a filename from a `Content-Disposition` value, taking a plain `filename=` and stripping it
-/// to its final path component so a stored value like `../../etc/passwd` cannot steer the output
-/// outside the intended directory. Returns `None` if no usable, non-empty name is present.
-fn content_disposition_name(value: &str) -> Option<String> {
-    let raw = value
-        .split(';')
-        .filter_map(|part| part.trim().strip_prefix("filename="))
-        .map(|raw| raw.trim().trim_matches('"').to_owned())
-        .next()?;
-    let base = std::path::Path::new(&raw)
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)?;
-    (!base.is_empty()).then(|| base.to_owned())
 }
 
 /// Read a whole-object stored checksum from a `HeadObject` response as an algorithm and lowercase hex

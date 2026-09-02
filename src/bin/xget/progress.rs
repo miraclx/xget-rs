@@ -22,83 +22,46 @@ use speedometer::Speedometer;
 /// Dimmed style for the chrome (borders, labels), used by the bar and by the CLI preamble in `main`.
 pub(crate) const DIM: anstyle::Style = anstyle::Style::new().dimmed();
 
-/// The chosen progress reporter, dispatching to whichever mode was selected. Every variant reports the
-/// same download; they differ only in how they render it.
-pub(crate) enum Reporter {
-    /// A live segmented bar with a size, speed, and ETA readout.
-    Bar(BarProgress),
-    /// A single updating text line.
-    Plain(PlainProgress),
-    /// One JSON event per update.
-    Json(JsonProgress),
-    /// No progress output.
-    Silent,
-}
+/// The chosen progress reporter: the leaf for the selected mode, behind a box so the download can hold
+/// one reporter type whichever mode is chosen. `Progress` is object-safe, so this is a plain forward to
+/// the leaf; the modes differ only in how they render the same download.
+pub(crate) struct Reporter(Box<dyn Progress>);
 
 impl Reporter {
     pub(crate) fn new(mode: ProgressMode, raw: bool) -> Self {
-        match mode {
-            ProgressMode::Bar | ProgressMode::Auto => Self::Bar(BarProgress::new(raw)),
-            ProgressMode::Plain => Self::Plain(PlainProgress::new(raw)),
-            ProgressMode::Json => Self::Json(JsonProgress::new()),
-            ProgressMode::None => Self::Silent,
-        }
+        Reporter(match mode {
+            ProgressMode::Bar | ProgressMode::Auto => Box::new(BarProgress::new(raw)),
+            ProgressMode::Plain => Box::new(PlainProgress::new(raw)),
+            ProgressMode::Json => Box::new(JsonProgress::new()),
+            // The crate's no-op reporter: renders nothing.
+            ProgressMode::None => Box::new(()),
+        })
     }
 }
 
 impl Progress for Reporter {
     fn start(&self, chunks: &[u64]) {
-        match self {
-            Self::Bar(bar) => bar.start(chunks),
-            Self::Plain(plain) => plain.start(chunks),
-            Self::Json(json) => json.start(chunks),
-            Self::Silent => {}
-        }
+        self.0.start(chunks);
     }
 
     fn restore(&self, present: &[u64]) {
-        match self {
-            Self::Bar(bar) => bar.restore(present),
-            Self::Plain(plain) => plain.restore(present),
-            Self::Json(json) => json.restore(present),
-            Self::Silent => {}
-        }
+        self.0.restore(present);
     }
 
     fn received(&self, index: usize, bytes: u64) {
-        match self {
-            Self::Bar(bar) => bar.received(index, bytes),
-            Self::Plain(plain) => plain.received(index, bytes),
-            Self::Json(json) => json.received(index, bytes),
-            Self::Silent => {}
-        }
+        self.0.received(index, bytes);
     }
 
     fn wrote(&self, index: usize, bytes: u64) {
-        match self {
-            Self::Bar(bar) => bar.wrote(index, bytes),
-            Self::Plain(plain) => plain.wrote(index, bytes),
-            Self::Json(json) => json.wrote(index, bytes),
-            Self::Silent => {}
-        }
+        self.0.wrote(index, bytes);
     }
 
     fn retry(&self, index: usize, retry: u32, max: u32, resume_from: u64, error: &str) {
-        match self {
-            Self::Bar(bar) => bar.retry(index, retry, max, resume_from, error),
-            Self::Plain(plain) => plain.retry(index, retry, max, resume_from, error),
-            Self::Json(json) => json.retry(index, retry, max, resume_from, error),
-            Self::Silent => {}
-        }
+        self.0.retry(index, retry, max, resume_from, error);
     }
 
     fn finish(&self) {
-        match self {
-            Self::Bar(bar) => bar.finish(),
-            Self::Plain(plain) => plain.finish(),
-            Self::Json(json) => json.finish(),
-            Self::Silent => {}
-        }
+        self.0.finish();
     }
 }
 

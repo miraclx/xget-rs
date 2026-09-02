@@ -141,7 +141,11 @@ pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
         distribute(&part, probe.length, output).await?;
         hash
     } else {
-        if options.resume && file_len(&part).await > 0 {
+        // Only a genuine non-range source is unresumable for this reason. A range-capable source taken
+        // down this path was forced sequential (`--stream`, or the CLI auto-switch for a huge pipe); a
+        // single stream simply cannot resume, so it restarts and the truncating create below discards any
+        // leftover partial.
+        if options.resume && !probe.supports_ranges && file_len(&part).await > 0 {
             return Err(Error::detail(
                 "cannot resume: the source does not support byte ranges",
             ));
@@ -491,7 +495,9 @@ impl Sink<'_> {
             .await?;
         while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
             let len = chunk.len() as u64;
-            if *offset + len > self.range.end {
+            // `*offset <= self.range.end` holds here, so subtract rather than add to avoid an overflow on
+            // a hostile source streaming near `u64::MAX`.
+            if len > self.range.end - *offset {
                 return Err(Error::detail(
                     "source sent more bytes than the requested range",
                 ));

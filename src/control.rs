@@ -119,6 +119,12 @@ pub(crate) async fn is_resumable(path: &Path) -> bool {
 /// A handle over an open `.xget` file that appends completed or checkpointed byte ranges to its trailer,
 /// rewriting the footer after each, and truncates them away on finish. Held behind an async mutex and
 /// shared by the fetchers, so their appends serialize even though they interleave at await points.
+///
+/// Durability note: writes are flushed to the OS but not `fsync`ed, so the trailer survives a process
+/// interruption (a Ctrl-C or kill, the case resume is built for) but a power loss may lose the last
+/// unsynced checkpoints. That is safe, not corrupting: a resume only refetches the ranges it cannot find
+/// recorded, and the verify pass certifies the bytes regardless. We trade an `fsync` per checkpoint for
+/// throughput deliberately.
 pub(crate) struct Writer {
     file: File,
     total: u64,

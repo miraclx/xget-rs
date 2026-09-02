@@ -115,11 +115,28 @@ impl Source for S3Source {
     async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
         let mut request = self.client.get_object().bucket(&self.bucket).key(&self.key);
         if let Some(range) = range {
-            // S3 ranges are inclusive on both ends; our ByteRange end is exclusive. S3 answers a range
-            // GET with exactly those bytes, so unlike HTTP there is no 200-with-whole-body case to guard.
+            // S3 ranges are inclusive on both ends; our ByteRange end is exclusive.
             request = request.range(format!("bytes={}-{}", range.start, range.end - 1));
         }
         let output = request.send().await.map_err(Error::transport)?;
+
+        if let Some(range) = range {
+            // Guard against an S3-compatible store (R2, MinIO, ...) that ignored the range and returned
+            // the whole object: those bytes would scatter at the wrong offsets. A range GET answers with
+            // a `Content-Range`; require its start to match, or, if the store omits it, the returned
+            // length to equal the requested window. Otherwise reject as a range not honored, the same
+            // typed error the HTTP source raises.
+            let honored = output
+                .content_range()
+                .and_then(super::http::content_range_start)
+                .map_or(
+                    output.content_length() == Some(range.len() as i64),
+                    |start| start == range.start,
+                );
+            if !honored {
+                return Err(Error::RangeNotHonored { requested: range });
+            }
+        }
 
         // Adapt the SDK's ByteStream into ours: read it as an AsyncRead and re-chunk with ReaderStream,
         // mapping each read error into our transport error.

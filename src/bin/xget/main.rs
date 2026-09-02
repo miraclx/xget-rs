@@ -170,10 +170,10 @@ async fn run() -> eyre::Result<()> {
     let probe = source.probe().await.ok();
     // Resolve where the bytes go and whether this run resumes, once.
     let dest = Destination::resolve(&cli, probe.as_ref()).await?;
-    if mode == ProgressMode::Bar {
-        // For a file, print the block before the bar as usual. For `-`, still print it (to stderr, since
-        // stdout is the data). A path label makes sense only for a file; show the destination stream
-        // otherwise. The "resuming" notice keys off a real partial on disk.
+    if matches!(mode, ProgressMode::Bar | ProgressMode::Plain) {
+        // Print the block before the progress output, on a bar or plain run alike: a piped or CI run
+        // resolves to plain and needs the context (URL, size, destination) just as much. It goes to
+        // stderr, so stdout stays clean for a `-` stream. The "resuming" notice keys off a real partial.
         preamble(
             &cli,
             probe.as_ref(),
@@ -494,6 +494,12 @@ fn summary(
     elapsed: Duration,
 ) {
     if mode == ProgressMode::Json {
+        // The `end` event already reported the byte totals; emit the verified digest here, where it is
+        // finally known, so a JSON consumer gets the checksum the tool computes. To stderr, like the
+        // other events, so stdout stays clean for a `-` stream.
+        if let Some(hash) = &report.hash {
+            eprintln!(r#"{{"event":"verified","checksum":"{checksum}","hash":"{hash}"}}"#);
+        }
         return;
     }
     let size = fmt_size(report.length, cli.raw_sizes);

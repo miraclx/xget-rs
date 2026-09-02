@@ -6,7 +6,7 @@
 //! ignores a range, or a length that does not match, is a typed [`Error`], not a silent bad file.
 //!
 //! The byte source is pluggable behind [`Source`]: HTTP range GET today, and anything that can report a
-//! length and serve a byte range tomorrow, an S3 object or a peer on an overlay network or your own. The
+//! length and serve a byte range tomorrow, an S3 object, an IPFS gateway, or your own. The
 //! engine is written once and works over any such source; a source that cannot serve ranges is fetched
 //! as a single stream.
 //!
@@ -321,7 +321,7 @@ pub enum Error {
         /// The length actually received.
         received: u64,
     },
-    /// The underlying transport (HTTP, S3, overlay) failed.
+    /// The underlying transport (HTTP, S3, IPFS) failed.
     #[error("fetch failed")]
     Transport(#[source] BoxError),
 }

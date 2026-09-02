@@ -235,7 +235,24 @@ async fn run() -> eyre::Result<()> {
     if choose_sequential(&cli, probe.as_ref(), dest.sink, mode) {
         plan = plan.sequential();
     }
-    let report = plan.progress(&reporter).write(handle.output()).await?;
+    // Race the download against Ctrl-C so an interrupt stops cleanly. On a signal the download future is
+    // dropped: its chunks stop, throwaway temp scratches are removed by their guards, and a file's `.xget`
+    // is left on disk with progress checkpointed, so the run is resumable.
+    let report = tokio::select! {
+        result = plan.progress(&reporter).write(handle.output()) => result?,
+        _ = tokio::signal::ctrl_c() => {
+            if mode == ProgressMode::Bar {
+                eprintln!(); // move past the in-place bar onto a fresh line
+            }
+            match &dest.output {
+                Some(output) if matches!(dest.sink, Sink::File) => {
+                    eprintln!("interrupted; resume with: xget {}.xget", output.display());
+                }
+                _ => eprintln!("interrupted"),
+            }
+            std::process::exit(130); // 128 + SIGINT, the shell convention for a Ctrl-C exit
+        }
+    };
 
     if let Some((_, want)) = &expected {
         match &report.hash {

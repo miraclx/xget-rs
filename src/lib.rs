@@ -5,12 +5,13 @@
 //! so a reported digest is trustworthy. It never certifies bytes it did not verify: a source that
 //! ignores a range, or a length that does not match, is a typed [`Error`], not a silent bad file.
 //!
-//! The byte source is pluggable behind [`Source`]: HTTP range GET today, S3 or a theia/bifrost peer
-//! tomorrow. The engine is written once and works over any source that can report a length and serve a
-//! byte range; a source that cannot serve ranges is fetched as a single stream.
+//! The byte source is pluggable behind [`Source`]: HTTP range GET today, and anything that can report a
+//! length and serve a byte range tomorrow, an S3 object or a peer on an overlay network or your own. The
+//! engine is written once and works over any such source; a source that cannot serve ranges is fetched
+//! as a single stream.
 //!
-//! Where things live: this root holds the public vocabulary ([`Source`], [`Progress`], [`Options`],
-//! [`Output`], [`Probe`], [`Error`]) that everything else speaks. The `source` module holds the shipped
+//! Where things live: this root holds the public vocabulary ([`Source`], [`Progress`], [`Output`],
+//! [`Probe`], [`Error`]) that everything else speaks. The `source` module holds the shipped
 //! sources ([`HttpSource`] is the reference one); `engine` is the machine that drives any source; and
 //! `plan`, `control`, and `checksum` are the parts it leans on (chunk planning, the `.xget` resume
 //! trailer, and the hashing). A good reading order is this doc, then [`Source`] and [`HttpSource`], then
@@ -143,7 +144,7 @@ impl Default for Options {
 
 /// Where a download's verified bytes go.
 ///
-/// A [`download`] scatters and verifies into a seekable scratch, then finalizes to the chosen sink. A
+/// A download scatters and verifies into a seekable scratch, then finalizes to the chosen sink. A
 /// sink with a file ([`Output::File`] or [`Output::Tee`]) leaves a persistent `.xget` and so is
 /// resumable; a lone [`Output::Writer`] or an [`Output::Discard`] has nothing to come back to and runs
 /// fresh.
@@ -241,7 +242,8 @@ pub type ByteStream = BoxStream<'static, Result<Bytes, Error>>;
 
 /// A pluggable byte source: it reports a resource's size and serves byte ranges.
 ///
-/// Implementations exist per protocol (HTTP, S3, a bifrost peer). The engine validates that a source
+/// Implementations exist per protocol (HTTP, S3, IPFS, and can be written for any other byte source).
+/// The engine validates that a source
 /// honored the exact range it was asked for, so a misbehaving source becomes an [`Error`], never a
 /// silent corruption.
 #[allow(async_fn_in_trait)]
@@ -322,3 +324,17 @@ pub enum Error {
 
 /// A boxed underlying error, kept as the source of an [`Error`].
 pub type BoxError = Box<dyn core::error::Error + Send + Sync + 'static>;
+
+impl Error {
+    /// Wrap an underlying transport failure (an HTTP/S3/IPFS error, an IO error) as the source of a
+    /// [`Error::Transport`].
+    pub(crate) fn transport(error: impl core::error::Error + Send + Sync + 'static) -> Self {
+        Error::Transport(Box::new(error))
+    }
+
+    /// A transport failure carrying a fixed diagnostic: a protocol violation the engine detected itself
+    /// (a short read, a mis-sized chunk, a malformed response) rather than one the transport reported.
+    pub(crate) fn detail(message: &str) -> Self {
+        Error::Transport(Box::new(std::io::Error::other(message.to_owned())))
+    }
+}

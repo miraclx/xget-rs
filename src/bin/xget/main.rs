@@ -168,7 +168,7 @@ async fn run() -> eyre::Result<()> {
     // The headers were validated into typed pairs at parse time; assemble them into a map.
     let mut headers = HeaderMap::new();
     for (name, value) in &cli.headers {
-        headers.insert(name.clone(), value.clone());
+        headers.insert(HeaderName::clone(name), HeaderValue::clone(value));
     }
     let source = build_source(&cli, &headers).await?;
     let mode = resolve_mode(&cli);
@@ -183,7 +183,7 @@ async fn run() -> eyre::Result<()> {
         Sink::File => Some(resolve_output(&cli, probe.as_ref())?),
         // A stream sink writes to the special file exactly as given: no name inference, no clobber check
         // (writing to the pipe or device is the point), no `.xget` beside it.
-        Sink::Stream => cli.output.clone(),
+        Sink::Stream => Option::clone(&cli.output),
         Sink::Stdout | Sink::Discard => None,
     };
     // Auto-resume: an interrupted download leaves a `.xget` control file beside the output, and its
@@ -207,13 +207,13 @@ async fn run() -> eyre::Result<()> {
     // `--expect` was parsed to a literal digest or a checksum-file URL at parse time; resolve it now,
     // fetching the sidecar if needed, to an optional pinned algorithm and the expected hex.
     let mut expected = match &cli.expect {
-        Some(expect) => Some(resolve_expect(expect.clone(), cli.endpoint_url.as_deref()).await?),
+        Some(expect) => Some(resolve_expect(Expect::clone(expect), cli.endpoint_url.as_deref()).await?),
         None => None,
     };
     // With no explicit --expect, adopt a checksum the source vouches for (e.g. an S3 stored checksum),
     // so the download is verified against it for free.
     if expected.is_none()
-        && let Some((algo, hex)) = probe.as_ref().and_then(|probe| probe.checksum.clone())
+        && let Some((algo, hex)) = probe.as_ref().and_then(|probe| Option::clone(&probe.checksum))
     {
         if mode != ProgressMode::Json {
             eprintln!(
@@ -342,18 +342,18 @@ impl Source for AnySource {
 /// URL ignores them.
 async fn build_source(cli: &Cli, headers: &HeaderMap) -> eyre::Result<AnySource> {
     if let Some(rest) = cli.url.strip_prefix("s3://") {
-        return build_s3_source(rest, cli.endpoint_url.clone()).await;
+        return build_s3_source(rest, Option::clone(&cli.endpoint_url)).await;
     }
     if let Some(rest) = cli.url.strip_prefix("ipfs://") {
-        return build_ipfs_source(rest, cli.ipfs_gateway.clone());
+        return build_ipfs_source(rest, Option::clone(&cli.ipfs_gateway));
     }
     // The primary plus any --mirror URLs, tried in order on failure. With no mirrors this is just the
     // primary, so there is one download path.
-    let primary = HttpSource::new(&cli.url, headers.clone())?;
+    let primary = HttpSource::new(&cli.url, HeaderMap::clone(headers))?;
     let mirrors = cli
         .mirrors
         .iter()
-        .map(|url| HttpSource::new(url, headers.clone()))
+        .map(|url| HttpSource::new(url, HeaderMap::clone(headers)))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(AnySource::Http(Mirrors::new(primary, mirrors)))
 }
@@ -719,7 +719,7 @@ fn resolve_output(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<PathBuf> {
         }
     };
     // A complete file at the destination is never clobbered without -f. A resume, by contrast, works on
-    // the sibling `.part` (which is not this path), so it is not gated here.
+    // the sibling `.xget` (which is not this path), so it is not gated here.
     if path.exists() && !cli.overwrite {
         eyre::bail!("{} already exists (use -f to overwrite)", path.display());
     }
@@ -736,7 +736,7 @@ fn resolve_output(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<PathBuf> {
 /// Infer an output filename: the resource's `Content-Disposition` if the server offered one in the
 /// probe, otherwise the URL's last path segment.
 fn infer_name(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<String> {
-    if let Some(name) = probe.and_then(|probe| probe.filename.clone()) {
+    if let Some(name) = probe.and_then(|probe| Option::clone(&probe.filename)) {
         return Ok(name);
     }
     url_basename(&cli.url)

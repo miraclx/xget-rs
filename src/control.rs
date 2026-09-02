@@ -147,11 +147,13 @@ impl Writer {
         }
         let _ = writeln!(trailer_text, "algo {}", checksum.name());
         let trailer = trailer_text.len() as u64;
-        file.seek(SeekFrom::Start(total)).await.map_err(io)?;
+        file.seek(SeekFrom::Start(total))
+            .await
+            .map_err(Error::transport)?;
         let mut buffer = trailer_text.into_bytes();
         buffer.extend_from_slice(&footer_bytes(total, trailer));
-        file.write_all(&buffer).await.map_err(io)?;
-        file.flush().await.map_err(io)?;
+        file.write_all(&buffer).await.map_err(Error::transport)?;
+        file.flush().await.map_err(Error::transport)?;
         Ok(Writer {
             file,
             total,
@@ -163,11 +165,11 @@ impl Writer {
     /// already validated the footer (via [`read`]) and that its total matches.
     pub(crate) async fn open(path: &Path, total: u64) -> Result<Writer, Error> {
         let file = open_rw(path).await?;
-        let size = file.metadata().await.map_err(io)?.len();
+        let size = file.metadata().await.map_err(Error::transport)?.len();
         let trailer = size
             .checked_sub(total)
             .and_then(|rest| rest.checked_sub(FOOTER))
-            .ok_or_else(|| detail("control file is smaller than its own layout"))?;
+            .ok_or_else(|| Error::detail("control file is smaller than its own layout"))?;
         Ok(Writer {
             file,
             total,
@@ -189,17 +191,23 @@ impl Writer {
         self.file
             .seek(SeekFrom::Start(self.total + self.trailer))
             .await
-            .map_err(io)?;
-        self.file.write_all(&buffer).await.map_err(io)?;
+            .map_err(Error::transport)?;
+        self.file
+            .write_all(&buffer)
+            .await
+            .map_err(Error::transport)?;
         self.trailer = trailer;
-        self.file.flush().await.map_err(io)
+        self.file.flush().await.map_err(Error::transport)
     }
 
     /// Truncate the trailer and footer away, leaving the file a byte-exact image of the resource, and
     /// flush. The caller renames it into place afterward.
     pub(crate) async fn finish(&mut self) -> Result<(), Error> {
-        self.file.set_len(self.total).await.map_err(io)?;
-        self.file.flush().await.map_err(io)
+        self.file
+            .set_len(self.total)
+            .await
+            .map_err(Error::transport)?;
+        self.file.flush().await.map_err(Error::transport)
     }
 }
 
@@ -220,13 +228,5 @@ async fn open_rw(path: &Path) -> Result<File, Error> {
         .write(true)
         .open(path)
         .await
-        .map_err(io)
-}
-
-fn io(error: std::io::Error) -> Error {
-    Error::Transport(Box::new(error))
-}
-
-fn detail(message: &str) -> Error {
-    Error::Transport(Box::new(std::io::Error::other(message.to_owned())))
+        .map_err(Error::transport)
 }

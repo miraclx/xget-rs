@@ -206,8 +206,8 @@ fn redraw(live: &mut Live) {
 }
 
 /// Compose the bar block: an aggregate header line over the per-chunk line when multi, otherwise a
-/// single aggregate bar. The readout (percent, speed, eta, sizes) is xget's to write; xprogress only
-/// renders the bars.
+/// single aggregate bar. The readout (percent, speed, eta, sizes) is written here; the `xprogress` crate
+/// only renders the bars.
 fn frame(live: &Live) -> String {
     let meter = &live.meter;
     let pct = meter.percent();

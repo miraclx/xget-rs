@@ -49,7 +49,7 @@ impl IpfsSource {
             None => (reference, String::new()),
         };
         let cid = Cid::try_from(cid_text)
-            .map_err(|error| detail(&format!("invalid IPFS CID: {error}")))?;
+            .map_err(|error| Error::detail(&format!("invalid IPFS CID: {error}")))?;
         let gateway = resolve_gateway(gateway);
         let url = format!("{gateway}/ipfs/{cid_text}{path}");
         let http = HttpSource::new(&url, HeaderMap::new())?;
@@ -71,11 +71,11 @@ impl Source for IpfsSource {
         // The CID is the content's address; when it hashes the raw bytes, adopt it so the download is
         // verified against its own address (unless the gateway already vouched for something).
         if probe.checksum.is_none() {
-            probe.checksum = self.checksum.clone();
+            probe.checksum = Option::clone(&self.checksum);
         }
         // The CID addresses the content itself, so it is a stronger, gateway-independent validator than
         // whatever ETag a particular gateway happens to return.
-        probe.validator = Some(self.identity.clone());
+        probe.validator = Some(String::clone(&self.identity));
         Ok(probe)
     }
 
@@ -124,9 +124,4 @@ pub(crate) fn checksum_from_cid(cid: &Cid) -> Option<(Checksum, String)> {
         _ => return None,
     };
     Some((algorithm, hex::encode(multihash.digest())))
-}
-
-/// Build a transport error carrying `message`.
-fn detail(message: &str) -> Error {
-    Error::Transport(Box::new(std::io::Error::other(message.to_owned())))
 }

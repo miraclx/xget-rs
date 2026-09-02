@@ -17,7 +17,7 @@ pub enum Checksum {
     Sha256,
     /// SHA-512.
     Sha512,
-    /// BLAKE3, the hash theia/iris speak.
+    /// BLAKE3, fast and parallelizable.
     Blake3,
 }
 

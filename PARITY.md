@@ -17,7 +17,7 @@ Honest tracking of libxget-js against xget-rs, so "done" means done. ✅ done ·
 | resume a partial FILE across runs | ✅ | auto-resumes a partial; `-c` forces, `--restart` fresh; prefix folded into the verify pass |
 | start from offset (`-i, --start-pos`) | ➖ | resume is range-based and automatic; a raw start offset yields a partial that can't be verified against a whole-resource checksum, so it is a non-goal (see below) |
 | inactivity timeout (`--timeout`) | ✅ | per-read; a ranged chunk's retry resumes it |
-| pluggable sources | ✅ | `Source` seam with HTTP, S3, and IPFS impls; a bifrost peer planned |
+| pluggable sources | ✅ | `Source` seam with HTTP, S3, and IPFS impls; open to any other byte source |
 | S3 / S3-compatible source (`s3` feature) | ✅ | signs or anonymous, workdir `.env`, `--endpoint-url`, adopts a stored checksum |
 | IPFS source (`ipfs` feature) | ✅ | `ipfs://<cid>` via an HTTP gateway; a raw-bytes CID self-verifies |
 | mirror / failover (`--mirror`) | ✅ | `Mirrors` source, tried in order per operation |

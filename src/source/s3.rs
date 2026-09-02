@@ -73,14 +73,14 @@ impl Source for S3Source {
             .checksum_mode(ChecksumMode::Enabled)
             .send()
             .await
-            .map_err(transport)?;
+            .map_err(Error::transport)?;
 
         // S3 always reports the object's size on a successful head; a missing length is a broken
         // response we cannot plan a chunked download against, so it is an error rather than a guess.
         let length = head
             .content_length()
             .and_then(|value| u64::try_from(value).ok())
-            .ok_or_else(|| detail("HeadObject response has no content length"))?;
+            .ok_or_else(|| Error::detail("HeadObject response has no content length"))?;
         let supports_ranges = head
             .accept_ranges()
             .is_some_and(|value| value.eq_ignore_ascii_case("bytes"));
@@ -119,13 +119,13 @@ impl Source for S3Source {
             // GET with exactly those bytes, so unlike HTTP there is no 200-with-whole-body case to guard.
             request = request.range(format!("bytes={}-{}", range.start, range.end - 1));
         }
-        let output = request.send().await.map_err(transport)?;
+        let output = request.send().await.map_err(Error::transport)?;
 
         // Adapt the SDK's ByteStream into ours: read it as an AsyncRead and re-chunk with ReaderStream,
         // mapping each read error into our transport error.
         let reader = output.body.into_async_read();
         Ok(Box::pin(
-            ReaderStream::new(reader).map(|chunk| chunk.map_err(transport)),
+            ReaderStream::new(reader).map(|chunk| chunk.map_err(Error::transport)),
         ))
     }
 }
@@ -165,12 +165,4 @@ fn stored_checksum(
         }
     }
     None
-}
-
-fn transport(error: impl core::error::Error + Send + Sync + 'static) -> Error {
-    Error::Transport(Box::new(error))
-}
-
-fn detail(message: &str) -> Error {
-    Error::Transport(Box::new(std::io::Error::other(message.to_owned())))
 }

@@ -76,10 +76,10 @@ pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
     // writers happens after the download completes, so a resumed run simply delivers the full stream once.
     let part = scratch_path(&output);
     let can_resume = first_file(&output).is_some();
-    // A throwaway temp scratch (a writer/discard output) is removed on any early exit — an error or a
-    // dropped/cancelled future — so an interrupted stream does not leave a partial in the temp dir. A
+    // A throwaway temp scratch (a writer/discard output) is removed on any early exit, an error or a
+    // dropped/cancelled future, so an interrupted stream does not leave a partial in the temp dir. A
     // file's `.xget` is the resume artifact and is never guarded.
-    let _scratch_guard = (!can_resume).then(|| ScratchGuard(part.clone()));
+    let _scratch_guard = (!can_resume).then(|| ScratchGuard(PathBuf::clone(&part)));
     let options = Options {
         resume: options.resume && can_resume,
         ..options
@@ -142,7 +142,7 @@ pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
         hash
     } else {
         if options.resume && file_len(&part).await > 0 {
-            return Err(detail(
+            return Err(Error::detail(
                 "cannot resume: the source does not support byte ranges",
             ));
         }
@@ -196,14 +196,18 @@ fn first_file<'a>(output: &Output<'a>) -> Option<&'a Path> {
 /// interrupt leaves at most the one `.xget`.
 async fn distribute(part: &Path, total: u64, output: Output<'_>) -> Result<(), Error> {
     match output {
-        Output::File(path) => tokio::fs::rename(part, path).await.map_err(io)?,
+        Output::File(path) => tokio::fs::rename(part, path)
+            .await
+            .map_err(Error::transport)?,
         Output::Writer(writer) => {
             copy_out(part, total, writer).await?;
             let _ = tokio::fs::remove_file(part).await;
         }
         Output::Tee { file, writer } => {
             copy_out(part, total, writer).await?;
-            tokio::fs::rename(part, file).await.map_err(io)?;
+            tokio::fs::rename(part, file)
+                .await
+                .map_err(Error::transport)?;
         }
         Output::Discard => {
             let _ = tokio::fs::remove_file(part).await;
@@ -219,22 +223,27 @@ async fn copy_out(
     total: u64,
     sink: &mut (dyn AsyncWrite + Unpin),
 ) -> Result<(), Error> {
-    let mut reader = File::open(part).await.map_err(io)?;
+    let mut reader = File::open(part).await.map_err(Error::transport)?;
     let mut buffer = vec![0u8; 128 * 1024];
     let mut remaining = total;
     while remaining > 0 {
         let want = remaining.min(buffer.len() as u64) as usize;
-        let read = reader.read(&mut buffer[..want]).await.map_err(io)?;
+        let read = reader
+            .read(&mut buffer[..want])
+            .await
+            .map_err(Error::transport)?;
         if read == 0 {
             return Err(Error::LengthMismatch {
                 expected: total,
                 received: total - remaining,
             });
         }
-        sink.write_all(&buffer[..read]).await.map_err(io)?;
+        sink.write_all(&buffer[..read])
+            .await
+            .map_err(Error::transport)?;
         remaining -= read as u64;
     }
-    sink.flush().await.map_err(io)
+    sink.flush().await.map_err(Error::transport)
 }
 
 /// The sibling `.xget` path a download writes to before it is renamed into place: the output name with
@@ -305,7 +314,7 @@ async fn resume_plan(
     if file_len(part).await == 0 {
         Ok(fresh())
     } else {
-        Err(detail(
+        Err(Error::detail(
             "cannot resume: no saved state in the partial file (use --restart to start over)",
         ))
     }
@@ -334,8 +343,8 @@ async fn file_len(part: &Path) -> u64 {
 /// be written. Only for a fresh download: a resume keeps its existing file (data and control trailer)
 /// untouched, since truncating here would strip the trailer.
 async fn allocate_fresh(part: &Path, total: u64) -> Result<(), Error> {
-    let file = File::create(part).await.map_err(io)?;
-    file.set_len(total).await.map_err(io)?;
+    let file = File::create(part).await.map_err(Error::transport)?;
+    file.set_len(total).await.map_err(Error::transport)?;
     Ok(())
 }
 
@@ -365,7 +374,7 @@ async fn fetch_scatter<S: Source, P: Progress + ?Sized>(
         progress.restore(received);
     }
     let shared = Rc::new(Shared {
-        received: RefCell::new(received.clone()),
+        received: RefCell::new(Vec::clone(received)),
         notify: Notify::new(),
         failed: Cell::new(false),
     });
@@ -470,7 +479,10 @@ impl Sink<'_> {
         timeout: Option<Duration>,
         progress: &P,
     ) -> Result<(), Error> {
-        self.file.seek(SeekFrom::Start(*offset)).await.map_err(io)?;
+        self.file
+            .seek(SeekFrom::Start(*offset))
+            .await
+            .map_err(Error::transport)?;
         let mut stream = source
             .fetch(Some(ByteRange {
                 start: *offset,
@@ -480,12 +492,17 @@ impl Sink<'_> {
         while let Some(chunk) = next_chunk(&mut stream, timeout).await? {
             let len = chunk.len() as u64;
             if *offset + len > self.range.end {
-                return Err(detail("source sent more bytes than the requested range"));
+                return Err(Error::detail(
+                    "source sent more bytes than the requested range",
+                ));
             }
-            self.file.write_all(&chunk).await.map_err(io)?;
+            self.file
+                .write_all(&chunk)
+                .await
+                .map_err(Error::transport)?;
             // Flush before recording, so the bytes are visible to the verifier's separate read handle
             // (a buffered write would otherwise let it read a stale hole and hash the wrong bytes).
-            self.file.flush().await.map_err(io)?;
+            self.file.flush().await.map_err(Error::transport)?;
             *offset += len;
             self.shared.received.borrow_mut()[self.index] = *offset - self.range.start;
             self.shared.notify.notify_one();
@@ -533,7 +550,7 @@ async fn scatter_one<S: Source, P: Progress + ?Sized>(
         .write(true)
         .open(part)
         .await
-        .map_err(io)?;
+        .map_err(Error::transport)?;
     let mut sink = Sink {
         index,
         range,
@@ -607,7 +624,7 @@ async fn verify<P: Progress + ?Sized>(
     progress: &P,
 ) -> Result<Option<String>, Error> {
     let mut hasher = checksum.hasher();
-    let mut reader = File::open(part).await.map_err(io)?;
+    let mut reader = File::open(part).await.map_err(Error::transport)?;
     let mut buffer = vec![0u8; 128 * 1024];
 
     // The plan tiles the whole resource from zero, so verifying is a single in-order sweep of the
@@ -617,7 +634,7 @@ async fn verify<P: Progress + ?Sized>(
 
     loop {
         if shared.failed.get() {
-            return Err(detail("a chunk failed before it could be verified"));
+            return Err(Error::detail("a chunk failed before it could be verified"));
         }
         let frontier = contiguous_run(&shared.received.borrow(), ranges);
         while hashed < frontier {
@@ -668,7 +685,10 @@ async fn read_into(
     let mut remaining = count;
     while remaining > 0 {
         let want = remaining.min(buffer.len() as u64) as usize;
-        let read = reader.read(&mut buffer[..want]).await.map_err(io)?;
+        let read = reader
+            .read(&mut buffer[..want])
+            .await
+            .map_err(Error::transport)?;
         if read == 0 {
             return Err(Error::LengthMismatch {
                 expected: count,
@@ -699,7 +719,9 @@ async fn fetch_stream<S: Source, P: Progress + ?Sized>(
     // A file or a tee streams to the scratch (delivered after); a lone writer goes live; a
     // discard writes nowhere.
     let mut file = match output {
-        Output::File(_) | Output::Tee { .. } => Some(File::create(part).await.map_err(io)?),
+        Output::File(_) | Output::Tee { .. } => {
+            Some(File::create(part).await.map_err(Error::transport)?)
+        }
         Output::Writer(_) | Output::Discard => None,
     };
     let mut hasher = options.checksum.hasher();
@@ -713,10 +735,10 @@ async fn fetch_stream<S: Source, P: Progress + ?Sized>(
         match output {
             Output::File(_) | Output::Tee { .. } => {
                 if let Some(file) = file.as_mut() {
-                    file.write_all(&chunk).await.map_err(io)?;
+                    file.write_all(&chunk).await.map_err(Error::transport)?;
                 }
             }
-            Output::Writer(sink) => sink.write_all(&chunk).await.map_err(io)?,
+            Output::Writer(sink) => sink.write_all(&chunk).await.map_err(Error::transport)?,
             Output::Discard => {}
         }
         written += len;
@@ -726,10 +748,10 @@ async fn fetch_stream<S: Source, P: Progress + ?Sized>(
     match output {
         Output::File(_) | Output::Tee { .. } => {
             if let Some(file) = file.as_mut() {
-                file.flush().await.map_err(io)?;
+                file.flush().await.map_err(Error::transport)?;
             }
         }
-        Output::Writer(sink) => sink.flush().await.map_err(io)?,
+        Output::Writer(sink) => sink.flush().await.map_err(Error::transport)?,
         Output::Discard => {}
     }
     if written != total {
@@ -750,7 +772,7 @@ async fn next_chunk(
     let next = match timeout {
         Some(limit) => tokio::time::timeout(limit, stream.next())
             .await
-            .map_err(|_| detail("timed out waiting for data"))?,
+            .map_err(|_| Error::detail("timed out waiting for data"))?,
         None => stream.next().await,
     };
     next.transpose()
@@ -785,7 +807,7 @@ impl Drop for ScratchGuard {
 
 /// Remove throwaway scratch files (`xget-<pid>-<n>.xget`) left in the temp dir by earlier runs whose
 /// process is gone: best-effort startup housekeeping so interrupted writer/discard downloads (a Ctrl-C,
-/// a kill, a crash — cases the in-process guard cannot catch) do not pile up. A live download's scratch,
+/// a kill, a crash: cases the in-process guard cannot catch) do not pile up. A live download's scratch,
 /// including this process's own, is never touched. A no-op off unix, where the liveness check is
 /// unavailable.
 pub async fn sweep_orphans() {
@@ -853,12 +875,4 @@ fn pid_alive(pid: u32) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn pid_alive(_pid: u32) -> bool {
     true
-}
-
-fn io(error: std::io::Error) -> Error {
-    Error::Transport(Box::new(error))
-}
-
-fn detail(message: &str) -> Error {
-    Error::Transport(Box::new(std::io::Error::other(message.to_owned())))
 }

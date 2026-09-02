@@ -17,7 +17,7 @@
 //! # }
 //! ```
 //!
-//! It is a thin layer over the engine's internal download routine; this builder is the entry point.
+//! This builder is the entry point; it configures a download and hands it to the engine.
 
 use core::time::Duration;
 
@@ -39,8 +39,8 @@ pub fn from<S: Source>(source: S) -> Download<'static, S> {
     Download::new(source)
 }
 
-/// A pending download: a source, its [`Options`], and a progress reporter, configured by chaining and
-/// run by [`Download::write`]. Built by [`get`] or [`from`].
+/// A pending download: a source, its options, and a progress reporter, configured by chaining and run by
+/// [`Download::write`]. Built by [`get`] or [`from`].
 #[must_use = "a Download does nothing until you call .write(output)"]
 pub struct Download<'p, S: Source> {
     source: S,

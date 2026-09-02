@@ -17,11 +17,11 @@ impl HttpSource {
     /// Build a source for `url`, sharing one connection pool across every chunk. `headers` are sent
     /// with every request.
     pub fn new(url: &str, headers: reqwest::header::HeaderMap) -> Result<Self, Error> {
-        let url = reqwest::Url::parse(url).map_err(transport)?;
+        let url = reqwest::Url::parse(url).map_err(Error::transport)?;
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .build()
-            .map_err(transport)?;
+            .map_err(Error::transport)?;
         Ok(Self { client, url })
     }
 }
@@ -35,11 +35,11 @@ impl Source for HttpSource {
         // Ask for a single byte: a range-capable server answers 206 with the total in Content-Range.
         let response = self
             .client
-            .get(self.url.clone())
+            .get(reqwest::Url::clone(&self.url))
             .header(RANGE, "bytes=0-0")
             .send()
             .await
-            .map_err(transport)?;
+            .map_err(Error::transport)?;
 
         let filename = response
             .headers()
@@ -69,7 +69,7 @@ impl Source for HttpSource {
                 .get(CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
                 .and_then(content_range_total)
-                .ok_or_else(|| detail("206 without a parseable Content-Range total"))?;
+                .ok_or_else(|| Error::detail("206 without a parseable Content-Range total"))?;
             return Ok(Probe {
                 length,
                 supports_ranges: true,
@@ -82,7 +82,7 @@ impl Source for HttpSource {
         if response.status().is_success() {
             let length = response
                 .content_length()
-                .ok_or_else(|| detail("response has no Content-Length"))?;
+                .ok_or_else(|| Error::detail("response has no Content-Length"))?;
             return Ok(Probe {
                 length,
                 supports_ranges: false,
@@ -92,19 +92,19 @@ impl Source for HttpSource {
                 validator,
             });
         }
-        Err(detail(&format!(
+        Err(Error::detail(&format!(
             "probe returned HTTP {}",
             response.status()
         )))
     }
 
     async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
-        let mut request = self.client.get(self.url.clone());
+        let mut request = self.client.get(reqwest::Url::clone(&self.url));
         if let Some(range) = range {
             // HTTP ranges are inclusive on both ends; our ByteRange end is exclusive.
             request = request.header(RANGE, format!("bytes={}-{}", range.start, range.end - 1));
         }
-        let response = request.send().await.map_err(transport)?;
+        let response = request.send().await.map_err(Error::transport)?;
 
         match range {
             Some(range) => {
@@ -124,7 +124,7 @@ impl Source for HttpSource {
             }
             None => {
                 if !response.status().is_success() {
-                    return Err(detail(&format!(
+                    return Err(Error::detail(&format!(
                         "fetch returned HTTP {}",
                         response.status()
                     )));
@@ -135,7 +135,7 @@ impl Source for HttpSource {
         Ok(Box::pin(
             response
                 .bytes_stream()
-                .map(|chunk| chunk.map_err(transport)),
+                .map(|chunk| chunk.map_err(Error::transport)),
         ))
     }
 }
@@ -192,12 +192,4 @@ fn decode_extended_filename(raw: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
-}
-
-fn transport(error: impl core::error::Error + Send + Sync + 'static) -> Error {
-    Error::Transport(Box::new(error))
-}
-
-fn detail(message: &str) -> Error {
-    Error::Transport(Box::new(std::io::Error::other(message.to_owned())))
 }

@@ -207,13 +207,17 @@ async fn run() -> eyre::Result<()> {
     // `--expect` was parsed to a literal digest or a checksum-file URL at parse time; resolve it now,
     // fetching the sidecar if needed, to an optional pinned algorithm and the expected hex.
     let mut expected = match &cli.expect {
-        Some(expect) => Some(resolve_expect(Expect::clone(expect), cli.endpoint_url.as_deref()).await?),
+        Some(expect) => {
+            Some(resolve_expect(Expect::clone(expect), cli.endpoint_url.as_deref()).await?)
+        }
         None => None,
     };
     // With no explicit --expect, adopt a checksum the source vouches for (e.g. an S3 stored checksum),
     // so the download is verified against it for free.
     if expected.is_none()
-        && let Some((algo, hex)) = probe.as_ref().and_then(|probe| Option::clone(&probe.checksum))
+        && let Some((algo, hex)) = probe
+            .as_ref()
+            .and_then(|probe| Option::clone(&probe.checksum))
     {
         if mode != ProgressMode::Json {
             eprintln!(
@@ -580,7 +584,10 @@ async fn show_info(cli: &Cli) -> eyre::Result<()> {
     // Point at the control file itself: `xget <file>.xget` reads the URL it records and finishes the
     // download. (Handing the output path would be read as a URL and fail.)
     match info.source {
-        Some(_) => println!("Status:     resumable   ->  xget {}", control_path.display()),
+        Some(_) => println!(
+            "Status:     resumable   ->  xget {}",
+            control_path.display()
+        ),
         None => println!("Status:     resumable (re-run with the original URL to resume)"),
     }
     Ok(())

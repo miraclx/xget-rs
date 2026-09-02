@@ -28,7 +28,7 @@ use xbytes::sizes::MEBI_BYTE;
 use crate::checksum::Hasher;
 use crate::control::Writer;
 use crate::plan::{plan_range, plan_resume};
-use crate::{ByteRange, Checksum, Error, Options, Output, Progress, Source, control};
+use crate::{ByteRange, Checksum, Error, Options, Output, Probe, Progress, Source, control};
 
 /// Bumped for each temp scratch a `Writer`/`Discard` download needs, so concurrent downloads in one
 /// process never collide on the same `.xget` scratch name.
@@ -63,7 +63,7 @@ pub struct Report {
 /// total length is gated, so the returned digest certifies the resource.
 pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
     source: &S,
-    mut output: Output<'_>,
+    output: Output<'_>,
     options: Options,
     progress: &P,
 ) -> Result<Report, Error> {
@@ -92,72 +92,13 @@ pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
         "probed resource"
     );
 
-    // A sequential download uses the single-stream path even for a range source: one ordered connection,
-    // no scatter, no scratch for a writer/discard sink. It trades parallel speed for zero holding space.
+    // Pick the machine: a range-capable resource scatters into the scratch in parallel and verifies in
+    // order; one that is not (or a run forced sequential) streams and hashes inline. Each arm owns its
+    // own finalize, so this reads as a straight router.
     let hash = if probe.supports_ranges && !options.sequential {
-        let plan = resume_plan(&part, probe.length, probe.validator.as_deref(), &options).await?;
-        tracing::debug!(
-            chunks = plan.ranges.len(),
-            already_done = plan
-                .received
-                .iter()
-                .zip(&plan.ranges)
-                .filter(|(received, range)| **received >= range.len())
-                .count(),
-            resumed = plan.resumed,
-            "planned download"
-        );
-        // The control writer lives in the `.xget` file itself: a resume reopens its trailer to append
-        // to, a fresh run allocates the sparse data region and writes an empty trailer.
-        let writer = if plan.resumed {
-            Writer::open(&part, probe.length).await?
-        } else {
-            allocate_fresh(&part, probe.length).await?;
-            Writer::create(
-                &part,
-                probe.length,
-                probe.validator.as_deref(),
-                source.identity().as_deref(),
-                options.checksum,
-            )
-            .await?
-        };
-        let writer = Rc::new(Mutex::new(writer));
-        let hash = fetch_scatter(
-            source,
-            &part,
-            probe.length,
-            &plan,
-            options,
-            progress,
-            &writer,
-        )
-        .await?;
-        // Strip the control trailer and footer, leaving the scratch a byte-exact image `[0, total)`.
-        writer.lock().await.finish().await?;
-        // Deliver the verified scratch to the sink: rename it to a file, copy it out to a writer, both
-        // for a tee, or drop it for a discard. (A writer re-reads the scratch for now; it could later
-        // stream during verify.)
-        distribute(&part, probe.length, output).await?;
-        hash
+        scatter_download(source, &part, &probe, options, progress, output).await?
     } else {
-        // Only a genuine non-range source is unresumable for this reason. A range-capable source taken
-        // down this path was forced sequential (`--sequential`, or the CLI auto-switch for a huge pipe); a
-        // single stream simply cannot resume, so it restarts and the truncating create below discards any
-        // leftover partial.
-        if options.resume && !probe.supports_ranges && file_len(&part).await > 0 {
-            return Err(Error::detail(
-                "cannot resume: the source does not support byte ranges",
-            ));
-        }
-        // The single stream writes straight to the sink: a file or a tee to the scratch (then
-        // delivered), a lone writer live with no scratch, a discard nowhere.
-        let hash =
-            fetch_stream(source, &mut output, &part, probe.length, options, progress).await?;
-        if matches!(output, Output::File(_) | Output::Tee { .. }) {
-            distribute(&part, probe.length, output).await?;
-        }
-        hash
+        stream_download(source, output, &part, &probe, options, progress).await?
     };
 
     progress.finish();
@@ -165,6 +106,88 @@ pub(crate) async fn download<S: Source, P: Progress + ?Sized>(
         length: probe.length,
         hash,
     })
+}
+
+/// Scatter a range-capable resource into the scratch in parallel and verify it in order, then deliver the
+/// finalized image to the sink. The control writer lives in the `.xget` file: a resume reopens its
+/// trailer to append to, a fresh run allocates the sparse data region and writes an empty trailer.
+async fn scatter_download<S: Source, P: Progress + ?Sized>(
+    source: &S,
+    part: &Path,
+    probe: &Probe,
+    options: Options,
+    progress: &P,
+    output: Output<'_>,
+) -> Result<Option<String>, Error> {
+    let plan = resume_plan(part, probe.length, probe.validator.as_deref(), &options).await?;
+    tracing::debug!(
+        chunks = plan.ranges.len(),
+        already_done = plan
+            .received
+            .iter()
+            .zip(&plan.ranges)
+            .filter(|(received, range)| **received >= range.len())
+            .count(),
+        resumed = plan.resumed,
+        "planned download"
+    );
+    let writer = if plan.resumed {
+        Writer::open(part, probe.length).await?
+    } else {
+        allocate_fresh(part, probe.length).await?;
+        Writer::create(
+            part,
+            probe.length,
+            probe.validator.as_deref(),
+            source.identity().as_deref(),
+            options.checksum,
+        )
+        .await?
+    };
+    let writer = Rc::new(Mutex::new(writer));
+    let hash = fetch_scatter(
+        source,
+        part,
+        probe.length,
+        &plan,
+        options,
+        progress,
+        &writer,
+    )
+    .await?;
+    // Strip the control trailer and footer, leaving the scratch a byte-exact image `[0, total)`.
+    writer.lock().await.finish().await?;
+    // Deliver the verified scratch to the sink: rename it to a file, copy it out to a writer, both for a
+    // tee, or drop it for a discard. (A writer re-reads the scratch for now; it could later stream during
+    // verify.)
+    distribute(part, probe.length, output).await?;
+    Ok(hash)
+}
+
+/// Stream a resource that cannot serve ranges (or a run forced sequential) as one ordered pass, hashing
+/// inline. Writes straight to the sink: a file or a tee to the scratch (then delivered), a lone writer
+/// live with no scratch, a discard nowhere.
+async fn stream_download<S: Source, P: Progress + ?Sized>(
+    source: &S,
+    mut output: Output<'_>,
+    part: &Path,
+    probe: &Probe,
+    options: Options,
+    progress: &P,
+) -> Result<Option<String>, Error> {
+    // Only a genuine non-range source is unresumable for this reason. A range-capable source taken down
+    // this path was forced sequential (`--sequential`, or the CLI auto-switch for a huge pipe); a single
+    // stream simply cannot resume, so it restarts and the truncating create below discards any partial.
+    if options.resume && !probe.supports_ranges && file_len(part).await > 0 {
+        return Err(Error::detail(
+            "cannot resume: the source does not support byte ranges",
+        ));
+    }
+    let hash = fetch_stream(source, &mut output, part, probe.length, options, progress).await?;
+    if matches!(output, Output::File(_) | Output::Tee { .. }) {
+        distribute(part, probe.length, output).await?;
+    }
+    Ok(hash)
 }
 
 /// The `.xget` scratch a download scatters into: beside the output for a [`Output::File`] (so it can be
@@ -722,13 +745,21 @@ async fn fetch_stream<S: Source, P: Progress + ?Sized>(
     progress: &P,
 ) -> Result<Option<String>, Error> {
     progress.start(&[total]);
-    // A file or a tee streams to the scratch (delivered after); a lone writer goes live; a
-    // discard writes nowhere.
+    // A file or a tee streams to the scratch (delivered after); a lone writer goes live; a discard writes
+    // nowhere. Hold the scratch handle, then resolve the one write target once, so the loop and the final
+    // flush do not re-decide where bytes go on every chunk.
     let mut file = match output {
         Output::File(_) | Output::Tee { .. } => {
             Some(File::create(part).await.map_err(Error::transport)?)
         }
         Output::Writer(_) | Output::Discard => None,
+    };
+    let mut sink: Option<&mut (dyn AsyncWrite + Unpin)> = match output {
+        Output::File(_) | Output::Tee { .. } => file
+            .as_mut()
+            .map(|file| file as &mut (dyn AsyncWrite + Unpin)),
+        Output::Writer(writer) => Some(&mut **writer),
+        Output::Discard => None,
     };
     let mut hasher = options.checksum.hasher();
     let mut stream = source.fetch(None).await?;
@@ -738,27 +769,15 @@ async fn fetch_stream<S: Source, P: Progress + ?Sized>(
         if let Some(hasher) = hasher.as_mut() {
             hasher.update(&chunk);
         }
-        match output {
-            Output::File(_) | Output::Tee { .. } => {
-                if let Some(file) = file.as_mut() {
-                    file.write_all(&chunk).await.map_err(Error::transport)?;
-                }
-            }
-            Output::Writer(sink) => sink.write_all(&chunk).await.map_err(Error::transport)?,
-            Output::Discard => {}
+        if let Some(sink) = sink.as_mut() {
+            sink.write_all(&chunk).await.map_err(Error::transport)?;
         }
         written += len;
         progress.received(0, len);
         progress.wrote(0, len);
     }
-    match output {
-        Output::File(_) | Output::Tee { .. } => {
-            if let Some(file) = file.as_mut() {
-                file.flush().await.map_err(Error::transport)?;
-            }
-        }
-        Output::Writer(sink) => sink.flush().await.map_err(Error::transport)?,
-        Output::Discard => {}
+    if let Some(sink) = sink.as_mut() {
+        sink.flush().await.map_err(Error::transport)?;
     }
     if written != total {
         return Err(Error::LengthMismatch {

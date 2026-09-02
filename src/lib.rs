@@ -18,9 +18,11 @@
 //! the engine.
 
 use core::time::Duration;
+use std::path::Path;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use tokio::io::AsyncWrite;
 
 mod builder;
 mod checksum;
@@ -39,7 +41,7 @@ pub use crate::engine::{Report, sweep_orphans};
 /// Whether an interrupted download left a resumable partial beside `output`: its `.xget` file with a
 /// valid control trailer. A caller can use this to resume automatically without an explicit request. The
 /// naming and format of the partial are the engine's to own, so a caller need not know them.
-pub async fn resumable(output: &std::path::Path) -> bool {
+pub async fn resumable(output: &Path) -> bool {
     crate::control::is_resumable(&crate::engine::part_path(output)).await
 }
 
@@ -47,7 +49,7 @@ pub async fn resumable(output: &std::path::Path) -> bool {
 /// stored one. This lets a caller resume from the partial alone, with no URL given again: read the URL,
 /// rebuild the source from it, and finish the download. `control_path` is the `.xget` file itself, not
 /// the output it belongs to.
-pub async fn control_source(control_path: &std::path::Path) -> Option<String> {
+pub async fn control_source(control_path: &Path) -> Option<String> {
     crate::control::read(control_path)
         .await
         .and_then(|control| control.source)
@@ -71,7 +73,7 @@ pub struct Inspection {
 /// Summarize a `.xget` control file, or `None` if `control_path` is not a valid control. Offline: it
 /// reads only the local file and never probes the network, so it can identify a stray partial. Powers
 /// `xget --info`.
-pub async fn inspect(control_path: &std::path::Path) -> Option<Inspection> {
+pub async fn inspect(control_path: &Path) -> Option<Inspection> {
     let control = crate::control::read(control_path).await?;
     Some(Inspection {
         source: control.source,
@@ -155,9 +157,9 @@ impl Default for Options {
 /// writers is the receiving writer's own job, so neither is a sink the engine needs to model.
 pub enum Output<'a> {
     /// Persist to a file: scatter into `<path>.xget`, atomic-rename on success. Resumable.
-    File(&'a std::path::Path),
+    File(&'a Path),
     /// Stream verified bytes to a writer (stdout, a socket, a child's stdin). Not resumable.
-    Writer(&'a mut (dyn tokio::io::AsyncWrite + Unpin)),
+    Writer(&'a mut (dyn AsyncWrite + Unpin)),
     /// Verify and keep nothing (a speed test, or /dev/null). Not resumable.
     Discard,
     /// Persist to a resumable file and hand the same verified bytes to a writer: the file is finalized by
@@ -165,29 +167,29 @@ pub enum Output<'a> {
     /// file.
     Tee {
         /// The resumable file, finalized by atomic rename on success.
-        file: &'a std::path::Path,
+        file: &'a Path,
         /// A writer that receives the verified bytes.
-        writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin),
+        writer: &'a mut (dyn AsyncWrite + Unpin),
     },
 }
 
 impl<'a> Output<'a> {
     /// Persist the download to `path`, scattering into `<path>.xget` and atomic-renaming on success.
     /// Takes anything path-like by reference: a `&str`, `&Path`, or `&PathBuf`.
-    pub fn file<P: AsRef<std::path::Path> + ?Sized>(path: &'a P) -> Self {
+    pub fn file<P: AsRef<Path> + ?Sized>(path: &'a P) -> Self {
         Output::File(path.as_ref())
     }
 
     /// Stream the download's verified bytes to `writer` as they are confirmed.
-    pub fn writer(writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin)) -> Self {
+    pub fn writer(writer: &'a mut (dyn AsyncWrite + Unpin)) -> Self {
         Output::Writer(writer)
     }
 
     /// Persist to a resumable `file` and also hand the verified bytes to `writer`: keep a copy and pipe
     /// it onward at once. `file` takes anything path-like by reference, as [`Output::file`] does.
-    pub fn tee<P: AsRef<std::path::Path> + ?Sized>(
+    pub fn tee<P: AsRef<Path> + ?Sized>(
         file: &'a P,
-        writer: &'a mut (dyn tokio::io::AsyncWrite + Unpin),
+        writer: &'a mut (dyn AsyncWrite + Unpin),
     ) -> Self {
         Output::Tee {
             file: file.as_ref(),

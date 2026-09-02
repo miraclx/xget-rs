@@ -7,8 +7,9 @@ use xget::Progress;
 
 use super::Meter;
 
-/// One JSON event per update, to stderr: a `start`, throttled `progress` events, and a `done`. The
-/// numbers are always raw bytes so a consumer can format them itself.
+/// One JSON event per update, to stderr: throttled `progress` events, a `retry` on a dropped chunk, and
+/// a final `end`; `main` adds a `verified` event with the checksum. Byte counts are raw so a consumer can
+/// format them itself; `done` is the cumulative confirmed bytes, `total` the resource length.
 pub(crate) struct JsonProgress {
     meter: RefCell<Option<Meter>>,
 }
@@ -37,7 +38,7 @@ impl Progress for JsonProgress {
             && meter.advance(bytes, Duration::from_millis(200))
         {
             eprintln!(
-                r#"{{"event":"progress","bytes":{},"total":{},"percent":{:.1},"speed":{},"eta":{}}}"#,
+                r#"{{"event":"progress","done":{},"total":{},"percent":{:.1},"speed":{},"eta":{}}}"#,
                 meter.done,
                 meter.total,
                 meter.percent_f64(),
@@ -58,7 +59,7 @@ impl Progress for JsonProgress {
     fn finish(&self) {
         if let Some(meter) = self.meter.borrow().as_ref() {
             eprintln!(
-                r#"{{"event":"end","bytes":{},"total":{},"elapsed":{}}}"#,
+                r#"{{"event":"end","done":{},"total":{},"elapsed":{}}}"#,
                 meter.done,
                 meter.total,
                 meter.elapsed_ms()

@@ -26,10 +26,10 @@ struct Cli {
     /// Where to write the file. If omitted or a directory, the name is taken from the URL.
     output: Option<PathBuf>,
     /// Maximum number of concurrent chunk connections.
-    #[arg(short = 'n', long, default_value_t = 5)]
+    #[arg(short = 'n', long, value_name = "N", default_value_t = 5)]
     chunks: u32,
     /// Retries for each chunk, resuming from its offset. `inf` for unlimited.
-    #[arg(short = 't', long, default_value = "10", value_parser = parse_tries)]
+    #[arg(short = 't', long, value_name = "N", default_value = "10", value_parser = parse_tries)]
     tries: u32,
     /// Save the file under this directory prefix.
     #[arg(short = 'D', long)]
@@ -69,7 +69,7 @@ struct Cli {
     #[arg(long, value_name = "URL")]
     ipfs_gateway: Option<String>,
     /// Checksum to verify the download with: none, md5, sha1, sha256, sha512, or blake3.
-    #[arg(short = 's', long, default_value_t = Checksum::Sha256)]
+    #[arg(short = 's', long, value_name = "ALGO", default_value_t = Checksum::Sha256)]
     checksum: Checksum,
     /// Require the download to match this checksum: `algo:hex`, or bare `hex` using `--checksum`'s
     /// algorithm, or a URL to a checksum file. Exits non-zero on mismatch.
@@ -79,7 +79,7 @@ struct Cli {
     #[arg(long, value_name = "SECS", value_parser = parse_timeout)]
     timeout: Option<Duration>,
     /// Progress output: auto (a bar on a terminal, else plain lines), bar, plain, json, or none.
-    #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
+    #[arg(long, value_enum, value_name = "MODE", default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
     /// Report raw byte counts instead of human-readable sizes.
     #[arg(long)]
@@ -153,6 +153,18 @@ async fn run() -> eyre::Result<()> {
         if let Some(checksum) = checksum {
             cli.checksum = checksum;
         }
+    } else if cli.output.is_none()
+        && !cli.url.contains("://")
+        && Path::new(&cli.url).extension().and_then(|ext| ext.to_str()) == Some("xget")
+    {
+        // A local `.xget` path that could not be resolved to a resume: empty, invalid, or from a source
+        // that recorded no URL. Say so, rather than falling through and fetching the path as a URL (which
+        // fails with a cryptic "relative URL without a base").
+        eyre::bail!(
+            "{} is not a resumable .xget control file (empty, invalid, or it records no source URL); \
+             pass the original URL to start over",
+            cli.url
+        );
     }
     init_tracing(cli.verbose);
     // Best-effort housekeeping: clear temp scratches left by earlier interrupted stream downloads (a
@@ -611,9 +623,17 @@ async fn show_info(cli: &Cli) -> eyre::Result<()> {
         PathBuf::from(with_suffix)
     };
     let Some(info) = xget::inspect(&control_path).await else {
+        // Distinguish a bad `.xget` the user named directly from a finished/plain file with no partial
+        // beside it, so the message points at the real situation.
+        if path.extension().and_then(|ext| ext.to_str()) == Some("xget") {
+            eyre::bail!(
+                "{} is not a valid .xget control file",
+                control_path.display()
+            );
+        }
         eyre::bail!(
-            "{} is not a resumable xget control file",
-            control_path.display()
+            "no resume file found: {} has no .xget partial beside it",
+            path.display()
         );
     };
 

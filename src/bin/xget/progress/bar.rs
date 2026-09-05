@@ -8,7 +8,7 @@ use xget::Progress;
 use xprogress::{AnsiColor, Bar, DrawTarget, Style};
 
 use super::{DIM, Meter};
-use crate::fmt_size;
+use crate::{fmt_size, fmt_speed};
 
 /// The bar takes at most this fraction of the terminal width, so it scales with the screen instead of
 /// stretching across it. Capped by [`BAR_MAX`] and floored so it never vanishes.
@@ -35,6 +35,7 @@ const YELLOW: anstyle::Style = anstyle::Style::new()
 pub(crate) struct BarProgress {
     inner: RefCell<Option<Live>>,
     raw: bool,
+    bits: bool,
 }
 
 struct Live {
@@ -48,6 +49,9 @@ struct Live {
     prev_lines: usize,
     meter: Meter,
     raw: bool,
+    /// Render the speed in bits per second (`--bits`) rather than the default bytes per second. A pure
+    /// render-site concern, so it rides alongside `raw` here rather than in the meter.
+    bits: bool,
     /// The chunk count, for a retry line's `chunk N/total`.
     chunks: usize,
     /// Whether the terminal renders unicode, so a retry line's marker and separators match the bar.
@@ -55,10 +59,11 @@ struct Live {
 }
 
 impl BarProgress {
-    pub(super) fn new(raw: bool) -> Self {
+    pub(super) fn new(raw: bool, bits: bool) -> Self {
         Self {
             inner: RefCell::new(None),
             raw,
+            bits,
         }
     }
 }
@@ -106,6 +111,7 @@ impl Progress for BarProgress {
             prev_lines: 0,
             meter: Meter::new(total),
             raw: self.raw,
+            bits: self.bits,
             chunks: chunks.len(),
             unicode,
         });
@@ -208,23 +214,30 @@ fn redraw(live: &mut Live) {
 /// Compose the bar block: an aggregate header line over the per-chunk line when multi, otherwise a
 /// single aggregate bar. The readout (percent, speed, eta, sizes) is written here; the `xprogress` crate
 /// only renders the bars.
-fn frame(live: &Live) -> String {
-    let meter = &live.meter;
-    let pct = meter.percent();
-    let speed = fmt_size(meter.rate(), live.raw);
-    let eta = format_eta(meter.eta());
-    let done = fmt_size(meter.done, live.raw);
-    let total = fmt_size(meter.total, live.raw);
-    let rate = format!(
-        "{}{pct:>3}%{}  {}{speed}/s{}  {}{eta}{}",
-        GREEN.render(),
-        GREEN.render_reset(),
-        BLUE.render(),
-        BLUE.render_reset(),
-        YELLOW.render(),
-        YELLOW.render_reset(),
-    );
-    let size = format!("{}{done}/{total}{}", GREEN.render(), GREEN.render_reset());
+fn frame(live: &mut Live) -> String {
+    let raw = live.raw;
+    let bits = live.bits;
+    // Read the meter behind a scoped `&mut` borrow: `rate`/`eta` now age the window to now, so they
+    // mutate. The borrow is confined to this block so the bar fields below can be read afterward.
+    let (rate, size) = {
+        let meter = &mut live.meter;
+        let pct = meter.percent();
+        let speed = fmt_speed(meter.rate(), raw, bits);
+        let eta = format_eta(meter.eta());
+        let done = fmt_size(meter.done, raw);
+        let total = fmt_size(meter.total, raw);
+        let rate = format!(
+            "{}{pct:>3}%{}  {}{speed}{}  {}{eta}{}",
+            GREEN.render(),
+            GREEN.render_reset(),
+            BLUE.render(),
+            BLUE.render_reset(),
+            YELLOW.render(),
+            YELLOW.render_reset(),
+        );
+        let size = format!("{}{done}/{total}{}", GREEN.render(), GREEN.render_reset());
+        (rate, size)
+    };
     if live.multi {
         format!(
             "  {}┏{} {} {}┓{}  {rate}\n  {}┗{} {} {}┛{}  {size}",

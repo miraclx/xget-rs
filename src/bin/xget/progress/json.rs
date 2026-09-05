@@ -37,13 +37,15 @@ impl Progress for JsonProgress {
         if let Some(meter) = self.meter.borrow_mut().as_mut()
             && meter.advance(bytes, Duration::from_millis(200))
         {
+            // `rate`/`eta` age the window to now, so they take `&mut`; pull them into locals first so the
+            // one format call does not mix a mutable read with the immutable field reads beside it.
+            let speed = meter.rate();
+            let eta = meter.eta();
             eprintln!(
-                r#"{{"event":"progress","done":{},"total":{},"percent":{:.1},"speed":{},"eta":{}}}"#,
+                r#"{{"event":"progress","done":{},"total":{},"percent":{:.1},"speed":{speed},"eta":{eta}}}"#,
                 meter.done,
                 meter.total,
                 meter.percent_f64(),
-                meter.rate(),
-                meter.eta()
             );
         }
     }

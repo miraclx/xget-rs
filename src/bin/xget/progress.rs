@@ -28,10 +28,10 @@ pub(crate) const DIM: anstyle::Style = anstyle::Style::new().dimmed();
 pub(crate) struct Reporter(Box<dyn Progress>);
 
 impl Reporter {
-    pub(crate) fn new(mode: ProgressMode, raw: bool) -> Self {
+    pub(crate) fn new(mode: ProgressMode, raw: bool, bits: bool) -> Self {
         Reporter(match mode {
-            ProgressMode::Bar | ProgressMode::Auto => Box::new(BarProgress::new(raw)),
-            ProgressMode::Plain => Box::new(PlainProgress::new(raw)),
+            ProgressMode::Bar | ProgressMode::Auto => Box::new(BarProgress::new(raw, bits)),
+            ProgressMode::Plain => Box::new(PlainProgress::new(raw, bits)),
             ProgressMode::Json => Box::new(JsonProgress::new()),
             // The crate's no-op reporter: renders nothing.
             ProgressMode::None => Box::new(()),
@@ -116,13 +116,15 @@ impl Meter {
         self.ready(every)
     }
 
-    /// Bytes per second across the recent window.
-    fn rate(&self) -> u64 {
+    /// Bytes per second across the recent window. Takes `&mut self` because the speedometer ages its
+    /// window forward to now on read, so a stall decays instead of freezing; the reporters already hold
+    /// the meter behind a `RefCell`/`&mut`, so the mutable read is free at every call site.
+    fn rate(&mut self) -> u64 {
         self.speed.rate()
     }
 
     /// Seconds until completion at the current rate, or `0` if unknown.
-    fn eta(&self) -> u64 {
+    fn eta(&mut self) -> u64 {
         let rate = self.rate();
         if rate > 0 && self.total > self.done {
             (self.total - self.done) / rate
@@ -149,7 +151,7 @@ impl Meter {
     }
 
     /// The ETA as a `MM:SS` clock (minutes may exceed 59 for a long transfer).
-    fn eta_clock(&self) -> String {
+    fn eta_clock(&mut self) -> String {
         let eta = self.eta();
         format!("{:02}:{:02}", eta / 60, eta % 60)
     }

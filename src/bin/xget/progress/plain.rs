@@ -6,39 +6,45 @@ use core::time::Duration;
 use xget::Progress;
 
 use super::Meter;
-use crate::fmt_size;
+use crate::{fmt_size, fmt_speed};
 
 /// A single updating text line: `done / total (pct%)  speed  eta`, drawn in place on stderr and
 /// throttled, with a final newline so the shell prompt lands cleanly.
 pub(crate) struct PlainProgress {
     meter: RefCell<Option<Meter>>,
     raw: bool,
+    /// Render the speed in bits per second (`--bits`) rather than the default bytes per second. A pure
+    /// render-site concern, so it rides alongside `raw` here rather than in the meter.
+    bits: bool,
 }
 
 impl PlainProgress {
-    pub(super) fn new(raw: bool) -> Self {
+    pub(super) fn new(raw: bool, bits: bool) -> Self {
         Self {
             meter: RefCell::new(None),
             raw,
+            bits,
         }
     }
 
-    fn line(&self, meter: &Meter) -> String {
+    fn line(&self, meter: &mut Meter) -> String {
+        // `rate`/`eta_clock` age the window to now, so they take `&mut`; pull them into locals first so
+        // the one format call does not mix a mutable read with the immutable field reads beside it.
+        let speed = fmt_speed(meter.rate(), self.raw, self.bits);
+        let eta = meter.eta_clock();
         format!(
-            "\r\x1b[K{:>5.1}%  {}/{}  {}/s  ETA {}",
+            "\r\x1b[K{:>5.1}%  {}/{}  {speed}  ETA {eta}",
             meter.percent_f64(),
             fmt_size(meter.done, self.raw),
             fmt_size(meter.total, self.raw),
-            fmt_size(meter.rate(), self.raw),
-            meter.eta_clock(),
         )
     }
 }
 
 impl Progress for PlainProgress {
     fn start(&self, chunks: &[u64]) {
-        let meter = Meter::new(chunks.iter().sum());
-        eprint!("{}", self.line(&meter));
+        let mut meter = Meter::new(chunks.iter().sum());
+        eprint!("{}", self.line(&mut meter));
         let _ = std::io::Write::flush(&mut std::io::stderr());
         *self.meter.borrow_mut() = Some(meter);
     }
@@ -70,7 +76,7 @@ impl Progress for PlainProgress {
     }
 
     fn finish(&self) {
-        if let Some(meter) = self.meter.borrow().as_ref() {
+        if let Some(meter) = self.meter.borrow_mut().as_mut() {
             eprintln!("{}", self.line(meter));
         }
     }

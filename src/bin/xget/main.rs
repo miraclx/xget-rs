@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use xbytes::ByteSize;
 use xbytes::sizes::{BYTE, GIBI_BYTE};
+use xbytes::{ByteSize, Mode};
 use xget::{ByteRange, ByteStream, Checksum, Error, HttpSource, Mirrors, Probe, Source};
 
 use crate::expect::{Expect, parse_expect, resolve_expect};
@@ -84,6 +84,9 @@ struct Cli {
     /// Report raw byte counts instead of human-readable sizes.
     #[arg(long)]
     raw_sizes: bool,
+    /// Show transfer speed in bits per second (Mbps) instead of bytes (MiB/s).
+    #[arg(long)]
+    bits: bool,
     /// Verbose diagnostics on stderr: `-v` for chunk ranges, retries, and errors as they happen; `-vv`
     /// for more. Off by default.
     #[arg(short = 'v', long, action = clap::ArgAction::Count)]
@@ -227,7 +230,7 @@ async fn run() -> eyre::Result<()> {
         _ => cli.checksum,
     };
 
-    let reporter = Reporter::new(mode, cli.raw_sizes);
+    let reporter = Reporter::new(mode, cli.raw_sizes, cli.bits);
     let started = Instant::now();
     // Open the write target up front and hold it for the whole download, so the engine can borrow it.
     let mut handle = Handle::open(&dest).await?;
@@ -561,6 +564,22 @@ pub(crate) fn fmt_size(bytes: u64, raw: bool) -> String {
     }
 }
 
+/// Format a transfer rate, in bytes per second by default (to match the size readout) or in bits per
+/// second under `--bits`. This is the single place speed spelling lives; the reporters call it. `--raw-sizes`
+/// takes precedence over `--bits`: a raw count is a byte count, so bits does not apply.
+pub(crate) fn fmt_speed(rate: u64, raw: bool, bits: bool) -> String {
+    if bits && !raw {
+        // decimal bits, contracted: "83.9 Mbps" / "512 kbps" / "8 bps"
+        format!(
+            "{}ps",
+            ByteSize::of(rate, BYTE).repr(Mode::Bits | Mode::Decimal)
+        )
+    } else {
+        // bytes (or raw), matching the size readout: "10.0 MiB/s" or "<n>/s" under --raw-sizes
+        format!("{}/s", fmt_size(rate, raw))
+    }
+}
+
 /// A compact wall-clock duration for the closing summary: `1h2m`, `3m4s`, or `4.29s`.
 fn fmt_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs_f64();
@@ -859,3 +878,7 @@ fn parse_tries(value: &str) -> Result<u32, String> {
             .map_err(|_| format!("expected a number or `inf`, got `{value}`")),
     }
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod main_tests;

@@ -887,7 +887,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.4",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3214,7 +3214,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "xbytes"
 version = "0.1.1"
-source = "git+https://github.com/miraclx/xbytes-rs#51a2de8da34ee2dcd253d788eca1703cac16152b"
+source = "git+https://github.com/miraclx/xbytes-rs#ae6fc8e1e7752cf9f6765e925eba0ffa7b005660"
 dependencies = [
  "bitflags",
  "fraction",

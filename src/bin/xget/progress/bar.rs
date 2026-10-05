@@ -15,6 +15,9 @@ use crate::{fmt_size, fmt_speed};
 const BAR_MAX_PCT: u16 = 40;
 /// The bar never grows past this many cells, however wide the terminal, keeping the stats in focus.
 const BAR_MAX: u16 = 48;
+/// How many retry notices stay parked above the bar. Past this the oldest is dropped: the bar is the
+/// primary readout and must stay on screen, and the run summary at the end carries the full count.
+const MAX_NOTICES: usize = 5;
 
 // Styles for the live readout text. anstyle renders each with its own reset, and the codes have zero
 // display width, so they never affect the bar's own width accounting.
@@ -56,6 +59,10 @@ struct Live {
     chunks: usize,
     /// Whether the terminal renders unicode, so a retry line's marker and separators match the bar.
     unicode: bool,
+    /// Retry notices parked above the bar, oldest first. The interposition is a layout policy, so it lives
+    /// here rather than in `xprogress`: the crate owns one block-drawing primitive, the bin decides what
+    /// goes in the block. Bounded so a mass-retry cannot push the bar off the top of the screen.
+    notices: Vec<String>,
 }
 
 impl BarProgress {
@@ -114,6 +121,7 @@ impl Progress for BarProgress {
             bits: self.bits,
             chunks: chunks.len(),
             unicode,
+            notices: Vec::new(),
         });
         if let Some(live) = slot.as_mut() {
             redraw(live);
@@ -160,13 +168,15 @@ impl Progress for BarProgress {
 
     fn retry(&self, index: usize, retry: u32, max: u32, resume_from: u64, error: &str) {
         if let Some(live) = self.inner.borrow_mut().as_mut() {
-            // Print the retry as a permanent line above the bar (only real retries reach here), so a
-            // stalled download explains itself instead of a silently frozen bar.
+            // Park the retry as a notice above the bar (only real retries reach here), so a stalled
+            // download explains itself instead of a silently frozen bar. The notice is held here and
+            // re-emitted by every frame, which is what keeps it on screen while the bar redraws under it.
             let line = retry_line(index, live, retry, max, resume_from, error);
-            let block = frame(live);
-            if let Ok(lines) = live.target.interject(&line, &block, live.prev_lines) {
-                live.prev_lines = lines;
+            live.notices.push(line);
+            if live.notices.len() > MAX_NOTICES {
+                live.notices.remove(0);
             }
+            redraw(live);
         }
     }
 
@@ -211,10 +221,26 @@ fn redraw(live: &mut Live) {
     }
 }
 
-/// Compose the bar block: an aggregate header line over the per-chunk line when multi, otherwise a
-/// single aggregate bar. The readout (percent, speed, eta, sizes) is written here; the `xprogress` crate
-/// only renders the bars.
+/// Compose the full block: retry notices parked above the bar, then the bar itself. The notices are
+/// re-emitted on every frame, which is what keeps them on screen while the bar redraws underneath.
 fn frame(live: &mut Live) -> String {
+    let bar = bar_frame(live);
+    if live.notices.is_empty() {
+        return bar;
+    }
+    let mut block = String::with_capacity(bar.len() + 64 * live.notices.len());
+    for notice in &live.notices {
+        block.push_str(notice);
+        block.push('\n');
+    }
+    block.push_str(&bar);
+    block
+}
+
+/// The bar block itself: an aggregate header line over the per-chunk line when multi, otherwise a
+/// single aggregate bar. The readout (percent, speed, eta, sizes) is written here; the `xprogress`
+/// crate only renders the bars.
+fn bar_frame(live: &mut Live) -> String {
     let raw = live.raw;
     let bits = live.bits;
     // Read the meter behind a scoped `&mut` borrow: `rate`/`eta` now age the window to now, so they

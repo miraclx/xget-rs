@@ -4,8 +4,8 @@
 crate, edition 2024, toolchain pinned to 1.97.1.
 
 - `STYLE.md` is the contract. It is not a summary of the house rules, it is the house rules. Read it before
-  writing a line. It has one carve-out already granted (`STYLE.md:128-132`: a one-shot private pipeline may
-  stay as free functions).
+  writing a line. It has one carve-out already granted: a one-shot private pipeline may stay as free
+  functions, in House rules.
 - `miraclx/REVIEW.md` is how this code gets reviewed. The severity, verdict and closure vocabulary lives
   there. `notes/craft-backlog.md` is what is open.
 - The open items are the work. `notes/craft-backlog.md` is the list. Nothing here is a task.
@@ -91,7 +91,8 @@ One inconsistency, currently load-bearing: the **lib** declares test modules pla
 and the **bin** uses `#[path = "bar_tests.rs"] mod bar_tests;` because those tests need `super` access to
 private items. Same-directory files either way. Not to be "tidied" without checking the `super` reach.
 
-`main.rs` is one flat file and that is a documented, excused deviation from `STYLE.md:55`, because `xget` is
+`main.rs` is one flat file and that is a documented, excused deviation from the CLI-is-a-module-tree rule
+(whose single-command exception it is), because `xget` is
 a single command with no subcommands.
 
 **"Cache" means the `.xget` scratch plus its embedded control trailer.** There is no in-memory chunk cache.
@@ -125,7 +126,7 @@ repo, including CI and the harness, uses `--features "s3 ipfs"`.
 `README.md` carries five vhs GIFs. Only `media/download.tape` exists; the other four gifs have no tape and
 are not reproducible. Record with `vhs media/download.tape`, judge the frames yourself before shipping one.
 
-Errors are the next instruction to the user, lowercase, no trailing punctuation (`STYLE.md:42`). Keep it
+Errors are the next instruction to the user, lowercase, no trailing punctuation (STYLE.md, error handling). Keep it
 that way: a bailed message that names the fix is the standard the reviews hold it to.
 
 `PARITY.md` was deleted in `59aff40`; its content was folded into `README.md:175-184`. Recover the

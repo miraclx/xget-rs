@@ -12,7 +12,7 @@ categories = ["network-programming", "asynchronous"]
 # The review record is tracked in ../craft and reached through a symlink. It is not part of the library.
 # `harness/` cannot run from an unpacked tarball: scenarios.sh builds from `..`, so shipping it would be
 # a promise the tarball cannot keep.
-exclude = ["notes", "harness", "AGENTS.md"]
+exclude = ["notes", "harness", "AGENTS.md", ".claude"]
 
 [features]
 s3 = [

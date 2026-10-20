@@ -197,8 +197,9 @@ is not an expected-content check. `download_all(inputs).to_directory(path)` plan
 and `.plan().await` exposes frozen read-only assignments before `client.execute(plan).await`. Planning
 uses HEAD, never a preview payload GET, and creates no output directories.
 
-This ordinary Client supports exact HTTP inputs, serial files and owned frozen-run continuation,
-not provider collections, trees, parallel ranges, partial-byte reuse, restart or overwrite. Unsupported inputs fail explicitly. Redirects,
+This ordinary Client supports exact HTTP inputs, optional bounded SwissTransfer collections, serial
+files and owned frozen-run continuation. Other trees/catalogues, parallel ranges, partial-byte reuse,
+restart and overwrite remain unsupported. Unsupported inputs fail explicitly. Redirects,
 automatic retries, content decompression and ambient proxies are disabled. Clones share request/body
 admission and connection reuse. Each request has a fixed 15-second deadline for admission waiting,
 connection and headers together, but no payload/inactivity timeout. Retained open bodies can exhaust
@@ -206,11 +207,57 @@ admission; drop or consume them to release capacity. Use a caller-owned Tokio ru
 time enabled. See the [`client` module](src/client.rs) for selection, version and failure contracts. The CLI still uses the
 legacy engine below; its feature flags do not enable new Client provider adapters.
 
+### SwissTransfer collections (library feature)
+
+Enable `swisstransfer` on the library dependency. The compiled legacy CLI has not adopted this adapter;
+there is no SwissTransfer CLI feature or provider-specific scheduler.
+
+`client.resolve(Input::parse(share)?)` returns a complete bounded inventory without opening object
+payloads. Inspect `inventory.files()`, then pass a consumed `File` or `inventory.into_files()` back to
+`download`/`download_all`; the original collection context and nested paths survive that selection.
+Materialization selects all members by default, including a genuine empty no-op. A zero-byte member
+is still a real file. Literal `File::member_token()` values support repeatable ID selection:
+
+```rust
+use std::path::Path;
+use xget::Client;
+
+async fn download_member(client: &Client, share: &str, token: &str, root: &Path)
+    -> Result<(), Box<dyn core::error::Error>>
+{
+    let report = client.download(share).select_id(token)
+        .to_directory(root).run().await?;
+    assert_eq!(report.completed().len(), 1);
+    Ok(())
+}
+```
+
+A token is the adapter's share-scoped file UUID, not an inventory row number, path or access URL.
+Stale IDs fail; globs and exclusions are not implemented yet. `to_file(path)` requires exactly one
+selected file. Mixed exact/share inputs use the same frozen plan and serial
+checked native execution. Singleton shares retain nested paths. Multiple unnamed shares have the
+honest readable fallback `SwissTransfer`; equal groups fail rather than merging or gaining opaque
+suffixes. Use `Input::under("share-one")` and distinct namespaces for multiple shares.
+
+Discovery is limited to 128 total members and 1 MiB of accounted retained metadata per request,
+including members removed by selection. Share HTML is capped at 2 MiB, access metadata at 64 KiB.
+The shared 15-second async discovery deadline is not CPU preemption of synchronous parsing. Supported
+bootstrap shapes must be complete; missing, denied or unsupported metadata is an error, not a truncated
+executable inventory. No source title field is claimed.
+
+Access is acquired only when opening a selected member. The whole identity response must match the
+manifest length and carry a strong ETag. Its first pin is checkpointed before native submission;
+subsequent access must preserve it. Only an expired lease rejected during opening can authorize one
+renewal, not a live denial or a healthy body's later expiry. Retained records contain no signed object
+URLs or cookies. Frozen-run continuation uses original occurrence/member mappings and fresh access,
+without manifest rediscovery or partial-byte reuse. Other provider catalogues and trees remain separate
+work.
+
 ### Owned run continuation
 
 Ordinary file runs retain bounded frozen metadata under the designated output root's `.xget-runs`
 store. A repeated matching request first looks for one unfinished run, before issuing fresh HEAD
-requests. It keeps that run's members, assignments, versions and check policy. Multiple matches return
+or collection-discovery requests. It keeps that run's members, assignments, versions and check policy. Multiple matches return
 explicit actual resume paths rather than choosing by timestamp; a fully completed prior run is not an
 unfinished match. `download(...).fresh(xget::client::Fresh)` deliberately bypasses continuation, but
 neither overwrites existing outputs nor deletes old work.

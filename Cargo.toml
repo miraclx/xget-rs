@@ -32,6 +32,7 @@ s3 = [
     "dep:tokio-util",
 ]
 ipfs = ["dep:cid"]
+swisstransfer = ["dep:scraper", "dep:serde", "dep:serde_json", "dep:time"]
 aws-credential-types = ["dep:aws-credential-types"]
 aws-smithy-types = ["dep:aws-smithy-types"]
 
@@ -51,9 +52,16 @@ md-5 = "0.10"
 percent-encoding = "2"
 # The ordinary Client explicitly disables the retry policy introduced in this release.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+# Parse the bounded service HTML bootstrap without string-based HTML heuristics.
+scraper = { version = "0.24", optional = true }
+# Typed external metadata stays separate from internal and stored representations.
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
 sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
+# Validate bounded signature dates and lifetimes; fixtures also format those dates.
+time = { version = "0.3", optional = true, features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", optional = true, features = ["io"] }
 tracing = "0.1.44"

@@ -85,6 +85,11 @@ pub(super) async fn create(
         .files
         .iter()
         .map(|file| Member {
+            occurrence: file.file.input.occurrence,
+            remote: file.file.input.member.map(|token| super::FrozenMember {
+                token,
+                source_path: zeroize::Zeroizing::new(file.file.source_path().to_owned()),
+            }),
             binding: Fingerprint::reference(&file.file.input),
             destination: PathBuf::clone(&file.destination),
             length: file.file.length(),
@@ -225,6 +230,7 @@ mod unix {
             }
             let store_identity = Self::identity(&store)?;
             Ok(Record {
+                version: 2,
                 root,
                 identity,
                 store_identity,

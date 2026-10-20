@@ -130,6 +130,7 @@ async fn unsupported_providers_and_trees_fail_without_fake_inventory_success() {
     for input in [
         Input::parse("s3://bucket/key").expect("s3 intent"),
         Input::parse("ipfs://bafyexample/path").expect("ipfs intent"),
+        #[cfg(not(feature = "swisstransfer"))]
         Input::parse("https://swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444")
             .expect("share intent"),
         Input::parse("https://github.com/owner/project/releases/latest").expect("catalogue intent"),

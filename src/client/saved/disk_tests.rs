@@ -73,6 +73,8 @@ async fn seed(root: &Path) -> (PathBuf, Vec<u8>, OperationOwner, oneshot::Receiv
         root.to_path_buf(),
         None,
         vec![Member {
+            occurrence: crate::input::InputOccurrence(0),
+            remote: None,
             binding: Fingerprint::bytes(b"owned manifest fixture"),
             destination: root.join("payload"),
             length: Length::Unknown,

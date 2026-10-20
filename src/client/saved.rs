@@ -1,4 +1,5 @@
-//! Frozen aggregate continuation for the exact HTTP client. The private codec is not a manifest API.
+//! Frozen aggregate continuation. Private V2 records bind input occurrences to members; V1 stays exact HTTP.
+//! This codec is not a public manifest API.
 
 use core::convert::Infallible;
 use core::fmt;
@@ -11,7 +12,7 @@ use zeroize::Zeroizing;
 use super::{Client, Error, Plan, PlannedFile, Report, RunFailure, Target};
 use crate::checks::{CheckPolicy, Requirements};
 use crate::checksum::OwnedSha256;
-use crate::input::Input;
+use crate::input::{Input, InputOccurrence, MemberToken};
 use crate::inventory::{Description, File, FileId, Selected};
 use crate::transfer::{Length, Measurement, OperationOwner, Receipt, Reconciliation, StateRef};
 
@@ -29,9 +30,11 @@ const MAX_RECORD: usize = 1024 * 1024;
 /// Offline frozen run inspection. This value grants no executable ownership and holds no credentials.
 ///
 /// Continue by re-supplying each inspected binding key. Only the exact original reference intent is
-/// supported, including its query and spelling. A different reference is not inferred to be the same
-/// member. Continuation rechecks completed native evidence, then opens fresh full ordered HTTP bodies
-/// for pending members. It does not reuse partial bytes or save range maps.
+/// supported, including its query and spelling. SwissTransfer reuses the original share reference
+/// plus its recorded member token, path and any first-open strong pin, never a persisted signed URL.
+/// A different reference is not inferred to be the same member. Continuation rechecks completed native
+/// evidence, then opens fresh full ordered bodies for pending members. It does not reuse partial bytes
+/// or save range maps. V1 remains one exact HTTP member per input; it is not reinterpreted as V2.
 ///
 /// ```no_run
 /// use xget::Client;
@@ -82,6 +85,35 @@ impl SavedRun {
                 },
                 member,
             })
+    }
+
+    pub(super) fn bind_request<'a>(
+        self,
+        client: &'a Client,
+        inputs: Vec<Input>,
+    ) -> Result<Resume<'a>, SavedError> {
+        if self.record.version == 1 && self.record.members.len() != inputs.len() {
+            return Err(SavedError::Binding);
+        }
+        let mut bindings = Vec::with_capacity(self.record.members.len());
+        for (inspected, member) in self.members().zip(&self.record.members) {
+            let input = inputs
+                .get(member.occurrence.0 as usize)
+                .ok_or(SavedError::Binding)?;
+            if !member.accepts_selected(input) {
+                return Err(SavedError::Binding);
+            }
+            let mut supplied = input
+                .duplicate_reference()
+                .map_err(|_| SavedError::Binding)?;
+            supplied.occurrence = member.occurrence;
+            bindings.push((inspected.key(), supplied));
+        }
+        let mut resume = client.resume(self);
+        for (key, input) in bindings {
+            resume = resume.input(key, input);
+        }
+        Ok(resume)
     }
 
     /// Fully acknowledged aggregate completion is not an unfinished automatic re-entry match.
@@ -226,7 +258,9 @@ impl<'a> Resume<'a> {
         }
     }
 
-    /// Supplies the exact original HTTP reference intent for one frozen member. Wrong, repeated and
+    /// Supplies the exact original reference intent for one frozen member. A share with several
+    /// members uses the same original share input for each inspected key, without rediscovery.
+    /// Wrong, repeated and
     /// foreign keys fail; renamed/renewed references are not accepted by guessing from paths or ETags.
     /// A supplied selected File must agree with the frozen version and advisory length, and each of
     /// its required digest values must already be frozen. It cannot replace or add execution policy.
@@ -237,7 +271,7 @@ impl<'a> Resume<'a> {
         if self.error.is_some() {
             return self;
         }
-        let input = match reference.try_into() {
+        let mut input = match reference.try_into() {
             Ok(input) => input,
             Err(_) => {
                 self.error = Some(SavedError::Binding);
@@ -266,6 +300,8 @@ impl<'a> Resume<'a> {
             self.error = Some(SavedError::Binding);
             return self;
         }
+        input.occurrence = member.occurrence;
+        input.member = member.remote.as_ref().map(|remote| remote.token);
         self.bindings[index] = Some(input);
         self
     }
@@ -446,8 +482,20 @@ impl Fingerprint {
     ) -> Result<Self, SavedError> {
         let mut hash = OwnedSha256::default();
         Self::field(&mut hash, b"xget exact request intent 1");
-        for input in inputs {
+        for (index, input) in inputs.iter().enumerate() {
             Self::field(&mut hash, &Self::reference(input).0);
+            if input.kind() == crate::input::InputKind::SwissTransfer && input.selected.is_some() {
+                let group = inputs[..index]
+                    .iter()
+                    .position(|previous| Arc::ptr_eq(&previous.group, &input.group))
+                    .unwrap_or(index);
+                Self::field(&mut hash, b"frozen collection grouping 1");
+                Self::field(&mut hash, &(group as u32).to_le_bytes());
+            }
+            if let Some(token) = input.member {
+                Self::field(&mut hash, b"swiss member token 1");
+                Self::field(&mut hash, token.as_str().as_bytes());
+            }
             // Selected-file requests carry a frozen session; do not merge with mutable discovery.
             if let Some(selected) = &input.selected {
                 Self::field(&mut hash, b"selected");
@@ -488,6 +536,9 @@ impl Fingerprint {
 }
 
 struct Record {
+    // V1 remains one exact HTTP file per input. It is read and checkpointed as V1, never
+    // reinterpreted as collection state. New records freeze explicit N-input -> M-member bindings.
+    version: u32,
     root: PathBuf,
     identity: RootIdentity,
     store_identity: RootIdentity,
@@ -507,7 +558,14 @@ struct RootDevice(u64);
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct RootInode(u64);
 
+struct FrozenMember {
+    token: MemberToken,
+    source_path: Zeroizing<String>,
+}
+
 struct Member {
+    occurrence: InputOccurrence,
+    remote: Option<FrozenMember>,
     binding: Fingerprint,
     destination: PathBuf,
     length: Length,
@@ -519,13 +577,23 @@ struct Member {
 
 impl Member {
     fn accepts_selected(&self, input: &Input) -> bool {
+        let token = self.remote.as_ref().map(|remote| remote.token);
+        if input.member.is_some() && input.member != token {
+            return false;
+        }
+        if (input.kind() == crate::input::InputKind::SwissTransfer) != self.remote.is_some() {
+            return false;
+        }
         let Some(selected) = &input.selected else {
             return true;
         };
         let supplied = &selected.description;
         // Exact-reference equality alone does not authorize discarding a supplied frozen session.
         // Preserve the stored policy, rejecting newer or additional selected evidence before effects.
-        supplied.length == self.length
+        self.remote
+            .as_ref()
+            .is_none_or(|remote| supplied.source_path.as_str() == remote.source_path.as_str())
+            && supplied.length == self.length
             && supplied.etag.as_deref() == self.etag.as_deref()
             && supplied.requirements.iter().all(|required| {
                 self.requirements
@@ -577,12 +645,15 @@ impl Owned {
             // Exact-reference equality was checked before ownership. Reconstitute only advisory
             // display metadata from that same supplied reference, never identity or selection.
             let remote_path = input.parsed_reference().path();
-            let source_path = Zeroizing::new(
-                remote_path
-                    .strip_prefix('/')
-                    .unwrap_or(remote_path)
-                    .to_owned(),
-            );
+            let source_path = match &member.remote {
+                Some(remote) => Zeroizing::clone(&remote.source_path),
+                None => Zeroizing::new(
+                    remote_path
+                        .strip_prefix('/')
+                        .unwrap_or(remote_path)
+                        .to_owned(),
+                ),
+            };
             let name = remote_path
                 .rsplit('/')
                 .next()
@@ -593,6 +664,15 @@ impl Owned {
                         .ok()
                 })
                 .map(|name| Zeroizing::new(name.into_owned()));
+            let name = if let Some(remote) = &member.remote {
+                remote
+                    .source_path
+                    .rsplit('/')
+                    .next()
+                    .map(|name| Zeroizing::new(name.to_owned()))
+            } else {
+                name
+            };
             files.push(PlannedFile {
                 file: File {
                     input,
@@ -628,6 +708,27 @@ impl Owned {
             .iter()
             .map(|member| member.destination.as_path())
     }
+    pub(super) async fn opened(&mut self, index: usize, file: &File) -> Result<(), SavedError> {
+        let member = &mut self.saved.record.members[index];
+        if member.remote.is_none() {
+            return Ok(());
+        }
+        let etag = file
+            .selected
+            .description
+            .etag
+            .as_ref()
+            .ok_or(SavedError::Binding)?;
+        if let Some(frozen) = &member.etag {
+            if frozen != etag || file.length() != member.length {
+                return Err(SavedError::Binding);
+            }
+            return Ok(());
+        }
+        member.etag = Some(Zeroizing::clone(etag));
+        self.checkpoint().await
+    }
+
     pub(super) async fn completed(&mut self, index: usize) -> Result<(), SavedError> {
         #[cfg(test)]
         if let Some(hook) = self.before_completed_checkpoint.take() {

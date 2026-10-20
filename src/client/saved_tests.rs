@@ -1045,6 +1045,8 @@ async fn stored_member_attempt_path_and_validator_bounds_fail_before_execution_a
     let member = record.members.pop().unwrap();
     record.members = (0..=crate::inventory::MAX_FILES)
         .map(|index| super::Member {
+            occurrence: crate::input::InputOccurrence(index as u32),
+            remote: None,
             binding: member.binding,
             destination: root.path().join(format!("file-{index}")),
             length: member.length,
@@ -1055,6 +1057,66 @@ async fn stored_member_attempt_path_and_validator_bounds_fail_before_execution_a
         })
         .collect();
     assert!(matches!(codec::encode(&record), Err(SavedError::Limit)));
+}
+
+#[tokio::test]
+async fn version_one_exact_runs_remain_readable_and_checkpoint_as_version_one() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let (reference, path) = failed_get(&root, &server).await;
+    let mut record = codec::decode(&fs::read(path.join("state")).unwrap()).unwrap();
+    record.version = 1;
+    let version_one = codec::encode(&record).unwrap();
+    assert_eq!(&version_one[8..12], &1_u32.to_le_bytes());
+    fs::write(path.join("state"), &version_one).unwrap();
+    assert_eq!(
+        codec::encode(&codec::decode(&version_one).unwrap()).unwrap(),
+        version_one
+    );
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(header("if-match", "\"old\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"old\"")
+                .set_body_bytes(b"abc"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let report = Client::new()
+        .unwrap()
+        .download(reference)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(report.completed().len(), 1);
+    assert_eq!(count(&server, "HEAD").await, 0);
+    let bytes = fs::read(path.join("state")).unwrap();
+    assert_eq!(&bytes[8..12], &1_u32.to_le_bytes());
+}
+
+#[tokio::test]
+async fn version_two_mapping_rejects_duplicate_exact_occurrences_before_authority() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let (_, path) = failed_get(&root, &server).await;
+    let mut record = codec::decode(&fs::read(path.join("state")).unwrap()).unwrap();
+    assert_eq!(record.version, 2);
+    let first = &record.members[0];
+    record.members.push(super::Member {
+        occurrence: first.occurrence,
+        remote: None,
+        binding: first.binding,
+        destination: root.path().join("another"),
+        length: first.length,
+        etag: None,
+        requirements: first.requirements,
+        measurement: first.measurement,
+        attempts: Vec::new(),
+    });
+    assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
 }
 
 #[test]

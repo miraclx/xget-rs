@@ -18,8 +18,9 @@ pub(crate) const MAX_METADATA_BYTES: usize = 1024 * 1024;
 
 /// A complete finite inventory. An incomplete discovery cannot construct this value.
 ///
-/// The first HTTP adapter returns one exact file. Empty values remain distinct from invalid input;
-/// this type does not invent successful empty results for unsupported providers.
+/// Exact HTTP returns one file; the optional SwissTransfer adapter returns its complete bounded
+/// member inventory. Empty values remain distinct from invalid input and zero-byte file jobs.
+/// Unsupported providers do not manufacture successful empty results.
 pub struct Inventory {
     files: Vec<File>,
     metadata_bytes: usize,
@@ -105,7 +106,7 @@ impl File {
         &self.selected.description.source_path
     }
 
-    /// Advisory URL-derived readable name, not a validated local filename.
+    /// Advisory URL- or member-path-derived readable name, not a local assignment.
     pub fn name_hint(&self) -> Option<&str> {
         self.selected
             .description
@@ -114,7 +115,7 @@ impl File {
             .map(String::as_str)
     }
 
-    /// Advisory HEAD length, not an independently pinned representation size.
+    /// Advisory HEAD or manifest length, not an independently pinned representation size.
     ///
     /// Execution checks the GET declaration when present. If GET omits it but repeats the enforced
     /// strong HEAD ETag, the HEAD length remains the effective exact length. See
@@ -123,7 +124,8 @@ impl File {
         self.selected.description.length
     }
 
-    /// States whether metadata supplied a strong ETag usable for a conditional GET.
+    /// States whether metadata or an actual opened provider response supplied a strong ETag.
+    /// Subsequent openings must enforce that pin, including after access renewal.
     /// The validator itself is intentionally not a diagnostic/public identity string.
     pub fn version(&self) -> VersionEvidence {
         if self.selected.description.etag.is_some() {
@@ -131,6 +133,12 @@ impl File {
         } else {
             VersionEvidence::Unpinned
         }
+    }
+
+    /// Repeatable adapter member selector, scoped by the original input. Exact HTTP has none.
+    /// Reordering a manifest cannot redirect this token to another member.
+    pub fn member_token(&self) -> Option<&crate::input::MemberToken> {
+        self.input.member.as_ref()
     }
 
     /// Input-local grouping, distinct from the remote member path.
@@ -206,7 +214,8 @@ impl fmt::Debug for FileId {
 pub enum VersionEvidence {
     /// A fresh ordered GET has no continuity claim with earlier metadata.
     Unpinned,
-    /// A strong HEAD ETag must be enforced and repeated by the GET response.
+    /// A strong ETag is frozen from HEAD metadata or an actual opened provider response.
+    /// Subsequent GET responses must enforce and repeat that pin.
     StrongEtag,
 }
 

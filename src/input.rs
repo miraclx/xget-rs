@@ -5,6 +5,7 @@
 
 use core::fmt;
 use core::str::FromStr;
+use std::sync::Arc;
 
 use url::Url;
 use zeroize::Zeroizing;
@@ -24,6 +25,11 @@ pub struct Input {
     namespace: Option<Namespace>,
     // Selected-file re-entry owns metadata only when present, keeping ordinary parsed inputs small.
     pub(crate) selected: Option<Box<crate::inventory::Selected>>,
+    pub(crate) member: Option<MemberToken>,
+    pub(crate) occurrence: InputOccurrence,
+    // Consumed Files from one resolved inventory retain grouping, while separately parsed identical
+    // references remain distinct requested occurrences. This is not a persistent member identifier.
+    pub(crate) group: Arc<()>,
 }
 
 impl Input {
@@ -69,6 +75,9 @@ impl Input {
             scope,
             namespace: None,
             selected: None,
+            member: None,
+            occurrence: InputOccurrence(0),
+            group: Arc::new(()),
         })
     }
 
@@ -94,6 +103,35 @@ impl Input {
     pub fn under(mut self, namespace: &str) -> Result<Self, NamespaceError> {
         self.namespace = Some(Namespace::parse(namespace)?);
         Ok(self)
+    }
+
+    /// Requests one repeatable SwissTransfer member token within this input occurrence.
+    ///
+    /// This is not authorization or an occurrence-local FileId. Fresh discovery must contain exactly
+    /// this member; a stale token fails without a path, position or filename fallback. A selected File
+    /// already carries its frozen member and cannot be redirected by this method.
+    pub fn select_id(mut self, token: &str) -> Result<Self, InputError> {
+        if self.kind != InputKind::SwissTransfer || self.selected.is_some() {
+            return Err(InputError::UnsupportedMemberSelection);
+        }
+        self.member = Some(MemberToken::parse(token).ok_or(InputError::InvalidMemberToken)?);
+        Ok(self)
+    }
+
+    pub(crate) fn duplicate_reference(&self) -> Result<Self, InputError> {
+        Ok(Self {
+            reference: Reference::parse(self.original_reference())?,
+            kind: self.kind,
+            scope: self.scope,
+            namespace: self
+                .namespace
+                .as_ref()
+                .map(|namespace| Namespace(String::clone(&namespace.0))),
+            selected: None,
+            member: self.member,
+            occurrence: self.occurrence,
+            group: Arc::clone(&self.group),
+        })
     }
 
     /// Returns the recognized reference family, not a discovered remote object type.
@@ -211,7 +249,12 @@ impl InputKind {
         if matches!(host, Some("swisstransfer.com" | "www.swisstransfer.com"))
             && (reference.path() == "/dl" || reference.path().starts_with("/dl/"))
         {
-            if reference.scheme() != "https" || reference.port().is_some() {
+            if reference.scheme() != "https"
+                || reference.port().is_some()
+                || !reference.username().is_empty()
+                || reference.password().is_some()
+                || reference.query().is_some()
+            {
                 return Err(InputError::UnsupportedProviderReference);
             }
             let share = reference.path().strip_prefix("/dl/").unwrap_or("");
@@ -265,6 +308,44 @@ impl InputKind {
         }
     }
 }
+
+/// A repeatable SwissTransfer member token. Its meaning is scoped by the original share input.
+///
+/// It contains only a canonical file UUID, never access credentials. It is not a global identity or
+/// the occurrence-local [`crate::inventory::FileId`]. Default diagnostics redact it.
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub struct MemberToken([u8; 36]);
+
+impl MemberToken {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        if !InputKind::is_share_id(value) {
+            return None;
+        }
+        let mut token = [0; 36];
+        for (output, byte) in token.iter_mut().zip(value.bytes()) {
+            *output = byte.to_ascii_lowercase();
+        }
+        Some(Self(token))
+    }
+
+    /// Canonical literal selector to use with the same share input, not a URL or access capability.
+    pub fn as_str(&self) -> &str {
+        match core::str::from_utf8(&self.0) {
+            Ok(value) => value,
+            Err(_) => unreachable!("member tokens contain only validated ASCII UUID bytes"),
+        }
+    }
+}
+
+impl fmt::Debug for MemberToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MemberToken([share-scoped])")
+    }
+}
+
+/// Frozen request occurrence index, not a remote member identity.
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct InputOccurrence(pub(crate) u32);
 
 /// Requested resolution scope, never inferred from a failed exact lookup or inventory cardinality.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,6 +440,12 @@ pub enum InputError {
     /// Provider catalogue recognition is restricted to its HTTPS service endpoint.
     #[error("unsupported provider endpoint; use its standard https url")]
     UnsupportedProviderReference,
+    /// Only a materialization adapter with stable member tokens supports ID intent.
+    #[error("member selection is unsupported for this input; select from its resolved inventory")]
+    UnsupportedMemberSelection,
+    /// Tokens are literal UUIDs, never row indices or paths.
+    #[error("invalid member token; supply the literal token from this share's inventory")]
+    InvalidMemberToken,
     /// Tree intent is supported only for HTTP(S)/WebDAV and S3 in this draft.
     #[error("unsupported tree scope; use an exact or collection reference for this input kind")]
     UnsupportedTree {

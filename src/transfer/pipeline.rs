@@ -5,10 +5,8 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 
 use super::native::{Native, NativeError};
-use super::{
-    ByteCount, Failure, FailureKind, Length, OwnedSha256, Partial, Receipt, Sha256Digest, StateRef,
-    WriteExtent,
-};
+use super::{ByteCount, Failure, FailureKind, Length, Partial, Receipt, StateRef, WriteExtent};
+use crate::checks::Checks;
 
 /// One consuming task owns the body. Native submissions own only descriptors and bounded byte slices.
 pub(super) struct Run {
@@ -18,7 +16,7 @@ pub(super) struct Run {
 }
 
 impl Run {
-    pub(super) async fn execute<B, E, S>(self, body: B, stop: S) -> Result<Receipt, Failure<E>>
+    pub(super) async fn execute<B, E, S>(self, body: B, stop: S) -> Result<Receipt, Box<Failure<E>>>
     where
         B: Stream<Item = Result<Bytes, E>>,
         S: Future<Output = ()>,
@@ -27,13 +25,18 @@ impl Run {
         let mut stop = pin!(stop);
         // The consuming helper drops the body before sealing/publication; no detached body pump exists.
         let outcome = match self.receive(body, stop.as_mut(), &mut partial).await {
-            Ok(()) => match self.native.seal(partial.written).await {
+            Ok(checks) => match self.native.seal(partial.written).await {
                 Ok(()) => tokio::select! {
                     biased;
                     () = &mut stop => Err(FailureKind::Stopped),
                     () = core::future::ready(()) => {
-                        if partial.actual == Some(self.native.required().digest()) { Ok(()) }
-                        else { Err(FailureKind::DigestMismatch) }
+                        match checks.finish() {
+                            Ok(results) => { partial.set_checks(results); Ok(()) }
+                            Err(mismatch) => {
+                                partial.set_checks(mismatch.results);
+                                Err(FailureKind::DigestMismatch(mismatch))
+                            }
+                        }
                     }
                 },
                 Err(error) => Err(error.into_kind()),
@@ -44,30 +47,33 @@ impl Run {
             // On normal failure and cooperative stop, checkpoint failure takes precedence over a
             // successful-pause claim. A body cause is retained separately if checkpointing also fails.
             if let Err(error) = self.native.checkpoint(partial).await {
-                return Err(Failure {
+                return Err(Box::new(Failure {
                     kind: FailureKind::CheckpointFailed {
                         cause: Box::new(kind),
                         checkpoint: Box::new(error.into_kind()),
                     },
                     partial,
                     state: Some(self.state),
-                });
+                }));
             }
-            return Err(Failure {
+            return Err(Box::new(Failure {
                 kind,
                 partial,
                 state: Some(self.state),
-            });
+            }));
         }
+        let results = partial.checks.ok_or_else(|| {
+            Box::new(Failure {
+                kind: FailureKind::InvalidState,
+                partial,
+                state: Some(StateRef::clone(&self.state)),
+            })
+        })?;
         self.native
             .publish(partial)
             .await
             .map_err(|error| self.failure(error, partial))?;
-        Ok(Receipt {
-            partial,
-            required: self.native.required(),
-            state: self.state,
-        })
+        Ok(Receipt::completed(partial, results, self.state))
     }
 
     async fn receive<B, E, S>(
@@ -75,13 +81,14 @@ impl Run {
         body: B,
         mut stop: Pin<&mut S>,
         partial: &mut Partial,
-    ) -> Result<(), FailureKind<E>>
+    ) -> Result<Checks, FailureKind<E>>
     where
         B: Stream<Item = Result<Bytes, E>>,
         S: Future<Output = ()>,
     {
         let mut body = pin!(body);
-        let mut hasher = OwnedSha256::default();
+        let mut checks = self.native.policy().start();
+        let hashing = checks.active();
         loop {
             // Stop wins simultaneous readiness and is checked between every bounded physical write.
             let next = tokio::select! {
@@ -122,15 +129,19 @@ impl Run {
                     .await
                 {
                     Ok(accepted) => {
-                        hasher.update(&bytes[..accepted.0 as usize]);
+                        checks.update(&bytes[..accepted.0 as usize]);
                         partial.written.0 += accepted.0;
-                        partial.hashed.0 += accepted.0;
+                        if hashing {
+                            partial.hashed.0 += accepted.0;
+                        }
                     }
                     Err(error) => {
                         if let Some(accepted) = error.accepted {
-                            hasher.update(&bytes[..accepted.0 as usize]);
+                            checks.update(&bytes[..accepted.0 as usize]);
                             partial.written.0 += accepted.0;
-                            partial.hashed.0 += accepted.0;
+                            if hashing {
+                                partial.hashed.0 += accepted.0;
+                            }
                         } else {
                             partial.write_extent = WriteExtent::Unconfirmed;
                         }
@@ -145,12 +156,10 @@ impl Run {
         {
             return Err(FailureKind::LengthMismatch);
         }
-        let actual = Sha256Digest(hasher.finish());
-        partial.actual = Some(actual);
-        Ok(())
+        Ok(checks)
     }
 
-    fn failure<E>(&self, error: NativeError, partial: Partial) -> Failure<E> {
+    fn failure<E>(&self, error: NativeError, partial: Partial) -> Box<Failure<E>> {
         Failure::native(error, partial, Some(StateRef::clone(&self.state)))
     }
 }

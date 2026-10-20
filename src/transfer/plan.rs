@@ -1,22 +1,26 @@
+#[cfg(unix)]
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::ffi::OsString;
 use std::path::{Component, Path};
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{RequestError, RequiredSha256, StateRef};
+use super::{RequestError, StateRef};
+use crate::checks::CheckPolicy;
 
+#[cfg(unix)]
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) struct Plan {
     pub(super) parent: std::path::PathBuf,
     pub(super) destination: OsString,
     pub(super) workspace: OsString,
-    pub(super) required: RequiredSha256,
+    pub(super) checks: CheckPolicy,
     pub(super) state: StateRef,
 }
 
 impl Plan {
-    pub(super) fn new(path: &Path, required: RequiredSha256) -> Result<Self, RequestError> {
+    pub(super) fn new(path: &Path, checks: impl Into<CheckPolicy>) -> Result<Self, RequestError> {
         let raw = path.as_os_str().as_encoded_bytes();
         let ends_in_separator = raw
             .last()
@@ -43,22 +47,29 @@ impl Plan {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        // This counter only avoids local collisions; create-new is the ownership authority.
-        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
-        let time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let workspace = OsString::from(format!(
-            ".xget-native-{}-{time:x}-{sequence:x}",
-            std::process::id()
-        ));
+        #[cfg(unix)]
+        let workspace = {
+            // This counter only avoids local collisions; create-new is the ownership authority.
+            let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+            let time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            OsString::from(format!(
+                ".xget-native-{}-{time:x}-{sequence:x}",
+                std::process::id()
+            ))
+        };
+        // A locator grants no authority. Unsupported backends reject execution before filesystem or
+        // hash work; do not call a native clock/process API while constructing their inert plan.
+        #[cfg(not(unix))]
+        let workspace = OsString::from(".xget-native-unsupported");
         let state = StateRef(parent.join(&workspace));
         Ok(Self {
             parent: parent.to_path_buf(),
             destination: name,
             workspace,
-            required,
+            checks: checks.into(),
             state,
         })
     }

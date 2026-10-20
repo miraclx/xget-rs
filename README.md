@@ -193,10 +193,20 @@ downloads, wrap the chain in a small function: `let dl = |u| xget::get(u)?.chunk
 
 ### Checked native-file publication
 
-[`Transfer`](src/transfer.rs) accepts an already-open ordered body and a required whole-file SHA-256.
-It requires clean EOF, settled writes, the declared length when known, and a matching digest before
-atomically publishing an absent destination. This is separate from the legacy `get`/`from` pipeline;
+[`Transfer`](src/transfer.rs) accepts an already-open ordered body, zero or more whole-file digest
+requirements, and a separate optional measurement. Clean EOF, settled writes and the declared length
+when known precede atomic absent-only publication; every configured requirement must match.
+
+SHA-256 measurement is enabled by default. Disabling measurement does not disable requirements, and
+choosing neither performs no hidden recovery hash. Reports distinguish measured digests from matched
+requirements. When retained identities agree but no strong content anchor was recorded, recovery
+returns `NotRevalidatable` rather than trusting identity alone. This entrance is separate from the legacy `get`/`from` pipeline;
 the current CLI has not switched to it.
+
+The advanced draft keeps existing `RequiredSha256` calls working. Successful receipts now expose
+read-only `partial()`, `checks()`, `required()` and `state()` views; `required()` is an optional SHA-256
+compatibility view. Run/stop/reconciliation return concrete boxed failures. New code should inspect the
+algorithm-general check results rather than infer requirements from a SHA-256 compatibility field.
 
 The native entrance requires a caller-owned Tokio runtime, an existing caller-owned parent without
 group/other write permission, and Unix hardlink support. It retains private staging for reconciliation,

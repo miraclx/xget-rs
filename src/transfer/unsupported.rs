@@ -3,12 +3,11 @@
 use bytes::Bytes;
 
 use super::plan::Plan;
-use super::{
-    AcquisitionFailure, ByteCount, FailureKind, Partial, Reconciliation, RequiredSha256, StateRef,
-};
+use super::{AcquisitionFailure, ByteCount, FailureKind, Partial, Reconciliation, StateRef};
+use crate::checks::CheckPolicy;
 
 pub(super) struct Native {
-    required: RequiredSha256,
+    checks: CheckPolicy,
 }
 
 impl Native {
@@ -17,10 +16,10 @@ impl Native {
             parent,
             destination,
             workspace,
-            required,
+            checks,
             state,
         } = plan;
-        drop((parent, destination, workspace, required, state));
+        drop((parent, destination, workspace, checks, state));
         Err(AcquisitionFailure {
             error: NativeError,
             state: None,
@@ -45,8 +44,8 @@ impl Native {
     pub(super) async fn publish(&self, _partial: Partial) -> Result<(), NativeError> {
         Err(NativeError)
     }
-    pub(super) fn required(&self) -> RequiredSha256 {
-        self.required
+    pub(super) fn policy(&self) -> CheckPolicy {
+        self.checks
     }
     pub(super) async fn reconcile(_state: StateRef) -> Result<Reconciliation, NativeError> {
         Err(NativeError)
@@ -67,3 +66,7 @@ impl NativeError {
         FailureKind::Unsupported
     }
 }
+
+#[cfg(test)]
+#[path = "unsupported_tests.rs"]
+mod tests;

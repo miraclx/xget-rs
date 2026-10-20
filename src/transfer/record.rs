@@ -1,11 +1,16 @@
-//! Private bounded storage encoding. No source identity, error, credential or hasher state belongs here.
+//! Bounded versioned native state. No source references, credentials, errors or hasher internals.
 
-use super::{ByteCount, Partial, RequiredSha256, Sha256Digest, WriteExtent};
+use super::{
+    Algorithm, ByteCount, CheckResults, Digest, Measurement, Origins, Partial, Provenance,
+    RequiredSha256, Sha256Digest, WriteExtent,
+};
+use crate::checks::{CheckPolicy, Requirements};
 
-const MAGIC: &[u8; 8] = b"XGETNF01";
+const MAGIC: &[u8; 8] = b"XGETNF02";
+const V1_MAGIC: &[u8; 8] = b"XGETNF01";
 pub(super) const MAX_RECORD: u64 = 1024;
 
-/// Stored independently of the public report so storage evolution does not change public types.
+/// Stored independently of the public report, with explicit conversion for both supported versions.
 pub(super) struct Record {
     pub(super) binding: Binding,
     pub(super) status: Status,
@@ -18,10 +23,10 @@ pub(super) struct Binding {
     pub(super) workspace: Identity,
     pub(super) data: Identity,
     pub(super) destination: Vec<u8>,
-    pub(super) required: RequiredSha256,
+    pub(super) checks: CheckPolicy,
 }
 
-/// Identity is pure evidence; the native boundary obtains it from filesystem metadata.
+/// Identity is pure evidence; only the native boundary obtains it from filesystem metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Identity {
     pub(super) device: DeviceId,
@@ -49,7 +54,7 @@ pub(super) enum Status {
 
 impl Record {
     pub(super) fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(512);
+        let mut bytes = Vec::with_capacity(1024);
         bytes.extend_from_slice(MAGIC);
         bytes.push(match self.status {
             Status::NeedsBody => 0,
@@ -57,30 +62,22 @@ impl Record {
             Status::Publishing => 2,
             Status::Published => 3,
         });
-        for identity in [
+        for Identity {
+            device: DeviceId(device),
+            inode: InodeId(inode),
+        } in [
             self.binding.parent,
             self.binding.workspace,
             self.binding.data,
         ] {
-            let Identity {
-                device: DeviceId(device),
-                inode: InodeId(inode),
-            } = identity;
             bytes.extend_from_slice(&device.to_le_bytes());
             bytes.extend_from_slice(&inode.to_le_bytes());
         }
-        let RequiredSha256(Sha256Digest(required)) = self.binding.required;
-        bytes.extend_from_slice(&required);
-        match self.partial.actual {
-            Some(Sha256Digest(actual)) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&actual);
-            }
-            None => {
-                bytes.push(0);
-                bytes.extend_from_slice(&[0; 32]);
-            }
-        }
+        Self::write_requirements(&mut bytes, self.binding.checks.requirements);
+        bytes.push(match self.binding.checks.measurement {
+            Measurement::None => 0,
+            Measurement::Algorithm(algorithm) => Self::tag(algorithm),
+        });
         bytes.push(match self.partial.write_extent {
             WriteExtent::Confirmed => 0,
             WriteExtent::Unconfirmed => 1,
@@ -92,15 +89,30 @@ impl Record {
         ] {
             bytes.extend_from_slice(&count.to_le_bytes());
         }
-        // Destination names were bounded to 255 bytes at the request boundary.
+        match self.partial.checks {
+            None => bytes.push(0),
+            Some(results) => {
+                bytes.push(1);
+                Self::write_requirements(&mut bytes, results.requirements());
+                match results.measured() {
+                    None => bytes.push(0),
+                    Some(digest) => Self::write_digest(&mut bytes, digest),
+                }
+            }
+        }
+        // The request boundary and decoder bound a destination to one component of at most 255 bytes.
         bytes.extend_from_slice(&(self.binding.destination.len() as u16).to_le_bytes());
         bytes.extend_from_slice(&self.binding.destination);
         bytes
     }
 
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, InvalidRecord> {
+        if bytes.len() as u64 > MAX_RECORD {
+            return Err(InvalidRecord);
+        }
         let mut input = Input(bytes);
-        if input.take::<8>()? != *MAGIC {
+        let magic = input.take::<8>()?;
+        if magic != *MAGIC && magic != *V1_MAGIC {
             return Err(InvalidRecord);
         }
         let status = match input.take::<1>()? {
@@ -113,22 +125,11 @@ impl Record {
         let parent = input.identity()?;
         let workspace = input.identity()?;
         let data = input.identity()?;
-        let required = RequiredSha256(Sha256Digest(input.take::<32>()?));
-        let actual_tag = input.take::<1>()?;
-        let digest = input.take::<32>()?;
-        let actual = match actual_tag {
-            [0] if digest == [0; 32] => None,
-            [1] => Some(Sha256Digest(digest)),
-            _ => return Err(InvalidRecord),
+        let (checks, partial) = if magic == *V1_MAGIC {
+            input.v1()?
+        } else {
+            input.v2()?
         };
-        let write_extent = match input.take::<1>()? {
-            [0] => WriteExtent::Confirmed,
-            [1] => WriteExtent::Unconfirmed,
-            _ => return Err(InvalidRecord),
-        };
-        let received = ByteCount(u64::from_le_bytes(input.take::<8>()?));
-        let written = ByteCount(u64::from_le_bytes(input.take::<8>()?));
-        let hashed = ByteCount(u64::from_le_bytes(input.take::<8>()?));
         let length = usize::from(u16::from_le_bytes(input.take::<2>()?));
         let Input(destination) = input;
         if length == 0
@@ -140,16 +141,11 @@ impl Record {
             || destination == b".."
             || destination.starts_with(b".xget-native-")
             || destination == b".xget-native.lock"
-            || hashed > written
-            || written > received
-        {
-            return Err(InvalidRecord);
-        }
-        if status != Status::NeedsBody
-            && (actual != Some(required.digest())
-                || received != written
-                || written != hashed
-                || write_extent != WriteExtent::Confirmed)
+            || partial.hashed > partial.written
+            || partial.written > partial.received
+            || (!checks.hashing() && partial.hashed != ByteCount(0))
+            || !partial.results_fit(checks)
+            || (status != Status::NeedsBody && !partial.complete_for(checks))
         {
             return Err(InvalidRecord);
         }
@@ -158,32 +154,53 @@ impl Record {
                 parent,
                 workspace,
                 data,
-                required,
                 destination: destination.to_vec(),
+                checks,
             },
             status,
-            partial: Partial {
-                received,
-                written,
-                hashed,
-                actual,
-                write_extent,
-            },
+            partial,
         })
+    }
+
+    fn write_requirements(bytes: &mut Vec<u8>, requirements: Requirements) {
+        bytes.push(requirements.iter().count() as u8);
+        for requirement in requirements.iter() {
+            Self::write_digest(bytes, requirement.digest);
+            bytes.push(requirement.origins.bits());
+        }
+    }
+
+    fn write_digest(bytes: &mut Vec<u8>, digest: Digest) {
+        bytes.push(Self::tag(digest.algorithm()));
+        bytes.extend_from_slice(digest.as_bytes());
+    }
+
+    fn tag(algorithm: Algorithm) -> u8 {
+        match algorithm {
+            Algorithm::Md5 => 1,
+            Algorithm::Sha1 => 2,
+            Algorithm::Sha256 => 3,
+            Algorithm::Sha512 => 4,
+            Algorithm::Blake3 => 5,
+        }
     }
 }
 
 struct Input<'a>(&'a [u8]);
 
-impl Input<'_> {
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], InvalidRecord> {
+impl<'a> Input<'a> {
+    fn bytes(&mut self, count: usize) -> Result<&'a [u8], InvalidRecord> {
         let Self(bytes) = self;
-        let Some((head, tail)) = bytes.split_at_checked(N) else {
+        let input = *bytes;
+        let Some((head, tail)) = input.split_at_checked(count) else {
             return Err(InvalidRecord);
         };
-        let value = head.try_into().map_err(|_| InvalidRecord)?;
         *bytes = tail;
-        Ok(value)
+        Ok(head)
+    }
+
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], InvalidRecord> {
+        self.bytes(N)?.try_into().map_err(|_| InvalidRecord)
     }
 
     fn identity(&mut self) -> Result<Identity, InvalidRecord> {
@@ -191,6 +208,122 @@ impl Input<'_> {
             device: DeviceId(u64::from_le_bytes(self.take::<8>()?)),
             inode: InodeId(u64::from_le_bytes(self.take::<8>()?)),
         })
+    }
+
+    fn algorithm(tag: u8) -> Result<Algorithm, InvalidRecord> {
+        match tag {
+            1 => Ok(Algorithm::Md5),
+            2 => Ok(Algorithm::Sha1),
+            3 => Ok(Algorithm::Sha256),
+            4 => Ok(Algorithm::Sha512),
+            5 => Ok(Algorithm::Blake3),
+            _ => Err(InvalidRecord),
+        }
+    }
+
+    fn digest_with_tag(&mut self, tag: u8) -> Result<Digest, InvalidRecord> {
+        let algorithm = Self::algorithm(tag)?;
+        Digest::from_raw(algorithm, self.bytes(algorithm.byte_len())?).map_err(|_| InvalidRecord)
+    }
+
+    fn requirements(&mut self) -> Result<Requirements, InvalidRecord> {
+        let [count] = self.take::<1>()?;
+        if count > 5 {
+            return Err(InvalidRecord);
+        }
+        let mut requirements = Requirements::default();
+        let mut previous = None;
+        for _ in 0..count {
+            let [tag] = self.take::<1>()?;
+            let digest = self.digest_with_tag(tag)?;
+            let index = digest.algorithm().index();
+            if previous.is_some_and(|previous| previous >= index) {
+                return Err(InvalidRecord);
+            }
+            previous = Some(index);
+            let [bits] = self.take::<1>()?;
+            let origins = Origins::from_bits(bits).ok_or(InvalidRecord)?;
+            for origin in origins.iter() {
+                requirements
+                    .insert(digest, origin)
+                    .map_err(|_| InvalidRecord)?;
+            }
+        }
+        Ok(requirements)
+    }
+
+    fn extent(&mut self) -> Result<WriteExtent, InvalidRecord> {
+        match self.take::<1>()? {
+            [0] => Ok(WriteExtent::Confirmed),
+            [1] => Ok(WriteExtent::Unconfirmed),
+            _ => Err(InvalidRecord),
+        }
+    }
+
+    fn counts(&mut self, write_extent: WriteExtent) -> Result<Partial, InvalidRecord> {
+        Ok(Partial {
+            received: ByteCount(u64::from_le_bytes(self.take::<8>()?)),
+            written: ByteCount(u64::from_le_bytes(self.take::<8>()?)),
+            hashed: ByteCount(u64::from_le_bytes(self.take::<8>()?)),
+            write_extent,
+            ..Partial::default()
+        })
+    }
+
+    fn v2(&mut self) -> Result<(CheckPolicy, Partial), InvalidRecord> {
+        let requirements = self.requirements()?;
+        let [measurement] = self.take::<1>()?;
+        let measurement = if measurement == 0 {
+            Measurement::None
+        } else {
+            Measurement::Algorithm(Self::algorithm(measurement)?)
+        };
+        let extent = self.extent()?;
+        let mut partial = self.counts(extent)?;
+        match self.take::<1>()? {
+            [0] => {}
+            [1] => {
+                let matched = self.requirements()?;
+                let [measured] = self.take::<1>()?;
+                let measured = if measured == 0 {
+                    None
+                } else {
+                    Some(self.digest_with_tag(measured)?)
+                };
+                partial.set_checks(CheckResults::from_parts(matched, measured));
+            }
+            _ => return Err(InvalidRecord),
+        }
+        Ok((
+            CheckPolicy {
+                requirements,
+                measurement,
+            },
+            partial,
+        ))
+    }
+
+    fn v1(&mut self) -> Result<(CheckPolicy, Partial), InvalidRecord> {
+        let required = RequiredSha256(Sha256Digest(self.take::<32>()?));
+        let [tag] = self.take::<1>()?;
+        let bytes = self.take::<32>()?;
+        let actual = match tag {
+            0 if bytes == [0; 32] => None,
+            1 => Some(Digest::sha256(bytes)),
+            _ => return Err(InvalidRecord),
+        };
+        let extent = self.extent()?;
+        let mut partial = self.counts(extent)?;
+        let checks = CheckPolicy::from(required);
+        if let Some(actual) = actual {
+            let matched = if actual == Digest::from(required) {
+                Requirements::single(actual, Provenance::Caller)
+            } else {
+                Requirements::default()
+            };
+            partial.set_checks(CheckResults::from_parts(matched, Some(actual)));
+        }
+        Ok((checks, partial))
     }
 }
 

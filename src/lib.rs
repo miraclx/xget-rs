@@ -27,6 +27,7 @@ use tokio::io::AsyncWrite;
 use crate::control::Control;
 
 mod builder;
+mod checked_body;
 mod checks;
 mod checksum;
 mod control;

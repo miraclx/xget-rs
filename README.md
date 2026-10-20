@@ -213,6 +213,24 @@ group/other write permission, and Unix hardlink support. It retains private stag
 not automatic reopening of a one-shot source, and promises process-interruption recovery rather than
 power-loss durability. See the [external API test](tests/transfer.rs) for a complete executable call.
 
+### Checked live output
+
+The same `Transfer::from_body` policy can release ordered bytes with `.into_body()` or drain them
+into a borrowed writer with `.stream_to(&mut writer)?.run().await`. These entrances do not create
+files, reopen sources, spawn a pump or shut down the caller's writer. They need no runtime beyond
+what the supplied body and writer require. Pinned writers use `.stream_to_pinned(...)`.
+
+Released prefixes cannot be recalled and are not expectation-verified. A late source error, length
+failure or required-check mismatch is reported before clean stream completion. Consume the stream
+through EOF and then call its consuming `finish()` to obtain a success receipt; reading exactly the
+declared count is insufficient. Writer success additionally requires a successful flush. Body counters
+and accepted write counts remain separate, including on failure. Cancellation stops further polling,
+not arbitrary physical I/O already owned by a caller's writer.
+
+See [`transfer::live`](src/transfer/live.rs) for runnable examples and the
+[public integration tests](tests/transfer_live.rs) for borrowed/local sources, writer backpressure and
+terminal failures. These advanced entrances do not replace the legacy CLI streaming path.
+
 ## How it works
 
 The legacy engine writes chunks straight to their offsets in a sparse `<file>.xget`. One verifier

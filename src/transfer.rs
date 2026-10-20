@@ -54,6 +54,7 @@ use crate::checks::{CheckPolicy, Requirements};
 #[cfg(all(test, unix))]
 use crate::checksum::OwnedSha256;
 
+pub mod live;
 #[cfg(unix)]
 mod native;
 #[cfg(not(unix))]
@@ -445,7 +446,7 @@ pub enum Reconciliation {
     NotRevalidatable(StateRef),
 }
 
-/// Request errors are resolved before any native filesystem effects.
+/// Request errors are resolved before body polling, writer calls or native filesystem effects.
 #[derive(Debug, thiserror::Error)]
 pub enum RequestError {
     /// Compatibility error retained for callers of the original checked-only entrance.
@@ -453,7 +454,7 @@ pub enum RequestError {
     #[error("supply a whole-file sha256 requirement before creating a native file")]
     MissingRequirement,
     /// Different required values cannot replace or cancel one another.
-    #[error("supply agreeing whole-file requirements for one native file")]
+    #[error("conflicting body requirements; supply agreeing digests for each algorithm")]
     ConflictingRequirements(#[source] Box<Conflict>),
     /// The compatibility RequiredSha256 parser was given a different algorithm.
     #[error("use sha256 in a requiredsha256 value or use digest for other algorithms")]

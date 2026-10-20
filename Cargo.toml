@@ -47,18 +47,28 @@ digest = "0.10"
 futures = "0.3"
 hex = "0.4"
 md-5 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# Decode remote filename hints without treating their spelling as a local path.
+percent-encoding = "2"
+# The ordinary Client explicitly disables the retry policy introduced in this release.
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", optional = true, features = ["io"] }
 tracing = "0.1.44"
+# Conservative output collision checks compare Unicode normalization and full case folding.
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+# Parse access references separately from local output paths.
+url = "2"
 
 # Sibling crate from the same rewrite effort. Git dependency so the crate builds standalone (and in CI);
 # a gitignored .cargo/config.toml overrides it with the neighbouring working copy for local
 # co-development, so edits across the repos are picked up without a push.
 xbytes = { git = "https://github.com/miraclx/xbytes-rs" }
+# Wipe retained access-reference and validator allocations when their owners are dropped.
+zeroize = "1"
 
 # Only for the startup sweep of orphaned temp scratches: a process-liveness check so a partial left by a
 # since-dead process is cleaned up while a live download's scratch is never touched. Unix uses
@@ -71,8 +81,8 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
-# Held-operation cancellation tests exercise a real multithreaded runtime; callers choose their runtime.
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# Cancellation and bounded loopback HTTP fixtures choose their own runtime and sockets.
+tokio = { version = "1", features = ["net", "rt-multi-thread"] }
 # An in-process mock HTTP server for the HttpSource integration tests: it lets a test answer a range
 # request with a real 206 and Content-Range (or deliberately ignore the range) so the source's own
 # validation is exercised over a real loopback socket, with no live network. The engine's own paths

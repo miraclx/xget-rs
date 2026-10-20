@@ -6,8 +6,9 @@
 - Read `STYLE.md` before writing code. It is the contract, including the narrow private-pipeline
   exception. `../craft/REVIEW.md` defines review evidence, severity and closure vocabulary.
 - `notes/craft-backlog.md` tracks open work. Historical reviews are not rewritten when a later fix lands.
-- The approved redesign is broader than the implemented surface. Do not call the ordinary Client,
-  inventory, multi-input selection, provider adapters or new recovery UX implemented until they exist.
+- The ordinary Client currently implements exact HTTP inventory, selection, frozen multi-input layout
+  and serial native publication/live opening. The approved redesign is broader: provider collections,
+  trees, pinned ranges, aggregate recovery and the new CLI are not implemented by this surface.
 
 ## Workspace boundary
 

@@ -1,6 +1,19 @@
-//! xget: a chunked, parallel, resumable, verified fetch engine.
+//! Reusable checked transfers, with a separate legacy parallel/resumable engine.
 //!
-//! The engine plans a resource into chunks, fetches them in parallel, resumes a dropped chunk from its
+//! Start with [`Client`] for ordinary exact HTTP inputs, bounded metadata discovery and frozen native
+//! output planning. [`Input`] distinguishes remote intent from local grouping; [`Inventory`] exposes
+//! resolved files without acquiring their payloads. The current Client executes files serially and
+//! rejects unsupported provider/tree inputs explicitly. Native publication is absent-only on supported
+//! Unix filesystems; this Client does not yet implement aggregate recovery or overwrite.
+//!
+//! Use [`Transfer`] for an already-open application body, either checked native publication or
+//! [`transfer::live`] delivery to an application-owned consumer/writer. Required checks and optional
+//! measurement are separate. Irreversible streamed prefixes are not whole-payload expectation evidence.
+//!
+//! # Legacy engine
+//!
+//! [`get`] and [`from`] retain the existing [`Source`], [`Download`], [`Output`] and [`Report`] APIs.
+//! The legacy engine plans a resource into chunks, fetches them in parallel, resumes a dropped chunk from its
 //! offset, reassembles them in order, gates on the exact length, and streams the bytes through a hash
 //! so a reported digest is trustworthy. It never certifies bytes it did not verify: a source that
 //! ignores a range, or a length that does not match, is a typed [`Error`], not a silent bad file.
@@ -30,8 +43,11 @@ mod builder;
 mod checked_body;
 mod checks;
 mod checksum;
+pub mod client;
 mod control;
 mod engine;
+pub mod input;
+pub mod inventory;
 mod plan;
 mod source;
 pub mod transfer;
@@ -43,7 +59,10 @@ mod plan_tests;
 
 pub use crate::builder::{Download, from, get};
 pub use crate::checksum::{Checksum, UnknownChecksum};
+pub use crate::client::Client;
 pub use crate::engine::{Report, sweep_orphans};
+pub use crate::input::Input;
+pub use crate::inventory::{File, Inventory};
 pub use crate::transfer::Transfer;
 
 /// Whether an interrupted download left a resumable partial beside `output`: its `.xget` file with a

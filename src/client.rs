@@ -1,8 +1,10 @@
 //! Ordinary acquisition through the common inventory, planning and checked publication path.
 //!
 //! Exact HTTP inputs and, with `swisstransfer`, bounded SwissTransfer collections use the same serial
-//! native Transfer implementation. Client clones share reusable HTTP connections and bounded
-//! control/body admission. This is not the legacy parallel range engine or a provider-owned scheduler.
+//! native Transfer implementation. Exact HTTP with known nonzero length, a bounded strong HEAD ETag
+//! and explicit byte-range support uses Transfer's bounded reader coordinator. Other exact HTTP and
+//! SwissTransfer retain ordered whole-body access. Client clones share reusable HTTP connections and
+//! bounded control/body admission, not a provider-owned scheduler or the legacy range engine.
 //! Owned run metadata stays in the designated destination's `.xget-runs` store. Redirects, catalogues
 //! and unsupported tree/provider inputs fail explicitly. SwissTransfer members currently open whole
 //! ordered responses, not parallel ranges or byte-resume sessions.
@@ -52,6 +54,7 @@ use crate::transfer::{Conflict, Digest, Measurement, Provenance, Receipt, Requir
 mod http;
 mod layout;
 mod live;
+mod range;
 mod saved;
 #[cfg(feature = "swisstransfer")]
 mod swiss;
@@ -202,7 +205,7 @@ impl Client {
         if input.kind() == InputKind::SwissTransfer {
             return Swiss::resolve(&self.http, input, budget).await;
         }
-        let description = self.http.describe(&input).await?;
+        let description = self.http.describe(&mut input).await?;
         let file = File {
             input,
             selected: Selected {
@@ -265,8 +268,10 @@ impl Client {
     /// write bits. New directories request mode 0700. The caller must control the hierarchy against
     /// concurrent replacement; these static checks are not a same-user sandbox. Publication is absent-only;
     /// no overwrite is granted. Execution accounts frozen members and advisory native attempts in an
-    /// owned aggregate SavedRun before native effects. Continuation uses fresh full ordered bodies,
-    /// not retained partial bytes. Checkpoint replacement is atomic but not fsync-durable.
+    /// owned aggregate SavedRun before native effects. Eligible exact HTTP uses up to four ranges;
+    /// continuation rehashes an owned strong prefix before suffix admission. Unsupported/unpinned
+    /// exact HTTP and SwissTransfer keep fresh full ordered bodies. Missing anchors and closed reader
+    /// stages refuse continuation, never silently refetch. Checkpoints are atomic, not fsync-durable.
     /// Dropping during directory preparation can leave empty directories and submitted Tokio filesystem
     /// work settling after drop; there is no high-level pause or directory-settlement receipt.
     /// See [`Resume`'s ownership and cancellation contract](Resume#ownership-and-cancellation) for
@@ -357,7 +362,7 @@ impl Client {
                         file,
                         destination,
                         version,
-                        receipt,
+                        receipt: PublicationReceipt::Whole(receipt),
                     });
                     if let Err(error) = owned.completed(index).await {
                         return Err(Box::new(RunFailure {
@@ -381,6 +386,48 @@ impl Client {
                         }),
                     }));
                 }
+            }
+            if range::Mode::of(&file) == range::Mode::Ranges {
+                let receipt = match range::run(
+                    &self.http,
+                    &file,
+                    &destination,
+                    requirements,
+                    measurement,
+                    &mut owned,
+                    index,
+                )
+                .await
+                {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        return Err(Box::new(RunFailure {
+                            error,
+                            report,
+                            failed: Some(PlannedFile {
+                                file,
+                                destination,
+                                requirements,
+                                measurement,
+                            }),
+                        }));
+                    }
+                };
+                // Preserve the native receipt and attempt statistics before completion checkpointing.
+                report.completed.push(PublishedFile {
+                    file,
+                    destination,
+                    version: VersionConsistency::StrongEtagMatched,
+                    receipt: PublicationReceipt::Ranges(receipt),
+                });
+                if let Err(error) = owned.completed(index).await {
+                    return Err(Box::new(RunFailure {
+                        error: Error::Saved(error),
+                        report,
+                        failed: None,
+                    }));
+                }
+                continue;
             }
             let opened = match self.open_file(&mut file).await {
                 Ok(opened) => opened,
@@ -452,7 +499,7 @@ impl Client {
                         file,
                         destination,
                         version,
-                        receipt,
+                        receipt: PublicationReceipt::Whole(receipt),
                     });
                     if let Err(error) = owned.completed(index).await {
                         return Err(Box::new(RunFailure {
@@ -985,7 +1032,14 @@ pub struct PublishedFile {
     file: File,
     destination: PathBuf,
     version: VersionConsistency,
-    receipt: Receipt,
+    receipt: PublicationReceipt,
+}
+
+// Preserve the consuming reader receipt without cloning or discarding its physical-work facts.
+// Reconciled publications have no new source attempt and therefore carry only the native receipt.
+enum PublicationReceipt {
+    Whole(Receipt),
+    Ranges(crate::transfer::reader::ReaderReceipt),
 }
 
 impl PublishedFile {
@@ -1001,7 +1055,20 @@ impl PublishedFile {
 
     /// The actual native publication/check receipt, including its retained state locator.
     pub fn receipt(&self) -> &Receipt {
-        &self.receipt
+        match &self.receipt {
+            PublicationReceipt::Whole(receipt) => receipt,
+            PublicationReceipt::Ranges(receipt) => receipt.native(),
+        }
+    }
+
+    /// Current reader attempt's restored, source and physical-write facts. Absent for whole-body
+    /// attempts and offline-reconciled publications, which did not run a reader in this invocation.
+    /// Logical assembled counts remain available through [`Self::receipt`].
+    pub fn range_stats(&self) -> Option<crate::transfer::reader::ReaderStats> {
+        match &self.receipt {
+            PublicationReceipt::Whole(_) => None,
+            PublicationReceipt::Ranges(receipt) => Some(receipt.stats()),
+        }
     }
 
     /// GET consistency, independent of matched requirements and measured hashes.
@@ -1160,6 +1227,23 @@ pub enum Error {
     /// Native request validation remains typed and precedes native effects.
     #[error("invalid native file request; inspect the request error")]
     NativeRequest(#[source] crate::transfer::RequestError),
+    /// Reader session/check validation fails before native effects or range admission.
+    #[error("invalid http range request; inspect the reader request error")]
+    RangeRequest(#[source] crate::transfer::reader::ReaderRequestError),
+    /// Concrete reader failures retain HTTP, protocol, native and logical partial-state facts.
+    #[error("http range transfer failed; inspect its partial report and retained state")]
+    RangeTransfer(
+        #[source] Box<crate::transfer::Failure<crate::transfer::reader::ReaderError<Error>>>,
+    ),
+    /// Both reader failure and aggregate checkpoint failure remain available.
+    #[error("http range transfer and checkpoint failed; retain both state references")]
+    RangeCheckpoint {
+        /// Original failure, not erased into a foreign cause string.
+        #[source]
+        transfer: Box<crate::transfer::Failure<crate::transfer::reader::ReaderError<Error>>>,
+        /// Failed aggregate acknowledgement, not a successful pause.
+        checkpoint: SavedError,
+    },
     /// Actual native partial counts, settled extents and retained state survive failure.
     #[error("native transfer failed; inspect its partial report and retained state")]
     Transfer(#[source] Box<crate::transfer::Failure<HttpError>>),

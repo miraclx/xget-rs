@@ -198,8 +198,12 @@ and `.plan().await` exposes frozen read-only assignments before `client.execute(
 uses HEAD, never a preview payload GET, and creates no output directories.
 
 This ordinary Client supports exact HTTP inputs, optional bounded SwissTransfer collections, serial
-files and owned frozen-run continuation. Other trees/catalogues, parallel ranges, partial-byte reuse,
-restart and overwrite remain unsupported. Unsupported inputs fail explicitly. Redirects,
+files and owned frozen-run continuation. Exact HTTP uses up to four parallel windows when HEAD
+explicitly advertises byte ranges, a known nonzero size and a strong ETag of at most 256 bytes.
+Otherwise it keeps ordered whole-response execution. Every range must repeat the frozen pin and match
+its complete requested window and total; ignored ranges or changed pins fail without fallback.
+`Client::open` and SwissTransfer remain ordered whole responses. Other trees/catalogues, restart and
+overwrite remain unsupported. Unsupported inputs fail explicitly. Redirects,
 automatic retries, content decompression and ambient proxies are disabled. Clones share request/body
 admission and connection reuse. Each request has a fixed 15-second deadline for admission waiting,
 connection and headers together, but no payload/inactivity timeout. Retained open bodies can exhaust
@@ -274,9 +278,20 @@ parent reduction across a possible symlink.
 
 Completed files are revalidated using their recorded strong content anchor and native identity, not
 filename/size/mtime or equal foreign bytes. A completion without a strong recorded anchor returns
-`NotRevalidatable`; it does not trigger a hidden hash. Pending files use fresh full HTTP responses with
-frozen strong ETag enforcement when available. This is frozen-run continuation, not partial-byte reuse
-or saved range-reader reopening. Old partials remain untouched.
+`NotRevalidatable`; it does not trigger a hidden hash. Ordered pending files, including SwissTransfer,
+use fresh whole responses with frozen strong ETag enforcement when available; their old partials remain
+untouched. Eligible exact-HTTP range runs instead retain their frozen mode and native reader state.
+Reentry checks that state and rehashes an already-recorded strong proper prefix before fetching only
+the suffix, without a fresh HEAD. Weak/no-hash, missing, unanchored, foreign and closed receiving
+states do not authorize reuse or silently fall back to refetching. Use the explicit `Fresh` entrance
+for deliberately new work, not overwrite or cleanup. V1/V2 aggregate records keep whole-response
+semantics; V3 records can freeze range mode. A fresh selected File's changed range advertisement is
+not new request intent and cannot upgrade/downgrade that stored mode or bypass unfinished work.
+
+`PublishedFile::range_stats()` reports restored bytes and current-attempt source/acknowledged writes.
+Its native receipt counts the logical assembled file. Offline-reconciled completions have no invented
+current-attempt range statistics. Ordinary Client cancellation here is future drop, not a successful
+cooperative-pause API.
 
 Aggregate ownership excludes cooperating same-root aggregate runs while active and stays with submitted physical work after
 a waiter is dropped. Drop is not rollback: publication can finish without a returned receipt. Retain the
@@ -365,8 +380,9 @@ inspectable through reconciliation, not reader continuation.
 `run_until(signal)` stops source admission and settles submitted work. A stop during sealing settles
 the seal without starting publication; its closed state is not reader-resumable. Once publication is
 submitted, stopping cannot undo it. `receipt.stats()` separates restored bytes from this attempt's
-source bytes and acknowledged payload writes. These are advanced caller-supplied reader capabilities,
-not ordinary HTTP Client parallelism/partial-byte reuse or a replacement for the legacy CLI engine.
+source bytes and acknowledged payload writes. The ordinary exact-HTTP Client reuses this coordinator
+for eligible pinned ranges; custom readers remain a distinct application-owned entrance. Neither has
+replaced the legacy CLI engine.
 
 ### Checked live output
 

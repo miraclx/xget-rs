@@ -9,8 +9,8 @@ use bytes::Bytes;
 use futures::Stream;
 use futures::stream::BoxStream;
 use reqwest::header::{
-    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_MATCH,
-    TRANSFER_ENCODING,
+    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG,
+    IF_MATCH, RANGE, TRANSFER_ENCODING,
 };
 use reqwest::{Method, Response};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -18,8 +18,9 @@ use zeroize::Zeroizing;
 
 use super::{Error, VersionConsistency};
 use crate::checks::Requirements;
-use crate::input::Input;
+use crate::input::{Input, RangeSupport};
 use crate::inventory::{Description, File};
+use crate::transfer::reader::Window;
 use crate::transfer::{ByteCount, Length};
 
 const HEADERS_DEADLINE: Duration = Duration::from_secs(15);
@@ -72,7 +73,7 @@ impl Http {
         Ok(())
     }
 
-    pub(super) async fn describe(&self, input: &Input) -> Result<Description, Error> {
+    pub(super) async fn describe(&self, input: &mut Input) -> Result<Description, Error> {
         let path = input.parsed_reference().path();
         if path.len() > MAX_PATH {
             return Err(Error::Inventory(crate::inventory::InventoryError::Limit));
@@ -107,6 +108,11 @@ impl Http {
         Self::validate_headers(response)?;
         let length = Self::length(response)?;
         let etag = Self::strong_etag(response)?;
+        input.ranges = if Self::accepts_ranges(response) {
+            RangeSupport::Bytes
+        } else {
+            RangeSupport::Unknown
+        };
         drop(admitted);
         Ok(Description {
             source_path,
@@ -196,6 +202,79 @@ impl Http {
         ))
     }
 
+    /// A range never downgrades to whole-body access. Both the condition and repeated ETag bind
+    /// every response to the frozen identity representation before its body reaches the coordinator.
+    pub(super) async fn open_range(
+        &self,
+        file: &File,
+        window: Window,
+        size: ByteCount,
+        etag: &str,
+    ) -> Result<HttpBody, Error> {
+        let admitted = self
+            .headers_window(&file.input, Method::GET, Some(etag), Some(window))
+            .await?;
+        let response = &admitted.response;
+        if response.status().as_u16() == 412 {
+            return Err(Error::VersionChanged);
+        }
+        if response.status().as_u16() != 206 {
+            return Err(Error::Status {
+                stage: RequestStage::Payload,
+                status: response.status().as_u16(),
+            });
+        }
+        Self::validate_headers(response)?;
+        if Self::strong_etag(response)?.as_deref().map(String::as_str) != Some(etag) {
+            return Err(Error::VersionChanged);
+        }
+        let mut ranges = response.headers().get_all(CONTENT_RANGE).iter();
+        let range = ranges.next().ok_or(Error::InvalidMetadata)?;
+        if ranges.next().is_some()
+            || !Self::matches_range(range.as_bytes(), window, size)
+            || matches!(Self::length(response)?, Length::Known(count) if count.0 != window.end().0 - window.start().0)
+        {
+            return Err(Error::InvalidMetadata);
+        }
+        let AdmittedResponse { response, permit } = admitted;
+        Ok(HttpBody {
+            stream: Some(Box::pin(response.bytes_stream())),
+            permit: Some(permit),
+        })
+    }
+
+    fn accepts_ranges(response: &Response) -> bool {
+        let mut values = response.headers().get_all(ACCEPT_RANGES).iter();
+        values
+            .next()
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"bytes"))
+            && values.next().is_none()
+    }
+
+    fn matches_range(value: &[u8], window: Window, size: ByteCount) -> bool {
+        let Ok(value) = core::str::from_utf8(value) else {
+            return false;
+        };
+        let Some(value) = value.strip_prefix("bytes ") else {
+            return false;
+        };
+        let Some((bounds, total)) = value.split_once('/') else {
+            return false;
+        };
+        let Some((start, end)) = bounds.split_once('-') else {
+            return false;
+        };
+        let decimal = |text: &str| {
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            text.parse::<u64>().ok()
+        };
+        decimal(start) == Some(window.start().0)
+            && decimal(end) == Some(window.end().0 - 1)
+            && decimal(total) == Some(size.0)
+    }
+
     #[cfg(feature = "swisstransfer")]
     pub(super) async fn metadata(
         &self,
@@ -236,6 +315,16 @@ impl Http {
         method: Method,
         etag: Option<&str>,
     ) -> Result<AdmittedResponse, Error> {
+        self.headers_window(input, method, etag, None).await
+    }
+
+    async fn headers_window(
+        &self,
+        input: &Input,
+        method: Method,
+        etag: Option<&str>,
+        window: Option<Window>,
+    ) -> Result<AdmittedResponse, Error> {
         Self::runtime()?;
         let operation = async {
             let permit = Arc::clone(&self.admission)
@@ -258,6 +347,12 @@ impl Http {
                 .header(ACCEPT_ENCODING, "identity");
             if let Some(etag) = etag {
                 request = request.header(IF_MATCH, etag);
+            }
+            if let Some(window) = window {
+                request = request.header(
+                    RANGE,
+                    format!("bytes={}-{}", window.start().0, window.end().0 - 1),
+                );
             }
             let response = request.send().await.map_err(HttpError::new)?;
             let admitted = AdmittedResponse { response, permit };
@@ -410,7 +505,7 @@ impl Stream for HttpBody {
 pub enum RequestStage {
     /// Advisory metadata HEAD request.
     Metadata,
-    /// Opening the single consumed payload GET.
+    /// Opening a consumed whole-body GET or one exact conditional range response.
     Payload,
 }
 

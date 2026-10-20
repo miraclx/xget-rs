@@ -96,6 +96,7 @@ pub(super) async fn create(
             etag: Option::clone(&file.file.selected.description.etag),
             requirements: file.requirements,
             measurement: file.measurement,
+            mode: crate::client::range::Mode::of(&file.file),
             attempts: Vec::new(),
         })
         .collect();
@@ -230,7 +231,14 @@ mod unix {
             }
             let store_identity = Self::identity(&store)?;
             Ok(Record {
-                version: 2,
+                version: if members
+                    .iter()
+                    .any(|member| member.mode == crate::client::range::Mode::Ranges)
+                {
+                    3
+                } else {
+                    2
+                },
                 root,
                 identity,
                 store_identity,

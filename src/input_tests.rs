@@ -15,6 +15,16 @@ fn an_empty_reference_is_not_an_empty_inventory() {
 }
 
 #[test]
+fn range_capability_is_not_invented_from_a_reference_and_survives_frozen_duplication() {
+    let mut input = Input::parse("https://example.test/payload").expect("reference");
+    assert_eq!(input.ranges, super::RangeSupport::Unknown);
+    input.ranges = super::RangeSupport::Bytes;
+    let duplicate = input.duplicate_reference().expect("frozen duplicate");
+    assert_eq!(duplicate.ranges, super::RangeSupport::Bytes);
+    assert_eq!(duplicate.original_reference(), input.original_reference());
+}
+
+#[test]
 fn one_exact_reference_has_no_implicit_group_or_tree_scope() {
     let input: Input = "https://example.test/archive.zip"
         .parse()

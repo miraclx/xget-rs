@@ -1,4 +1,5 @@
-//! Frozen aggregate continuation. Private V2 records bind input occurrences to members; V1 stays exact HTTP.
+//! Frozen aggregate continuation. V3 adds exact HTTP reader mode to V2 member bindings.
+//! V1/V2 retain their original whole-body meaning and encoding.
 //! This codec is not a public manifest API.
 
 use core::convert::Infallible;
@@ -33,8 +34,10 @@ const MAX_RECORD: usize = 1024 * 1024;
 /// supported, including its query and spelling. SwissTransfer reuses the original share reference
 /// plus its recorded member token, path and any first-open strong pin, never a persisted signed URL.
 /// A different reference is not inferred to be the same member. Continuation rechecks completed native
-/// evidence, then opens fresh full ordered bodies for pending members. It does not reuse partial bytes
-/// or save range maps. V1 remains one exact HTTP member per input; it is not reinterpreted as V2.
+/// evidence. Frozen V3 exact HTTP reader members may rehash an owned strong receiving prefix and open
+/// only missing suffix windows. Native validation refuses missing/unanchored/closed reader evidence;
+/// there is no fallback after refusal. Other members open fresh full ordered bodies. V1/V2 retain
+/// their original whole-body meaning. No transport session capability or credential is persisted.
 ///
 /// ```no_run
 /// use xget::Client;
@@ -499,6 +502,8 @@ impl Fingerprint {
             // Selected-file requests carry a frozen session; do not merge with mutable discovery.
             if let Some(selected) = &input.selected {
                 Self::field(&mut hash, b"selected");
+                // Advisory range support is not caller intent. Matching must still find an older
+                // run when fresh metadata advertises different transport capabilities.
                 match selected.description.length {
                     Length::Unknown => Self::field(&mut hash, b"unknown length"),
                     Length::Known(length) => Self::field(&mut hash, &length.0.to_le_bytes()),
@@ -537,7 +542,8 @@ impl Fingerprint {
 
 struct Record {
     // V1 remains one exact HTTP file per input. It is read and checkpointed as V1, never
-    // reinterpreted as collection state. New records freeze explicit N-input -> M-member bindings.
+    // reinterpreted as collection state. V2 freezes N-input -> M-member bindings; V3 additionally
+    // freezes reader capability without changing the meaning or encoding of either older version.
     version: u32,
     root: PathBuf,
     identity: RootIdentity,
@@ -572,6 +578,7 @@ struct Member {
     etag: Option<Zeroizing<String>>,
     requirements: Requirements,
     measurement: Measurement,
+    mode: super::range::Mode,
     attempts: Vec<Attempt>,
 }
 
@@ -590,6 +597,7 @@ impl Member {
         let supplied = &selected.description;
         // Exact-reference equality alone does not authorize discarding a supplied frozen session.
         // Preserve the stored policy, rejecting newer or additional selected evidence before effects.
+        // Fresh range hints do not change authority: reconstruction restores the recorded mode.
         self.remote
             .as_ref()
             .is_none_or(|remote| supplied.source_path.as_str() == remote.source_path.as_str())
@@ -642,6 +650,10 @@ impl Owned {
             // Resume::input already rejected incompatible selected evidence before ownership.
             // The stored session remains authoritative; compatible metadata grants no policy change.
             input.selected = None;
+            input.ranges = match member.mode {
+                super::range::Mode::Whole => crate::input::RangeSupport::Unknown,
+                super::range::Mode::Ranges => crate::input::RangeSupport::Bytes,
+            };
             // Exact-reference equality was checked before ownership. Reconstitute only advisory
             // display metadata from that same supplied reference, never identity or selection.
             let remote_path = input.parsed_reference().path();
@@ -782,6 +794,38 @@ impl Owned {
             Reconciliation::NotRevalidatable(_) => Err(SavedError::NotRevalidatable),
         }
     }
+    pub(super) fn reader_state(&self, index: usize) -> Option<StateRef> {
+        let member = &self.saved.record.members[index];
+        if member.mode != super::range::Mode::Ranges {
+            return None;
+        }
+        member
+            .attempts
+            .last()
+            .map(|attempt| StateRef::clone(&attempt.state))
+    }
+
+    pub(super) async fn submit_reader(
+        &mut self,
+        index: usize,
+        state: &StateRef,
+    ) -> Result<(), SavedError> {
+        let member = &mut self.saved.record.members[index];
+        if member.mode != super::range::Mode::Ranges {
+            return Err(SavedError::Binding);
+        }
+        if let Some(attempt) = member.attempts.last_mut() {
+            if attempt.state != *state || attempt.status == AttemptStatus::Complete {
+                return Err(SavedError::Uncertain);
+            }
+            // Continuation is the same owned native attempt, not a duplicate locator or authority
+            // to replace older attempts. Record intent again before submitting any physical work.
+            attempt.status = AttemptStatus::Submitted;
+            return self.checkpoint().await;
+        }
+        self.submit(index, state).await
+    }
+
     pub(super) async fn submit(
         &mut self,
         index: usize,

@@ -5,8 +5,9 @@
 //! resolved files without acquiring their payloads. The current Client executes files serially and
 //! rejects unsupported provider/tree inputs explicitly. Native publication is absent-only on supported
 //! Unix filesystems. [`SavedRun`] inspects frozen aggregate state offline; ordinary re-entry finds a
-//! unique matching unfinished run before new discovery. Pending members continue with fresh full HTTP
-//! responses, not partial-byte reuse. Restart and overwrite are not implemented by this Client.
+//! unique matching unfinished run before new discovery. Whole-response members open fresh bodies;
+//! eligible exact-HTTP range members revalidate a recorded strong prefix and fetch only the suffix.
+//! Restart and overwrite are not implemented by this Client.
 //!
 //! Use [`Transfer`] for an already-open application body, either checked native publication or
 //! [`transfer::live`] delivery to an application-owned consumer/writer. [`Transfer::from_reader`] accepts

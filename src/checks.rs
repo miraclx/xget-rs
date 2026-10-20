@@ -271,7 +271,7 @@ impl Requirements {
         Self { entries }
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     /// Canonical encoding and policy checks share one fixed algorithm order.
     pub(crate) fn iter(self) -> impl Iterator<Item = Requirement> {
         self.entries.into_iter().flatten()

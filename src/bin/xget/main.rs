@@ -84,7 +84,7 @@ struct Cli {
     /// Report raw byte counts instead of human-readable sizes.
     #[arg(long)]
     raw_sizes: bool,
-    /// Show transfer speed in bits per second (Mbps) instead of bytes (MiB/s).
+    /// Show bar/plain transfer speed in bits per second (Mbps) instead of bytes (MiB/s).
     #[arg(long)]
     bits: bool,
     /// Verbose diagnostics on stderr: `-v` for chunk ranges, retries, and errors as they happen; `-vv`
@@ -198,6 +198,7 @@ async fn run() -> eyre::Result<()> {
         headers.insert(HeaderName::clone(name), HeaderValue::clone(value));
     }
     let source = build_source(&cli, &headers).await?;
+    let format = DisplayFormat::from(&cli);
     let mode = resolve_mode(&cli);
 
     // Probe once up front for the preamble and the output name; the download re-probes authoritatively.
@@ -214,6 +215,7 @@ async fn run() -> eyre::Result<()> {
             dest.output.as_deref(),
             dest.sink,
             dest.resume,
+            format,
         );
     }
 
@@ -246,7 +248,7 @@ async fn run() -> eyre::Result<()> {
         _ => cli.checksum,
     };
 
-    let reporter = Reporter::new(mode, cli.raw_sizes, cli.bits);
+    let reporter = Reporter::new(mode, format);
     let started = Instant::now();
     // Open the write target up front and hold it for the whole download, so the engine can borrow it.
     let mut handle = Handle::open(&dest).await?;
@@ -272,8 +274,8 @@ async fn run() -> eyre::Result<()> {
     let report = tokio::select! {
         result = plan.progress(&reporter).write(handle.output()) => result?,
         _ = tokio::signal::ctrl_c() => {
-            if mode == ProgressMode::Bar {
-                eprintln!(); // move past the in-place bar onto a fresh line
+            if matches!(mode, ProgressMode::Bar | ProgressMode::Plain) {
+                eprintln!(); // both human reporters draw in place without a trailing newline
             }
             match &dest.output {
                 Some(output) if matches!(dest.sink, Sink::File) => {
@@ -295,7 +297,7 @@ async fn run() -> eyre::Result<()> {
         }
     }
 
-    summary(mode, &cli, checksum, &report, started.elapsed());
+    summary(mode, format, checksum, &report, started.elapsed());
     Ok(())
 }
 
@@ -483,7 +485,14 @@ fn build_ipfs_source(_rest: &str, _gateway: Option<String>) -> eyre::Result<AnyS
 /// Print the block shown before a live bar: the URL, how many chunks, the length and media type, and
 /// where the bytes are going, noting when the run is continuing a partial. Always to stderr, so it does
 /// not corrupt a `-` download whose data is on stdout.
-fn preamble(cli: &Cli, probe: Option<&Probe>, output: Option<&Path>, sink: Sink, resume: bool) {
+fn preamble(
+    cli: &Cli,
+    probe: Option<&Probe>,
+    output: Option<&Path>,
+    sink: Sink,
+    resume: bool,
+    format: DisplayFormat,
+) {
     eprintln!("{}URL:{} {}", DIM.render(), DIM.render_reset(), cli.url);
     let chunks = match probe {
         Some(probe) if probe.supports_ranges => xget::plan(probe.length, cli.chunks).len().max(1),
@@ -493,7 +502,7 @@ fn preamble(cli: &Cli, probe: Option<&Probe>, output: Option<&Path>, sink: Sink,
     eprintln!("{}Chunks:{} {chunks}", DIM.render(), DIM.render_reset());
     match probe {
         Some(probe) => {
-            let size = fmt_size(probe.length, cli.raw_sizes);
+            let size = format.size(probe.length);
             match &probe.content_type {
                 Some(kind) => eprintln!(
                     "{}Length:{} {size} [{kind}]",
@@ -536,7 +545,7 @@ fn preamble(cli: &Cli, probe: Option<&Probe>, output: Option<&Path>, sink: Sink,
 /// requested. Skipped for `json` (which emits an `end` event instead).
 fn summary(
     mode: ProgressMode,
-    cli: &Cli,
+    format: DisplayFormat,
     checksum: Checksum,
     report: &xget::Report,
     elapsed: Duration,
@@ -550,7 +559,7 @@ fn summary(
         }
         return;
     }
-    let size = fmt_size(report.length, cli.raw_sizes);
+    let size = format.size(report.length);
     // The summary is chatter, not data, so it goes to stderr, leaving stdout clean for a `-` stream.
     eprintln!("Downloaded {size} in {}", fmt_elapsed(elapsed));
     if let Some(hash) = &report.hash {
@@ -571,28 +580,48 @@ fn resolve_mode(cli: &Cli) -> ProgressMode {
     mode
 }
 
-/// Format a byte count, either raw or human-readable.
-pub(crate) fn fmt_size(bytes: u64, raw: bool) -> String {
-    if raw {
-        bytes.to_string()
-    } else {
-        ByteSize::of(bytes, BYTE).iec().to_string()
+/// Human display units, resolved once from the flags. Raw byte counts take precedence over bit rates;
+/// JSON does not use this format because its counts and rates always have fixed byte units.
+#[derive(Clone, Copy)]
+pub(crate) enum DisplayFormat {
+    /// IEC byte sizes and byte rates, the default for a file tool.
+    HumanBytes,
+    /// IEC byte sizes, with decimal bit rates for comparison to a network link.
+    HumanBits,
+    /// Unscaled byte counts and byte rates.
+    RawBytes,
+}
+
+impl From<&Cli> for DisplayFormat {
+    fn from(cli: &Cli) -> Self {
+        if cli.raw_sizes {
+            Self::RawBytes
+        } else if cli.bits {
+            Self::HumanBits
+        } else {
+            Self::HumanBytes
+        }
     }
 }
 
-/// Format a transfer rate, in bytes per second by default (to match the size readout) or in bits per
-/// second under `--bits`. This is the single place speed spelling lives; the reporters call it. `--raw-sizes`
-/// takes precedence over `--bits`: a raw count is a byte count, so bits does not apply.
-pub(crate) fn fmt_speed(rate: u64, raw: bool, bits: bool) -> String {
-    if bits && !raw {
-        // decimal bits, contracted: "83.9 Mbps" / "512 kbps" / "8 bps"
-        format!(
-            "{}ps",
-            ByteSize::of(rate, BYTE).repr(Mode::Bits | Mode::Decimal)
-        )
-    } else {
-        // bytes (or raw), matching the size readout: "10.0 MiB/s" or "<n>/s" under --raw-sizes
-        format!("{}/s", fmt_size(rate, raw))
+impl DisplayFormat {
+    /// Render a size in bytes, unscaled only for the raw format.
+    pub(crate) fn size(self, bytes: u64) -> String {
+        match self {
+            Self::RawBytes => bytes.to_string(),
+            Self::HumanBytes | Self::HumanBits => ByteSize::of(bytes, BYTE).iec().to_string(),
+        }
+    }
+
+    /// Render a bytes-per-second measurement in the chosen display units.
+    pub(crate) fn speed(self, rate: u64) -> String {
+        match self {
+            Self::HumanBits => format!(
+                "{}ps",
+                ByteSize::of(rate, BYTE).repr(Mode::Bits | Mode::Decimal)
+            ),
+            Self::HumanBytes | Self::RawBytes => format!("{}/s", self.size(rate)),
+        }
     }
 }
 
@@ -672,7 +701,7 @@ async fn show_info(cli: &Cli) -> eyre::Result<()> {
         );
     };
 
-    let raw = cli.raw_sizes;
+    let format = DisplayFormat::from(cli);
     let percent = if info.total > 0 {
         info.downloaded as f64 * 100.0 / info.total as f64
     } else {
@@ -682,10 +711,10 @@ async fn show_info(cli: &Cli) -> eyre::Result<()> {
         "Source:     {}",
         info.source.as_deref().unwrap_or("(unknown)")
     );
-    println!("Size:       {}", fmt_size(info.total, raw));
+    println!("Size:       {}", format.size(info.total));
     println!(
         "Downloaded: {}  ({percent:.1}%)",
-        fmt_size(info.downloaded, raw)
+        format.size(info.downloaded)
     );
     if let Some(validator) = &info.validator {
         println!("Validator:  {validator}");

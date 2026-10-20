@@ -53,9 +53,12 @@ Verify against a known checksum. `--expect` takes an inline `algo:hex`, a bare h
 checksum file, and exits non-zero on mismatch:
 
 ```console
-xget https://example.com/big.iso --expect sha256:9f86d0818...
+xget https://example.com/big.iso --expect sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 xget https://example.com/big.iso --expect https://example.com/big.iso.sha256sum
 ```
+
+`--expect` verifies a download, not a file already on disk. To check an existing file, use a checksum
+utility such as `shasum -a 256 big.iso`.
 
 ![a checksum mismatch fails loudly and exits non-zero](media/expect.gif)
 
@@ -68,7 +71,8 @@ silently frozen bar:
 Across runs it is just as forgiving. Interrupt it and run it again: it resumes from where it stopped,
 re-verifying the bytes already on disk from the start as it goes (a checksum cannot be resumed
 mid-stream, so the guarantee is worth the reread), no flag needed. You can also point xget straight at
-the leftover control file and it finishes the job, no URL to retype:
+the leftover control file and it finishes the job, no URL to retype. Ctrl-C exits with status 130 and
+prints the resume command; stdout, pipe, and discard outputs keep no resumable partial:
 
 ```console
 xget big.iso.xget
@@ -136,6 +140,13 @@ name comes from the server (`Content-Disposition`) or the URL. The full list is 
 | `--progress <MODE>` | `auto`, `bar`, `plain`, `json`, or `none` |
 | `-v, -vv` | verbose diagnostics on stderr |
 
+The inactivity timeout is opt-in. Without `--timeout`, a stalled chunk may wait indefinitely.
+
+`--progress json` writes newline-delimited events to stderr: `progress`, `retry`, `end`, and, when a
+checksum was computed, `verified`. A quick download may finish before the first throttled `progress`
+event. Byte counts and `speed` are always bytes and bytes per second; `eta` is seconds and `end.elapsed`
+is milliseconds. `--bits` and `--raw-sizes` affect human output only and do not change JSON units.
+
 ## Library usage
 
 Start with `get(url)` and finish with `.write(output)`:
@@ -169,8 +180,9 @@ Chunks are written straight to their offsets in a sparse `<file>.xget`; one veri
 order, hashing the contiguous prefix and gating on the exact length, then it is renamed into place. That
 same `.xget` is the resume control: it records the ranges already written, so a re-run picks up each
 chunk where it stopped and folds the existing bytes into the same verify pass. Before resuming, xget
-checks the resource has not changed (via its `ETag`/`Last-Modified`, or an IPFS CID); if it has, the
-partial is discarded rather than stitched.
+compares the saved and current resource validators (`ETag`, `Last-Modified`, or an IPFS CID); a mismatch
+discards the partial rather than stitching versions together. If either validator is absent, resume
+falls back to the length alone, which cannot detect a same-length resource change.
 
 ## Differences from libxget-js
 

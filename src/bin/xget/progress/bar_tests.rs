@@ -5,6 +5,7 @@ use xprogress::{Bar, DrawTarget};
 
 use super::super::Meter;
 use super::{BarProgress, Live, MAX_NOTICES, frame, locale_is_utf8};
+use crate::DisplayFormat;
 
 /// A `Live` far from any terminal: `DrawTarget::hidden()` draws nothing, so the test never touches
 /// stderr, and `Meter::new` starts the readout from zero.
@@ -16,8 +17,7 @@ fn live(total: u64) -> Live {
         multi: false,
         prev_lines: 0,
         meter: Meter::new(total),
-        raw: false,
-        bits: false,
+        format: DisplayFormat::HumanBytes,
         chunks: 1,
         unicode: false,
         notices: Vec::new(),
@@ -46,8 +46,7 @@ fn utf8_locales_are_recognized() {
 fn a_bar_without_retries_draws_no_notice_lines() {
     let progress = BarProgress {
         inner: RefCell::new(None),
-        raw: false,
-        bits: false,
+        format: DisplayFormat::HumanBytes,
     };
     started(&progress, 100);
     assert_eq!(render(&progress).lines().count(), 1);
@@ -57,8 +56,7 @@ fn a_bar_without_retries_draws_no_notice_lines() {
 fn a_retry_is_parked_above_the_bar_and_stays_there() {
     let progress = BarProgress {
         inner: RefCell::new(None),
-        raw: false,
-        bits: false,
+        format: DisplayFormat::HumanBytes,
     };
     started(&progress, 100);
     progress.retry(0, 1, 10, 40, "connection reset");
@@ -71,7 +69,7 @@ fn a_retry_is_parked_above_the_bar_and_stays_there() {
     assert!(lines[0].contains("retry 1/10"), "got {:?}", lines[0]);
     assert!(lines[0].contains("connection reset"), "got {:?}", lines[0]);
     assert!(
-        lines[0].contains('4'),
+        lines[0].contains("40 B"),
         "resume point missing: {:?}",
         lines[0]
     );
@@ -82,8 +80,7 @@ fn a_retry_is_parked_above_the_bar_and_stays_there() {
 fn notices_cap_so_a_mass_retry_cannot_push_the_bar_off_screen() {
     let progress = BarProgress {
         inner: RefCell::new(None),
-        raw: false,
-        bits: false,
+        format: DisplayFormat::HumanBytes,
     };
     started(&progress, 100);
     for attempt in 1..=(MAX_NOTICES as u32 + 3) {

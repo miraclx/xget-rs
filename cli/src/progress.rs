@@ -3,6 +3,7 @@
 //! [`speedometer`] windowed rate feed the two that render numbers.
 
 use core::time::Duration;
+use std::io::IsTerminal as _;
 use std::time::Instant;
 
 use xget::Progress;
@@ -28,6 +29,15 @@ pub(crate) const DIM: anstyle::Style = anstyle::Style::new().dimmed();
 pub(crate) struct Reporter(Box<dyn Progress>);
 
 impl Reporter {
+    /// Human diagnostics use terminal chrome only when stderr can render it.
+    pub(crate) fn diagnostic_style() -> anstyle::Style {
+        if std::io::stderr().is_terminal() {
+            DIM
+        } else {
+            anstyle::Style::new()
+        }
+    }
+
     pub(crate) fn new(mode: ProgressMode, format: DisplayFormat) -> Self {
         Reporter(match mode {
             ProgressMode::Bar | ProgressMode::Auto => Box::new(BarProgress::new(format)),

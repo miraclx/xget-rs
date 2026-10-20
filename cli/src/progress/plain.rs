@@ -1,18 +1,29 @@
-//! A single updating text line, for when there is no terminal to draw a live bar on.
+//! Throttled text progress: updating on a terminal, newline-delimited when captured.
 
 use core::cell::RefCell;
 use core::time::Duration;
+use std::io::IsTerminal as _;
 
 use xget::Progress;
 
 use super::Meter;
 use crate::DisplayFormat;
 
-/// A single updating text line: `done / total (pct%)  speed  eta`, drawn in place on stderr and
-/// throttled, with a final newline so the shell prompt lands cleanly.
+#[cfg(test)]
+#[path = "plain_tests.rs"]
+mod tests;
+
+/// Human progress on stderr, without terminal cursor controls in captured output.
 pub(crate) struct PlainProgress {
     meter: RefCell<Option<Meter>>,
     format: DisplayFormat,
+    rendering: Rendering,
+}
+
+#[derive(Clone, Copy)]
+enum Rendering {
+    Updating,
+    Lines,
 }
 
 impl PlainProgress {
@@ -20,36 +31,56 @@ impl PlainProgress {
         Self {
             meter: RefCell::new(None),
             format,
+            rendering: if std::io::stderr().is_terminal() {
+                Rendering::Updating
+            } else {
+                Rendering::Lines
+            },
         }
     }
 
     fn line(&self, meter: &mut Meter) -> String {
-        // `rate`/`eta_clock` age the window to now, so they take `&mut`; pull them into locals first so
-        // the one format call does not mix a mutable read with the immutable field reads beside it.
+        // Pull the aging mutable measurements before borrowing the remaining fields for formatting.
         let speed = self.format.speed(meter.rate());
         let eta = meter.eta_clock();
         format!(
-            "\r\x1b[K{:>5.1}%  {}/{}  {speed}  ETA {eta}",
+            "{:>5.1}%  {}/{}  {speed}  ETA {eta}",
             meter.percent_f64(),
             self.format.size(meter.done),
             self.format.size(meter.total),
         )
+    }
+
+    fn prefix(&self) -> &'static str {
+        match self.rendering {
+            Rendering::Updating => "\r\x1b[K",
+            Rendering::Lines => "",
+        }
+    }
+
+    fn render(&self, meter: &mut Meter) {
+        let line = self.line(meter);
+        match self.rendering {
+            Rendering::Updating => {
+                eprint!("{}{line}", self.prefix());
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+            Rendering::Lines => eprintln!("{line}"),
+        }
     }
 }
 
 impl Progress for PlainProgress {
     fn start(&self, chunks: &[u64]) {
         let mut meter = Meter::new(chunks.iter().sum());
-        eprint!("{}", self.line(&mut meter));
-        let _ = std::io::Write::flush(&mut std::io::stderr());
+        self.render(&mut meter);
         *self.meter.borrow_mut() = Some(meter);
     }
 
     fn restore(&self, present: &[u64]) {
         if let Some(meter) = self.meter.borrow_mut().as_mut() {
             meter.restore(present.iter().sum());
-            eprint!("{}", self.line(meter));
-            let _ = std::io::Write::flush(&mut std::io::stderr());
+            self.render(meter);
         }
     }
 
@@ -57,15 +88,16 @@ impl Progress for PlainProgress {
         if let Some(meter) = self.meter.borrow_mut().as_mut()
             && meter.advance(bytes, Duration::from_millis(200))
         {
-            eprint!("{}", self.line(meter));
-            let _ = std::io::Write::flush(&mut std::io::stderr());
+            self.render(meter);
         }
     }
 
     fn retry(&self, index: usize, retry: u32, max: u32, resume_from: u64, error: &str) {
-        // Clear the in-place progress line and drop the retry on its own line; the next update redraws.
+        // A remote cause must not inject cursor controls or extra log lines.
+        let error = error.escape_debug();
         eprintln!(
-            "\r\x1b[Kchunk {} retry {retry}/{max}: {error} (from {})",
+            "{}chunk {} retry {retry}/{max}: {error} (from {})",
+            self.prefix(),
             index + 1,
             self.format.size(resume_from)
         );
@@ -73,7 +105,7 @@ impl Progress for PlainProgress {
 
     fn finish(&self) {
         if let Some(meter) = self.meter.borrow_mut().as_mut() {
-            eprintln!("{}", self.line(meter));
+            eprintln!("{}{}", self.prefix(), self.line(meter));
         }
     }
 }

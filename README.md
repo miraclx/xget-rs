@@ -163,6 +163,11 @@ checksum was computed, `verified`. A quick download may finish before the first 
 event. Byte counts and `speed` are always bytes and bytes per second; `eta` is seconds and `end.elapsed`
 is milliseconds. `--bits` and `--raw-sizes` affect human output only and do not change JSON units.
 
+`--progress plain` updates in place on a terminal. When stderr is captured, it emits complete text
+lines without cursor-control escapes or styled diagnostic labels. Retry-cause control characters are
+escaped rather than allowed to redraw or split those lines. Progress and diagnostics stay on stderr;
+a `-` output's payload stays on stdout.
+
 ## Library usage
 
 Depend on the root `xget` package; `xget-cli` is not needed for library use.

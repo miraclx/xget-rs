@@ -20,7 +20,7 @@ jobs:
     - uses: dtolnay/rust-toolchain@nightly
       with:
         components: rustfmt
-    - run: cargo +nightly fmt --check
+    - run: cargo +nightly fmt --all --check
 
   clippy:
     name: clippy
@@ -33,13 +33,14 @@ jobs:
         components: clippy
     - uses: Swatinem/rust-cache@v2
     - name: clippy (default features)
-      run: cargo clippy --all-targets -- -D warnings
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    # The CLI forwards these features to the library it consumes, so the named package enables both.
     - name: clippy (s3 feature)
-      run: cargo clippy --all-targets --features s3 -- -D warnings
+      run: cargo clippy --workspace --all-targets --features xget-cli/s3 -- -D warnings
     - name: clippy (ipfs feature)
-      run: cargo clippy --all-targets --features ipfs -- -D warnings
+      run: cargo clippy --workspace --all-targets --features xget-cli/ipfs -- -D warnings
     - name: clippy (all features)
-      run: cargo clippy --all-targets --features "s3 ipfs" -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: test
@@ -49,22 +50,21 @@ jobs:
     - uses: dtolnay/rust-toolchain@1.97.1
     - uses: Swatinem/rust-cache@v2
     - name: test (default features, all targets + doctests)
-      run: cargo test --all-targets && cargo test --doc
+      run: cargo test --workspace --all-targets && cargo test -p xget --doc
     # The s3 code paths compile and their tests run without any live AWS. Build and test them so the
     # feature does not rot; the integration tests here use a fake Source and an in-process mock server,
-    # never a live network.
+    # never a live network. The CLI forwards the feature, so naming it there enables the library too.
     - name: test (s3 feature)
-      run: cargo test --all-targets --features s3
+      run: cargo test --workspace --all-targets --features xget-cli/s3
     # The ipfs source resolves a CID to a gateway HTTP request; its unit tests parse CIDs and derive the
     # verifiable checksum with no network. All features together must also build and test cleanly.
     - name: test (ipfs feature)
-      run: cargo test --all-targets --features ipfs
+      run: cargo test --workspace --all-targets --features xget-cli/ipfs
     - name: test (all features)
-      run: cargo test --all-targets --features "s3 ipfs" && cargo test --doc --features "s3 ipfs"
+      run: cargo test --workspace --all-targets --all-features && cargo test -p xget --doc --all-features
 
-  # Prove the crate and the binary compile on Windows too. A Windows runner has the MSVC toolchain the
-  # TLS backend's native crypto needs, so this catches any non-portable code (the one unix-only path,
-  # special-file detection, is cfg-gated and falls back on other platforms).
+  # Check both packages on Windows with the MSVC toolchain required by the TLS backend. Unix filesystem
+  # operations are cfg-gated; this checks fallback compilation, not native publication on Windows.
   windows:
     name: windows check
     runs-on: windows-latest
@@ -72,7 +72,7 @@ jobs:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@1.97.1
     - uses: Swatinem/rust-cache@v2
-    - run: cargo check --all-targets --features "s3 ipfs"
+    - run: cargo check --workspace --all-targets --all-features
 
 # Note: the docker harness under harness/ (go-httpbin + minio + toxiproxy) is a manual dev tool for
 # fault-injection and real-object-store testing. It needs containers and is intentionally not run in

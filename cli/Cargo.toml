@@ -1,0 +1,48 @@
+# The command-line layer. It consumes the `xget` library at the path below and owns everything a terminal
+# or a shell needs (argument parsing, progress rendering, tracing setup), so the library carries none of it.
+[package]
+name = "xget-cli"
+version = "0.1.0"
+authors = ["Miraculous Owonubi <omiraculous@gmail.com>"]
+edition = "2024"
+rust-version = "1.97.1"
+description = "Command-line interface for the xget fetch engine"
+repository = "https://github.com/miraclx/xget-rs"
+license = "MIT OR Apache-2.0"
+
+# Keep the established executable name. This single-command binary uses the CLI module-tree rule's
+# single-file exception; new command groups must own their modules.
+[[bin]]
+name = "xget"
+path = "src/main.rs"
+
+[features]
+ipfs = ["xget/ipfs"]
+# The S3 sidecar reader streams an object through the xget source, so it needs futures under this feature.
+s3 = ["dep:futures", "xget/s3"]
+
+[dependencies]
+anstyle = "1"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15.7"
+eyre = "0.6"
+futures = { version = "0.3", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["fs", "io-std", "macros", "rt-multi-thread", "signal"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+xbytes = { git = "https://github.com/miraclx/xbytes-rs" }
+xget = { path = ".." }
+xprogress = { git = "https://github.com/miraclx/xprogress-rs" }
+
+# Free-space checks for the sequential-stream automatic switch. Unix only; elsewhere the check is absent.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints.rust]
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+wildcard_imports = "deny"
+std_instead_of_core = "warn"

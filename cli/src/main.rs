@@ -871,12 +871,11 @@ fn resolve_output(cli: &Cli, probe: Option<&Probe>) -> eyre::Result<PathBuf> {
     if path.exists() && !cli.overwrite {
         eyre::bail!("{} already exists (use -f to overwrite)", path.display());
     }
-    if !cli.no_directories {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+    if !cli.no_directories
+        && let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     Ok(path)
 }

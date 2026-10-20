@@ -1,133 +1,158 @@
 # AGENTS.md
 
-`xget`: a chunked, parallel, resumable, verified fetch engine over a pluggable byte source. lib + bin, one
-crate, edition 2024, toolchain pinned to 1.97.1.
+`xget` is a reusable fetch library. `xget-cli` is the workspace's command-line package and installs the
+`xget` executable. Both use edition 2024 and the pinned Rust 1.97.1 toolchain.
 
-- `STYLE.md` is the contract. It is not a summary of the house rules, it is the house rules. Read it before
-  writing a line. It has one carve-out already granted: a one-shot private pipeline may stay as free
-  functions, in House rules.
-- `miraclx/REVIEW.md` is how this code gets reviewed. The severity, verdict and closure vocabulary lives
-  there. `notes/craft-backlog.md` is what is open.
-- The open items are the work. `notes/craft-backlog.md` is the list. Nothing here is a task.
+- Read `STYLE.md` before writing code. It is the contract, including the narrow private-pipeline
+  exception. `../craft/REVIEW.md` defines review evidence, severity and closure vocabulary.
+- `notes/craft-backlog.md` tracks open work. Historical reviews are not rewritten when a later fix lands.
+- The approved redesign is broader than the implemented surface. Do not call the ordinary Client,
+  inventory, multi-input selection, provider adapters or new recovery UX implemented until they exist.
 
-## The trap that will bite you first
+## Workspace boundary
 
-`Cargo.toml` depends on `xbytes` and `xprogress` as **unpinned git deps**. `.cargo/config.toml` (gitignored,
-local only) overrides them with `paths = ["../xbytes-rs", "../xprogress-rs"]`.
+- Root package `xget`: `src/`, library integration tests in `tests/`, transport sources and the advanced
+  native `transfer` module. No argument parser, progress renderer or dotenv setup belongs here.
+- Package `xget-cli`: `cli/src/`, executable `xget`. Its single-command `main.rs` retains the documented
+  module-tree exception. That is not permission to add provider orchestration to main.
+- The old working files under `src/bin/xget/` are preserved provisional work, excluded from root binary
+  discovery and packaging. They are not the compiled CLI. Do not accidentally add their SwissTransfer
+  feature, synthetic file locators or provider-owned scheduler through a move or broad staging operation.
+- No `mod.rs`. Unit tests stay in sibling `*_tests.rs` files. Private child tests use `#[path]`; do not
+  widen production visibility or move their declarations to the crate root just for access.
 
-So a local build runs against the **sibling working copies**, while `Cargo.lock` pins the **remote revs**.
-These are two different bodies of code and they drift silently.
+The existing `Source`, `get`, `from`, `Download`, `Output` and `Report` library APIs remain available.
+`Source` uses native async trait methods and is not object-safe. The CLI's concrete enum dispatch is
+intentional; source futures need not be Send.
 
-```
-Cargo.lock pins   xprogress 418aa05a (2026-08-30)  where DrawTarget::interject exists
-local override    xprogress-rs HEAD 8f2665c (2026-09-08)  where it was cut
-```
+## Two dependency graphs
 
-A sibling commit can break this crate's build while **CI stays green**, because CI has no override and uses
-the lock. Never trust green CI to mean your local tree compiles, and never trust a green local build to mean
-the lock is satisfiable. After touching either sibling, `cargo update -p xprogress` and re-run the build.
+The library uses Git `xbytes`; the CLI uses Git `xprogress` and the library. The ignored local
+`.cargo/config.toml` overrides both siblings through paths. Local working-copy success and locked-Git
+success are different evidence. A sibling commit or a green CI run does not establish both.
 
-`unreachable_pub` is not enabled, so `plan::plan_range` and `plan::plan_resume` are `pub` in a private
-module and not nameable outside the crate. That is current state, not intent.
+Run Cargo from an isolated export's own cwd when checking the pinned graph. `--manifest-path` alone
+still inherits configuration from the caller's cwd. Inspect actual metadata sources/revisions. Do not
+silently advance a dependency pin to an unrelated or unavailable revision. Check xget and Freyr callers
+before removing a public sibling API; Freyr uses xprogress rows, block drawing and Dump.
 
 ## Gates
 
-All four, before every commit. This is the definition of done.
+Before each commit, validate the exact staged prefix, not merely the larger working tree. Keep build
+and install targets outside checkout; do not overwrite a user's executable.
 
-```
-cargo test
+```console
+cargo test --workspace --all-targets
+cargo test --workspace --doc
 cargo clippy --workspace --all-targets -- -D warnings
-cargo +nightly fmt --check        # nightly: group_imports and imports_granularity are nightly-only
+cargo +nightly fmt --check
 cargo sort --workspace --check
 ```
 
-`harness/` is the fault-injection rig: docker compose (go-httpbin, MinIO, toxiproxy), `up.sh` then
-`scenarios.sh`. It is **manual and not in CI** (`ci.yml:77-79`). It is the only thing that proves resume,
-retry, mirror failover and the S3 paths actually work, so a green test suite does not cover it. It needs
-`docker`, the `aws` CLI, and `timeout` (Homebrew coreutils on macOS, absent from a stock Mac).
+Also run individual source features and all features, including doctests and strict Clippy, on both
+actual dependency graphs. Warning-denied docs, an external library consumer, local CLI installation and
+actual executable smoke checks are workspace-boundary gates. Package listing must exclude the old CLI
+and provisional provider tree from the library package.
 
-## Invariants
+Rust 1.97.1 is the exercised support baseline. The previous advertised 1.85 was not proven. Do not
+claim a lower MSRV without the corresponding toolchain/dependency/feature validation.
 
-**Verify-as-you-scatter.** An in-order hasher runs concurrently with the chunk fetchers on the same task,
-chasing a contiguous frontier (`engine.rs:647`). `received` advances the lead, `wrote` advances the done.
-This is why the crate can return a verified file without waiting for the slowest chunk, and why it is
-single-task structured concurrency: source futures need not be `Send`.
+## Legacy engine invariants
 
-**The `.xget` file is the download.** A file sink scatters into `<output>.xget` and renames it into place
-only on success (`engine.rs:226`). Layout is `[data 0..total][text trailer][32-byte footer]`, magic
-`XGETCTL1` (`control.rs:4`, `:26`, `:28`). The rename happens after `Writer::finish` truncates trailer and footer, so
-**before the rename the `.xget` is not the finished bytes**.
+**Verify as bytes arrive.** The in-order verifier runs alongside fetchers on one task, chasing a
+contiguous frontier. Received progress is not verified progress. The Barrier/Notify regression in
+`tests/engine.rs` forces tails before a partial head and verifies that head before its body can finish.
+Do not replace this with a hash pass that starts only after the slowest chunk completes.
 
-**Resume is automatic.** No flag. Presence of a valid `.xget` beside the output resumes it; `--restart` opts
-out. `-c/--continue` and `--no-bar` were removed; `--stream` became `--sequential`.
+**The partial is not the finished file.** `<output>.xget` contains data, a text trailer and a 32-byte
+`XGETCTL1` footer. `Writer::finish` removes trailer/footer before rename. Fresh allocation and truncation
+belong to `Writer::create`, before control writing; `Writer::open` preserves resumed data and control.
 
-**`validators_agree` is the splice guard** (`engine.rs:354`). If both an ETag and a Last-Modified are
-present they must match; a resource that changed between runs is never resumed into, because the old bytes
-would be spliced onto the new. If either side is absent it returns `true` and falls back to length alone.
-That fallback is the security-relevant default and it currently has **no test** (`craft-backlog.md`, B2).
+**Resume is automatic.** `--restart` opts out. When both validators exist they must agree; when either
+is missing, legacy resume falls back to length and cannot detect a same-length change. Five unit cases
+pin that policy. Do not import this fallback into stronger new version/identity guarantees.
 
-**Ordering rule that lives in the wrong place**: `allocate_fresh` must run before `Writer::create`, or
-`create` truncates the trailer. The invariant is on the caller (`engine.rs:137`), not on `Writer`. Tracked
-as H3.
+**No fsync.** Flushing covers process interruption, not power-loss durability. Do not invent a stronger
+crash guarantee. The subtractive over-serve check, `len > range.end - offset`, avoids integer wrap; do
+not replace it with a comparison that admits a wrapped offset.
 
-**No `fsync`.** Control updates are flushed to the OS, never fsynced. Survives process interruption, may
-lose the last checkpoints on power loss. Deliberate, documented at `control.rs:122-125`. The README makes no
-crash-durability promise, which is why the decision is defensible.
+**Scratch ownership.** Temporary stdout/pipe/discard scratches are `xget-<pid>-<counter>.xget` and are
+removed by their guard. Startup sweeping only targets that temporary naming pattern with dead PIDs.
+Persistent file partials must never be swept. Test actual CLI runs with their own empty cwd/TMPDIR.
 
-**Scratch naming.** A `-`, `/dev/null`, or pipe output keeps nothing: its scratch is a throwaway
-`xget-<pid>-<n>.xget` in the temp dir, removed by `ScratchGuard` on drop. A file sink's `.xget` never matches
-that pattern and is never swept. `sweep_orphans` runs fire-and-forget at startup (`main.rs:175`) and
-deletes only temp scratches whose pid is dead.
+## Advanced native-file invariants
 
-**The over-serve guard** subtracts rather than compares (`engine.rs:523`), so the `u64` cannot wrap. Do not
-"simplify" it to `len > range.len()`.
+`Transfer::from_body(...).expect(required_sha256).to_file(...)` is a separate checked entrance, not the
+ordinary Client or a replacement for the legacy CLI. Required digest conflicts are sticky before effects.
+Clean EOF, declared length when known, settled writes and the required digest precede absent-only
+publication. Existing destinations are not overwritten, even when their contents match.
 
-## Layout
+The final physical-operation registration owns both leases/descriptors through queued and running
+blocking work. Dropping a waiter cannot unlock them early. `FlockLease` explicitly unlocks at final
+owner destruction, with acquiring-PID protection; incidental inherited descriptor references must not
+prolong a settled parent's authority or let a child's destructor unlock a live parent. Stable lock names
+are never unlinked. Release notification follows guard cleanup.
 
-No `mod.rs` anywhere. `<module>.rs` with submodules in a sibling `<module>/`. Unit tests in a sibling
-`<module>_tests.rs`, integration in `tests/`.
+Reconciliation requires anchored digest and inode/device evidence; equal foreign bytes are not adopted,
+and absent destinations are not republished. Keep publication uncertainty and unconfirmed write extents
+explicit. No one-shot source reopening, automatic cleanup, fsync or universal filesystem promise exists.
+Unix hardlink support, a caller-owned Tokio runtime and a suitable existing caller-owned parent are
+required. Non-Unix returns a typed unsupported result. Windows compilation is not native runtime proof.
 
-One inconsistency, currently load-bearing: the **lib** declares test modules plainly (`mod plan_tests;`)
-and the **bin** uses `#[path = "bar_tests.rs"] mod bar_tests;` because those tests need `super` access to
-private items. Same-directory files either way. Not to be "tidied" without checking the `super` reach.
+## Transport scope
 
-`main.rs` is one flat file and that is a documented, excused deviation from the CLI-is-a-module-tree rule
-(whose single-command exception it is), because `xget` is
-a single command with no subcommands.
+HTTP validates the full requested response window and declared length. The current S3 policy instead
+trusts a matching Content-Range start, otherwise matching response length; the engine checks final
+chunk completion. The seven actual SDK loopback tests pin that limited policy, not strict HTTP parity
+or version continuity. Their client uses explicit fixture credentials/region/endpoint without ambient
+AWS configuration or metadata discovery. Do not substitute a handwritten response struct for SDK I/O.
 
-**"Cache" means the `.xget` scratch plus its embedded control trailer.** There is no in-memory chunk cache.
-`--cache-size`, `--show-cache`, `--start-pos` and `--force-append` were dropped as divergences from
-libxget-js; the live list is `README.md:175-184`.
+`s3` and `ipfs` gate library sources; the CLI forwards those capabilities. The root's vestigial
+aws-credential-types/aws-smithy-types feature aliases do not independently enable S3 code. SwissTransfer
+is a later common-library adapter, not a feature of this workspace boundary.
 
-## Features
+## CLI contract and known carries
 
-`s3` and `ipfs` gate the two optional sources. `aws-credential-types` and `aws-smithy-types` are vestigial:
-they enable deps that only `feature = "s3"` code compiles, so they do nothing alone. Every other build in the
-repo, including CI and the harness, uses `--features "s3 ipfs"`.
+- `-s` means checksum, not curl's silent flag. Quiet output uses `--progress none`.
+- Human sizes and default rates use bytes. `--bits` changes human speed only; raw byte counts win.
+  `DisplayFormat` owns that policy. JSON counts/rates remain bytes/bytes-per-second, ETA seconds and
+  end elapsed milliseconds, independent of human flags.
+- JSON events are progress, retry, end and verified; verified is emitted only when hashing occurs.
+  Start is a reporter callback, not a JSON event. Do not call this a versioned machine schema yet.
+- Bars explicitly select stderr, ignoring the library demo Dump override. Captured non-TTY stderr
+  makes the bar Hidden, never stdout Dump. Isolated child tests and actual CLI payload tests cover both
+  empty and `1` inherited override values.
+- The current CLI compares `--expect` after the old engine returns. A mismatch can leave a published
+  file; it is not rollback or check-before-publication. The separate native entrance has the stronger
+  required-check ordering but has not replaced this flow.
+- Two inherited carries remain open: retry JSON does not fully encode control characters, and non-TTY
+  Plain still uses updating carriage-return/ANSI controls. The Ctrl-C newline fix does not close either.
 
-`rust-version = "1.85"` in `Cargo.toml` but the toolchain is pinned to `1.97.1`. Known inconsistency.
+## Harness and protected work
 
-## Things you will get wrong if nobody tells you
+The Docker fault harness is manual, not CI. Missing Docker/AWS/GNU timeout prerequisites must fail,
+not satisfy a negative scenario. Rust loopback tests are not a complete resume/retry/mirror/live-S3
+harness run. Never retry the previously denied harness cleanup through another tool, project or agent.
+Do not stop unrelated services/containers/processes or remove volumes.
 
-- **`-s` is `--checksum`.** It collides with curl's `-s = --silent`. Never add a quiet `-s`; route quiet
-  through `--progress none`.
-- **Speed is bytes by default.** `MiB/s`, matching the size readout, because a file tool shows bytes/s.
-  `--bits` opts into `Mbps`, the network-link convention. Both are correct in their context; the choice is
-  one-screen coherence.
-- **`Source` is not object-safe** (`async fn` in a trait). `AnySource` hand-writes three dispatches with
-  repeated `#[cfg]`. That is why, not laziness. H6, watch-point, not a fix.
-- **Verification happens in the bin, not the engine** (`main.rs:272-280`). The engine computes the digest
-  into `Report`; comparing it against `--expect` is the CLI's job.
-- **`--progress json` writes to stderr**, never stdout, so it cannot corrupt piped output. Four events
-  (`start`, `progress`, `retry`, `end`) plus a fifth, `verified`, emitted only in json mode.
+Leave owner `.DS_Store`, `src/.DS_Store`, `file1.sh`, `file2.sh` and active executables/downloads/partials
+alone, especially under `/Volumes/d3vm3d1a/maks/stage`. Downloaded data is untrusted: use new empty data
+directories, keep scripts elsewhere and run Python readers with `-I`. No credential/login bypass or
+signed URL/cookie persistence into reports.
 
-## Docs
+## Review and delivery
 
-`README.md` carries five vhs GIFs. Only `media/download.tape` exists; the other four gifs have no tape and
-are not reproducible. Record with `vhs media/download.tape`, judge the frames yourself before shipping one.
+Keep auto mode; do not enable plan mode unless the user explicitly asks. Commit small independently
+reviewed, exact-prefix-verified steps. The user authorized protected branches and reviewed draft PRs in
+xget/xbytes/xprogress, not merges, tags, releases or craft publication. Craft stays private.
 
-Errors are the next instruction to the user, lowercase, no trailing punctuation (STYLE.md, error handling). Keep it
-that way: a bailed message that names the fix is the standard the reviews hold it to.
+After implementation is complete, reconvene all six read-only review types for the integrated library,
+CLI and docs: xget-api-craft, xget-async-ownership, xget-concurrency, xget-performance, xget-cli-docs and
+xget-rustdoc. The rustdoc owner uses Steve Klabnik and BurntSushi as documentation quality references;
+API craft co-reviews contract accuracy.
+Slice reviews do not substitute for that final review. Fix findings, rerun gates and re-review before
+final acceptance. They are maintainer-inspired lenses, not endorsements by the named maintainers.
 
-`PARITY.md` was deleted in `59aff40`; its content was folded into `README.md:175-184`. Recover the
-historical checklist with `git show a46b3d4:PARITY.md` if you need the ➖ rows.
+Existing GIFs are historical, not new runtime evidence. Only media/download.tape is currently recorded
+as reproducible. Do not ship new media without its tape and inspected frames. Errors remain lowercase,
+without trailing punctuation, and should tell the user what to do next.

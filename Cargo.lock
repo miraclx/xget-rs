@@ -3225,7 +3225,6 @@ dependencies = [
 name = "xget"
 version = "0.1.0"
 dependencies = [
- "anstyle",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
@@ -3233,10 +3232,7 @@ dependencies = [
  "blake3",
  "bytes",
  "cid",
- "clap",
  "digest",
- "dotenvy",
- "eyre",
  "futures",
  "hex",
  "libc",
@@ -3248,10 +3244,26 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "windows-sys 0.59.0",
  "wiremock",
  "xbytes",
+]
+
+[[package]]
+name = "xget-cli"
+version = "0.1.0"
+dependencies = [
+ "anstyle",
+ "clap",
+ "dotenvy",
+ "eyre",
+ "futures",
+ "libc",
+ "reqwest",
+ "tokio",
+ "tracing-subscriber",
+ "xbytes",
+ "xget",
  "xprogress",
 ]
 

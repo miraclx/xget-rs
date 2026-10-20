@@ -1,11 +1,17 @@
 //! One JSON event per update, for machine consumers.
 
 use core::cell::RefCell;
+use core::fmt;
+use core::fmt::Write as _;
 use core::time::Duration;
 
 use xget::Progress;
 
 use super::Meter;
+
+#[cfg(test)]
+#[path = "json_tests.rs"]
+mod tests;
 
 /// One JSON event per update, to stderr: throttled `progress` events, a `retry` on a dropped chunk, and
 /// a final `end`; `main` adds a `verified` event with the checksum. Byte counts are raw so a consumer can
@@ -53,10 +59,9 @@ impl Progress for JsonProgress {
     }
 
     fn retry(&self, index: usize, retry: u32, max: u32, resume_from: u64, error: &str) {
-        // Escape the cause so the line stays valid JSON.
-        let error = error.replace('\\', "\\\\").replace('"', "\\\"");
+        let error = JsonString(error);
         eprintln!(
-            r#"{{"event":"retry","chunk":{index},"retry":{retry},"max":{max},"resume_from":{resume_from},"error":"{error}"}}"#
+            r#"{{"event":"retry","chunk":{index},"retry":{retry},"max":{max},"resume_from":{resume_from},"error":{error}}}"#
         );
     }
 
@@ -69,5 +74,23 @@ impl Progress for JsonProgress {
                 meter.elapsed_ms()
             );
         }
+    }
+}
+
+// A JSON string is not a Rust debug string: all U+0000..U+001F characters need JSON escapes.
+struct JsonString<'a>(&'a str);
+
+impl fmt::Display for JsonString<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_char('"')?;
+        for character in self.0.chars() {
+            match character {
+                '"' => formatter.write_str("\\\"")?,
+                '\\' => formatter.write_str("\\\\")?,
+                '\u{0000}'..='\u{001f}' => write!(formatter, "\\u{:04x}", u32::from(character))?,
+                character => formatter.write_char(character)?,
+            }
+        }
+        formatter.write_char('"')
     }
 }

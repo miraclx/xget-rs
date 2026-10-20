@@ -134,8 +134,10 @@ is a later common-library adapter, not a feature of this workspace boundary.
 - The current CLI compares `--expect` after the old engine returns. A mismatch can leave a published
   file; it is not rollback or check-before-publication. The separate native entrance has the stronger
   required-check ordering but has not replaced this flow.
-- Two inherited carries remain open: retry JSON does not fully encode control characters, and non-TTY
-  Plain still uses updating carriage-return/ANSI controls. The Ctrl-C newline fix does not close either.
+- Retry JSON quotes and escapes all U+0000..U+001F control characters; the child callback regression
+  parses one complete event with an independent JSON parser. This does not version the schema.
+- Non-TTY Plain still uses updating carriage-return/ANSI controls. The Ctrl-C newline fix does not
+  close that inherited carry.
 
 ## Harness and protected work
 

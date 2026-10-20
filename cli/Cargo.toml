@@ -38,6 +38,10 @@ xprogress = { git = "https://github.com/miraclx/xprogress-rs" }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# Validate machine output with an independent JSON parser, not the encoder's own assumptions.
+serde_json = "1"
+
 [lints.rust]
 unused_must_use = "deny"
 

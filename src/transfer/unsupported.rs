@@ -35,6 +35,13 @@ impl Native {
             error: NativeError,
         })
     }
+    pub(super) async fn read_prefix(
+        &self,
+        _start: ByteCount,
+        _end: ByteCount,
+    ) -> Result<Vec<u8>, NativeError> {
+        Err(NativeError)
+    }
     pub(super) async fn seal(&self, _length: ByteCount) -> Result<(), NativeError> {
         Err(NativeError)
     }

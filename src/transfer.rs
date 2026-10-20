@@ -62,6 +62,7 @@ mod native;
 mod native;
 mod pipeline;
 mod plan;
+pub mod reader;
 #[cfg(unix)]
 mod record;
 
@@ -79,6 +80,17 @@ pub struct Transfer<B> {
     length: Length,
     requirements: Result<Requirements, Box<Conflict>>,
     measurement: Measurement,
+}
+
+impl Transfer<()> {
+    /// Borrow a repeatable, known-size range session for checked native publication.
+    /// See [`reader::RangeReader`] for lifetime-specific future/body/error families and version policy.
+    pub fn from_reader<'read, R>(reader: &'read R) -> reader::ReaderTransfer<'read, R>
+    where
+        R: reader::RangeReader<'read>,
+    {
+        reader::ReaderTransfer::from_reader(reader)
+    }
 }
 
 impl<B> Transfer<B> {
@@ -474,6 +486,8 @@ pub enum Phase {
     Acquire,
     /// Bounded payload write.
     Write,
+    /// Bounded in-order readback of an acknowledged stage prefix for configured digest work.
+    ReadStage,
     /// Settling and checking the physical data file.
     Seal,
     /// Atomic state replacement, without fsync.
@@ -489,6 +503,7 @@ impl fmt::Display for Phase {
         f.write_str(match self {
             Self::Acquire => "acquire",
             Self::Write => "write",
+            Self::ReadStage => "read stage",
             Self::Seal => "seal",
             Self::Checkpoint => "checkpoint",
             Self::Publish => "publish",

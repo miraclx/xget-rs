@@ -31,6 +31,66 @@ use crate::transfer::{
 };
 
 #[tokio::test]
+async fn a_real_stage_read_failure_keeps_its_phase_and_io_cause() {
+    let fixture = Fixture::new();
+    let (run, state) = owned_run(&fixture).await;
+    run.native
+        .write(ByteCount(0), Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(state.path().join("data"))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let error = run
+        .native
+        .read_prefix(ByteCount(0), ByteCount(3))
+        .await
+        .unwrap_err();
+    match error {
+        NativeError::Io { phase, cause } => {
+            assert_eq!(phase, Phase::ReadStage);
+            assert_eq!(cause.kind(), io::ErrorKind::UnexpectedEof);
+        }
+        other => panic!("expected a real stage read error, got {other:?}"),
+    }
+    assert!(!fixture.output().exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_stage_read_future_keeps_both_leases_until_physical_settlement() {
+    let fixture = Fixture::new();
+    let (run, state) = owned_run(&fixture).await;
+    let native = run.native;
+    native
+        .write(ByteCount(0), Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    let barrier = native.hooks().read.install();
+    let released = Arc::clone(&native.hooks().released);
+    let mut future = Box::pin(async move { native.read_prefix(ByteCount(0), ByteCount(3)).await });
+    tokio::select! {
+        result = &mut future => panic!("physical stage read should be held, got {result:?}"),
+        () = barrier.entered.notified() => {}
+    }
+    drop(future);
+    probe(fixture.path(), "busy");
+    probe(state.path(), "workspace-busy");
+    assert!(matches!(
+        state.reconcile().await.unwrap_err().kind,
+        FailureKind::Busy
+    ));
+    barrier.release();
+    released.notified().await;
+    probe(fixture.path(), "free");
+    probe(state.path(), "workspace-free");
+    assert_eq!(fs::read(state.path().join("data")).unwrap(), b"abc");
+    assert!(!fixture.output().exists());
+}
+
+#[tokio::test]
 async fn a_partial_physical_write_error_reports_its_actual_accepted_prefix() {
     let fixture = Fixture::new();
     let (run, state) = owned_run(&fixture).await;

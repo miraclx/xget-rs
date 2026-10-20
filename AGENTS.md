@@ -108,6 +108,20 @@ explicit. No one-shot source reopening, automatic cleanup, fsync or universal fi
 Unix hardlink support, a caller-owned Tokio runtime and a suitable existing caller-owned parent are
 required. Non-Unix returns a typed unsupported result. Windows compilation is not native runtime proof.
 
+## Advanced range-reader invariants
+
+`Transfer::from_reader` borrows one lifetime-specific repeatable session. Enforced representation/version
+contracts or a required SHA-256/SHA-512/BLAKE3 value authorize assembly; optional measurement, weak hashes
+and length alone do not. Every response window and evidence must match, and late errors after the last
+requested byte still fail. Up to four ranges write bounded prefixes. The checker follows the contiguous
+settled-write frontier while bodies run, not a post-slowest-range hash pass. Stage readback uses the same
+physical-operation registration and leases as writes, including after waiter drop.
+
+Reader/check/body/error families remain concrete and conditionally Send. Generic Send helpers name one
+borrow's F/B/E families with equality bounds; do not replace that with an HRTB or static requirement.
+No reader-session pin or resumable range map is persisted by this entrance, and it does not enable
+ordinary Client parallel ranges, retries, source reopening or cooperative pause.
+
 ## Transport scope
 
 HTTP validates the full requested response window and declared length. The current S3 policy instead

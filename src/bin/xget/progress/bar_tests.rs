@@ -1,4 +1,5 @@
 use core::cell::RefCell;
+use std::process::{Command, Stdio};
 
 use xget::Progress as _;
 use xprogress::{Bar, DrawTarget};
@@ -32,6 +33,67 @@ fn started(progress: &BarProgress, total: u64) {
 fn render(progress: &BarProgress) -> String {
     let mut state = progress.inner.borrow_mut();
     frame(state.as_mut().expect("started"))
+}
+
+#[test]
+fn an_inherited_dump_setting_cannot_write_progress_into_payload_stdout() {
+    // Child-only environment avoids mutating process-global state while other tests are running.
+    for value in ["", "1"] {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "progress::bar::bar_tests::payload_target_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("XGET_TEST_BAR_PAYLOAD_CHILD", "1")
+            .env("XPROGRESS_DUMP", value)
+            .stdin(Stdio::null())
+            .output()
+            .expect("isolated child");
+        let stdout = String::from_utf8(output.stdout).expect("test output utf-8");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child failed: {stdout:?}; {stderr}"
+        );
+        let payload = stdout
+            .split_once("PAYLOAD-BEGIN\n")
+            .expect("payload start")
+            .1
+            .split_once("PAYLOAD-END\n")
+            .expect("payload end")
+            .0;
+        assert_eq!(
+            payload, "",
+            "progress entered stdout with XPROGRESS_DUMP={value:?}"
+        );
+    }
+}
+
+#[test]
+fn payload_target_child() {
+    if std::env::var_os("XGET_TEST_BAR_PAYLOAD_CHILD").is_none() {
+        return;
+    }
+    assert!(
+        matches!(DrawTarget::from_env(), DrawTarget::Dump),
+        "fixture must exercise the dump override"
+    );
+    let progress = BarProgress::new(DisplayFormat::HumanBytes);
+    println!("PAYLOAD-BEGIN");
+    progress.start(&[60, 40]);
+    progress.received(0, 10);
+    progress.wrote(0, 10);
+    progress.finish();
+    println!("PAYLOAD-END");
+    assert!(
+        matches!(
+            progress.inner.borrow().as_ref().expect("started").target,
+            DrawTarget::Terminal | DrawTarget::Hidden
+        ),
+        "payload reporter must never choose stdout Dump"
+    );
 }
 
 #[test]

@@ -97,7 +97,8 @@ impl Progress for BarProgress {
             .with_blank_color(AnsiColor::BrightBlack);
         let total: u64 = chunks.iter().sum();
         let bar = Bar::new(chunks.iter().copied()).with_style(style);
-        let target = DrawTarget::from_env();
+        // A library demo override must never redirect progress into xget's payload stream.
+        let target = DrawTarget::stderr();
         // Fill the space beside the stats, but never past a fraction of the screen, so the bar scales
         // with the terminal up to a cap and only shrinks past that when the stats would clip.
         let columns = target.columns().unwrap_or(80);

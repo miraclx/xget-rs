@@ -1,7 +1,8 @@
 # xget review lenses
 
 These are focused review roles, not impersonations of named maintainers. The quality references are
-Alice Ryhl, dtolnay, BurntSushi and Mara Bos. The bar applies to library APIs, the binary and documentation.
+Alice Ryhl, dtolnay, BurntSushi and Mara Bos. Rust documentation also uses Steve Klabnik as a reference
+for teaching clarity. The bar applies to library APIs, the binary and documentation.
 
 | Role | Primary question |
 |---|---|
@@ -9,7 +10,8 @@ Alice Ryhl, dtolnay, BurntSushi and Mara Bos. The bar applies to library APIs, t
 | xget-async-ownership | Who owns every body, borrow and operation before and after cancellation? |
 | xget-concurrency | Which invariant does each synchronization/ownership primitive actually enforce? |
 | xget-performance | Are parsing, byte arithmetic and retained resources correct and bounded? |
-| xget-cli-docs | Can someone use the documented library and CLI without reading implementation? |
+| xget-cli-docs | Can someone use CLI help, commands, errors and output without reading implementation? |
+| xget-rustdoc | Can someone learn and correctly use the Rust API from its crate docs and examples? |
 
 ## Shared contract
 
@@ -35,9 +37,10 @@ Keep approvals honest: the user's existing design/implementation authority stand
 action is not rerouted through a reviewer. Do not enable plan mode or change the selected model. These
 roles inherit the parent model and permission mode; no permissionMode override is configured.
 
-Use the smallest relevant cast, not five agents for every edit. Authors, independent reviewers and the
-actual execution owner remain distinct responsibilities. For cold-use review, distinguish the initial
-docs/help-only attempt from later source inspection.
+Use the smallest relevant cast for each slice. Authors, independent reviewers and the actual execution
+owner remain distinct responsibilities. For cold-use review, distinguish the initial docs/help-only
+attempt from later source inspection. Once the redesign implementation is complete, the user requires
+all six roles to review the integrated library, binary and docs again; slice reviews are not a substitute.
 
 ## Loading
 

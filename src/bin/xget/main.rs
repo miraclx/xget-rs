@@ -93,6 +93,24 @@ struct Cli {
     verbose: u8,
 }
 
+impl Cli {
+    /// Reject an expectation with no effective hash algorithm before building or probing a source.
+    fn validate(&self) -> eyre::Result<()> {
+        let Some(expect) = &self.expect else {
+            return Ok(());
+        };
+        let algo = match expect {
+            Expect::Literal { algo, .. } | Expect::Sidecar { algo, .. } => {
+                algo.unwrap_or(self.checksum)
+            }
+        };
+        if algo == Checksum::None {
+            eyre::bail!("--expect needs an algorithm: pass --checksum or use algo:hex");
+        }
+        Ok(())
+    }
+}
+
 /// Turn on diagnostic tracing to stderr at a level chosen by `-v` count. Off when zero, so a normal run
 /// emits nothing. `RUST_LOG` overrides the level if set.
 fn init_tracing(verbose: u8) {
@@ -169,6 +187,7 @@ async fn run() -> eyre::Result<()> {
             cli.url
         );
     }
+    cli.validate()?;
     init_tracing(cli.verbose);
     // Best-effort housekeeping: clear temp scratches left by earlier interrupted stream downloads (a
     // Ctrl-C or kill the in-process guard cannot catch). Fire-and-forget so it never delays the download.
@@ -224,9 +243,6 @@ async fn run() -> eyre::Result<()> {
     }
     let checksum = match &expected {
         Some((Some(algo), _)) => *algo,
-        Some((None, _)) if matches!(cli.checksum, Checksum::None) => {
-            eyre::bail!("--expect needs an algorithm: pass --checksum or use algo:hex")
-        }
         _ => cli.checksum,
     };
 

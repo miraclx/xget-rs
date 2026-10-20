@@ -9,7 +9,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd as _, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -20,8 +20,8 @@ use super::record::{
     Binding, DeviceId, Identity, InodeId, InvalidRecord, MAX_RECORD, Record, Status,
 };
 use super::{
-    AcquisitionFailure, ByteCount, FailureKind, Measurement, Partial, Phase, Receipt,
-    Reconciliation, StateRef,
+    AcquisitionFailure, ByteCount, FailureKind, Measurement, OperationOwner, Partial, Phase,
+    Receipt, Reconciliation, RecoveryBinding, StateRef,
 };
 use crate::checks::{CheckPolicy, Requirements};
 
@@ -40,6 +40,21 @@ pub(super) struct Native(Arc<Lease>);
 
 impl Native {
     pub(super) async fn acquire(plan: Plan) -> Result<Self, AcquisitionFailure> {
+        Self::acquire_registered(plan, None).await
+    }
+
+    pub(super) async fn acquire_registered(
+        plan: Plan,
+        registration: Option<OperationOwner>,
+    ) -> Result<Self, AcquisitionFailure> {
+        // Shared managed roles cannot become payloads through another native entrance. Reader plans
+        // are also checked here without changing the reader implementation or acquiring any authority.
+        if super::is_run_store(&plan.parent) || super::is_run_store(Path::new(&plan.destination)) {
+            return Err(AcquisitionFailure {
+                error: NativeError::InvalidState,
+                state: None,
+            });
+        }
         // Do not panic or create a hidden runtime when a caller uses a different executor.
         let runtime = Handle::try_current().map_err(|_| AcquisitionFailure {
             error: NativeError::RuntimeUnavailable,
@@ -47,7 +62,7 @@ impl Native {
         })?;
         let owner_runtime = Handle::clone(&runtime);
         runtime
-            .spawn_blocking(move || Self::open(plan, owner_runtime))
+            .spawn_blocking(move || Self::open(plan, owner_runtime, registration))
             .await
             .map_err(|cause| AcquisitionFailure {
                 error: NativeError::io(Phase::Acquire, io::Error::other(cause)),
@@ -55,9 +70,15 @@ impl Native {
             })?
     }
 
-    fn open(plan: Plan, runtime: Handle) -> Result<Self, AcquisitionFailure> {
+    fn open(
+        plan: Plan,
+        runtime: Handle,
+        registration: Option<OperationOwner>,
+    ) -> Result<Self, AcquisitionFailure> {
         let mut retained = None;
         let result = (|| {
+            #[cfg(test)]
+            tests::enter_registered_work(plan.state.path(), tests::PhysicalOperation::Acquire);
             let directory = DirectoryLease::acquire(&plan.parent)?;
             let workspace_name = Name::from_os(&plan.workspace)?;
             directory.parent.mkdir(&workspace_name)?;
@@ -96,6 +117,7 @@ impl Native {
                 runtime,
                 mode: AtomicU8::new(RECEIVING),
                 initialized: AtomicBool::new(false),
+                _registration: registration,
                 #[cfg(test)]
                 hooks: Hooks {
                     released: Arc::clone(&released),
@@ -295,15 +317,68 @@ impl Native {
             })?
     }
 
-    pub(super) async fn reconcile(state: StateRef) -> Result<Reconciliation, NativeError> {
+    pub(super) async fn lease_directory(path: PathBuf) -> Result<OperationOwner, NativeError> {
+        Self::lease_directory_with(path, LockAccess::Create).await
+    }
+
+    pub(super) async fn lease_existing_directory(
+        path: PathBuf,
+    ) -> Result<OperationOwner, NativeError> {
+        Self::lease_directory_with(path, LockAccess::Existing).await
+    }
+
+    async fn lease_directory_with(
+        path: PathBuf,
+        access: LockAccess,
+    ) -> Result<OperationOwner, NativeError> {
         let runtime = Handle::try_current().map_err(|_| NativeError::RuntimeUnavailable)?;
         runtime
-            .spawn_blocking(move || Self::reconcile_owned(state))
+            .spawn_blocking(move || {
+                // This is a workspace lease, not the destination-directory lock used by file attempts.
+                // Reuse the final-owner acquiring-PID guard and stable marker validation.
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)
+                    .map_err(|cause| NativeError::io(Phase::Acquire, cause))?;
+                let directory = Directory(file);
+                directory.check_private_directory(Phase::Acquire)?;
+                let lock =
+                    directory.lock(c"lease", super::OWNED_LEASE_MARKER, access, Phase::Acquire)?;
+                Ok(Arc::new(OwnedDirectory {
+                    _directory: directory,
+                    _lock: lock,
+                }) as OperationOwner)
+            })
+            .await
+            .map_err(|cause| NativeError::io(Phase::Acquire, io::Error::other(cause)))?
+    }
+
+    pub(super) async fn reconcile(state: StateRef) -> Result<Reconciliation, NativeError> {
+        Self::reconcile_registered(state, None, None).await
+    }
+
+    pub(super) async fn reconcile_registered(
+        state: StateRef,
+        registration: Option<OperationOwner>,
+        binding: Option<RecoveryBinding>,
+    ) -> Result<Reconciliation, NativeError> {
+        let runtime = Handle::try_current().map_err(|_| NativeError::RuntimeUnavailable)?;
+        runtime
+            .spawn_blocking(move || {
+                let _registration = registration;
+                #[cfg(test)]
+                tests::enter_registered_work(state.path(), tests::PhysicalOperation::Reconcile);
+                Self::reconcile_bound(state, binding)
+            })
             .await
             .map_err(|cause| NativeError::io(Phase::Reconcile, io::Error::other(cause)))?
     }
 
-    fn reconcile_owned(state: StateRef) -> Result<Reconciliation, NativeError> {
+    fn reconcile_bound(
+        state: StateRef,
+        expected: Option<RecoveryBinding>,
+    ) -> Result<Reconciliation, NativeError> {
         let parent = state.path().parent().ok_or(NativeError::InvalidState)?;
         let workspace_name = state.path().file_name().ok_or(NativeError::InvalidState)?;
         if !workspace_name.as_bytes().starts_with(b".xget-native-") {
@@ -321,6 +396,14 @@ impl Native {
             Phase::Reconcile,
         )?;
         let record = workspace.read_record(Phase::Reconcile)?;
+        if let Some(expected) = expected
+            && (expected.destination.parent() != Some(parent)
+                || expected.destination.file_name().map(OsStr::as_bytes)
+                    != Some(record.binding.destination.as_slice())
+                || expected.checks != record.binding.checks)
+        {
+            return Err(NativeError::InvalidState);
+        }
         if record.binding.parent != directory.parent.identity(Phase::Reconcile)?
             || record.binding.workspace != workspace.identity(Phase::Reconcile)?
         {
@@ -462,6 +545,8 @@ struct Lease {
     // These atomics enforce a monotonic inode lifecycle and distinguish initial create from replace.
     mode: AtomicU8,
     initialized: AtomicBool,
+    // The outer workspace stays owned until the final queued/running physical operation settles.
+    _registration: Option<OperationOwner>,
     #[cfg(test)]
     hooks: Hooks,
     // Last field: notification follows descriptor and lease destruction, not public waiter drop.
@@ -526,6 +611,11 @@ impl Lease {
             .parent
             .publish(&self.workspace, DATA, &destination)
     }
+}
+
+struct OwnedDirectory {
+    _directory: Directory,
+    _lock: FlockLease,
 }
 
 struct DirectoryLease {

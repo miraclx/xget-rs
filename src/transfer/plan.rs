@@ -11,6 +11,21 @@ use crate::checks::CheckPolicy;
 #[cfg(unix)]
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+/// Reject raw directory-shaped file spellings before components or canonicalization erase them.
+pub(crate) fn validate_file_spelling(path: &Path) -> Result<(), RequestError> {
+    let raw = path.as_os_str().as_encoded_bytes();
+    let ends_in_separator = raw
+        .last()
+        .is_some_and(|byte| std::path::is_separator(char::from(*byte)));
+    let ends_in_directory_dot = raw.len() >= 2
+        && raw.last() == Some(&b'.')
+        && std::path::is_separator(char::from(raw[raw.len() - 2]));
+    if ends_in_separator || ends_in_directory_dot {
+        return Err(RequestError::InvalidDestination);
+    }
+    Ok(())
+}
+
 pub(super) struct Plan {
     pub(super) parent: std::path::PathBuf,
     pub(super) destination: OsString,
@@ -21,16 +36,7 @@ pub(super) struct Plan {
 
 impl Plan {
     pub(super) fn new(path: &Path, checks: impl Into<CheckPolicy>) -> Result<Self, RequestError> {
-        let raw = path.as_os_str().as_encoded_bytes();
-        let ends_in_separator = raw
-            .last()
-            .is_some_and(|byte| std::path::is_separator(char::from(*byte)));
-        let ends_in_directory_dot = raw.len() >= 2
-            && raw.last() == Some(&b'.')
-            && std::path::is_separator(char::from(raw[raw.len() - 2]));
-        if ends_in_separator || ends_in_directory_dot {
-            return Err(RequestError::InvalidDestination);
-        }
+        validate_file_spelling(path)?;
         let Some(Component::Normal(name)) = path.components().next_back() else {
             return Err(RequestError::InvalidDestination);
         };

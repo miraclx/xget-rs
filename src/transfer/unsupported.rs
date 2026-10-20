@@ -3,7 +3,10 @@
 use bytes::Bytes;
 
 use super::plan::Plan;
-use super::{AcquisitionFailure, ByteCount, FailureKind, Partial, Reconciliation, StateRef};
+use super::{
+    AcquisitionFailure, ByteCount, FailureKind, OperationOwner, Partial, Reconciliation,
+    RecoveryBinding, StateRef,
+};
 use crate::checks::CheckPolicy;
 
 pub(super) struct Native {
@@ -12,6 +15,12 @@ pub(super) struct Native {
 
 impl Native {
     pub(super) async fn acquire(plan: Plan) -> Result<Self, AcquisitionFailure> {
+        Self::acquire_registered(plan, None).await
+    }
+    pub(super) async fn acquire_registered(
+        plan: Plan,
+        _registration: Option<OperationOwner>,
+    ) -> Result<Self, AcquisitionFailure> {
         let Plan {
             parent,
             destination,
@@ -55,6 +64,23 @@ impl Native {
         self.checks
     }
     pub(super) async fn reconcile(_state: StateRef) -> Result<Reconciliation, NativeError> {
+        Err(NativeError)
+    }
+    pub(super) async fn reconcile_registered(
+        _state: StateRef,
+        _registration: Option<OperationOwner>,
+        _binding: Option<RecoveryBinding>,
+    ) -> Result<Reconciliation, NativeError> {
+        Err(NativeError)
+    }
+    pub(super) async fn lease_directory(
+        _path: std::path::PathBuf,
+    ) -> Result<OperationOwner, NativeError> {
+        Err(NativeError)
+    }
+    pub(super) async fn lease_existing_directory(
+        _path: std::path::PathBuf,
+    ) -> Result<OperationOwner, NativeError> {
         Err(NativeError)
     }
 }

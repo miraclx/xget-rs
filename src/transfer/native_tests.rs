@@ -6,14 +6,15 @@ use core::future::pending;
 use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, RawFd};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, LazyLock, Mutex, mpsc};
 use std::{io, thread};
 
 use bytes::Bytes;
@@ -29,6 +30,219 @@ use crate::transfer::tests::{Fixture, complete, requirement};
 use crate::transfer::{
     ByteCount, FailureKind, Length, Partial, Phase, Reconciliation, StateRef, Transfer, WriteExtent,
 };
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum PhysicalOperation {
+    Acquire,
+    Reconcile,
+}
+
+// Only per-state fixture configuration is guarded. Remove the entry before waiting on the existing
+// physical barrier, so unrelated native operations and other tests cannot be held by this mutex.
+type RegisteredGates = BTreeMap<(PathBuf, PhysicalOperation), Arc<super::Gate>>;
+static REGISTERED_WORK: LazyLock<Mutex<RegisteredGates>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+pub(super) fn enter_registered_work(state: &Path, operation: PhysicalOperation) {
+    let gate = REGISTERED_WORK
+        .lock()
+        .unwrap()
+        .remove(&(state.to_path_buf(), operation));
+    if let Some(gate) = gate {
+        gate.enter();
+    }
+}
+
+struct ObservedRegistration {
+    lease: Option<crate::transfer::OperationOwner>,
+    released: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl Drop for ObservedRegistration {
+    fn drop(&mut self) {
+        drop(self.lease.take());
+        if let Some(released) = self.released.take() {
+            let _ = released.send(());
+        }
+    }
+}
+
+enum SubmissionStage {
+    Queued,
+    Running,
+}
+enum HeldSubmission {
+    Queued {
+        release: mpsc::Sender<()>,
+        blocker: tokio::task::JoinHandle<()>,
+    },
+    Running(super::Held),
+}
+
+fn dropped_registered_work(operation: PhysicalOperation, stage: SubmissionStage) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let fixture = Fixture::new();
+        let store = fixture.path().join("owned-store");
+        fs::create_dir(&store).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = fixture.path().join("store-alias");
+        symlink(&store, &alias).unwrap();
+        let plan = Plan::new(&fixture.output(), requirement(b"abc")).unwrap();
+        let state = match operation {
+            PhysicalOperation::Acquire => StateRef::clone(plan.state()),
+            PhysicalOperation::Reconcile => StateRef::clone(
+                Transfer::from_body(body(), Length::Unknown)
+                    .to_file(fixture.output())
+                    .unwrap()
+                    .run()
+                    .await
+                    .unwrap()
+                    .state(),
+            ),
+        };
+        let lease = Native::lease_directory(store).await.unwrap();
+        let (released, settled) = tokio::sync::oneshot::channel();
+        let owner: crate::transfer::OperationOwner = Arc::new(ObservedRegistration {
+            lease: Some(lease),
+            released: Some(released),
+        });
+        let held = match stage {
+            SubmissionStage::Queued => {
+                let (entered, occupied) = tokio::sync::oneshot::channel();
+                let (release, blocked) = mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    let _ = entered.send(());
+                    let _ = blocked.recv();
+                });
+                occupied.await.unwrap();
+                HeldSubmission::Queued { release, blocker }
+            }
+            SubmissionStage::Running => {
+                let gate = Arc::new(super::Gate::default());
+                let held = gate.install();
+                REGISTERED_WORK
+                    .lock()
+                    .unwrap()
+                    .insert((state.path().to_path_buf(), operation), gate);
+                HeldSubmission::Running(held)
+            }
+        };
+        let operation_state = StateRef::clone(&state);
+        let mut waiter = Box::pin(async move {
+            match operation {
+                PhysicalOperation::Acquire => {
+                    let _native = Native::acquire_registered(plan, Some(owner)).await.unwrap();
+                }
+                PhysicalOperation::Reconcile => {
+                    let _result = Native::reconcile_registered(operation_state, Some(owner), None)
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        match &held {
+            HeldSubmission::Queued { .. } => assert!(futures::poll!(waiter.as_mut()).is_pending()),
+            HeldSubmission::Running(barrier) => tokio::select! {
+                () = &mut waiter => panic!("physical registered operation must be held"),
+                () = barrier.entered.notified() => {}
+            },
+        }
+        drop(waiter);
+        // A separately executed child opens the stable lock through an alias. This is an actual
+        // primitive proof, not a second high-level Busy result or an inspection of Arc counts.
+        probe(&alias, "owned-busy");
+        if matches!(operation, PhysicalOperation::Acquire) {
+            assert!(!state.path().exists());
+        }
+        match held {
+            HeldSubmission::Queued { release, blocker } => {
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+            }
+            HeldSubmission::Running(barrier) => barrier.release(),
+        }
+        settled.await.unwrap();
+        probe(&alias, "owned-free");
+        probe(fixture.path(), "free");
+        assert!(state.path().join("state").is_file());
+        match operation {
+            PhysicalOperation::Acquire => assert!(!fixture.output().exists()),
+            PhysicalOperation::Reconcile => assert_eq!(fs::read(fixture.output()).unwrap(), b"abc"),
+        }
+    });
+}
+
+#[test]
+fn queued_acquisition_retains_the_outer_lease_before_a_native_owner_is_returned() {
+    dropped_registered_work(PhysicalOperation::Acquire, SubmissionStage::Queued);
+}
+#[test]
+fn running_acquisition_retains_the_outer_lease_before_a_native_owner_is_returned() {
+    dropped_registered_work(PhysicalOperation::Acquire, SubmissionStage::Running);
+}
+#[test]
+fn queued_reconciliation_retains_the_outer_lease_after_waiter_drop() {
+    dropped_registered_work(PhysicalOperation::Reconcile, SubmissionStage::Queued);
+}
+#[test]
+fn running_reconciliation_retains_the_outer_lease_after_waiter_drop() {
+    dropped_registered_work(PhysicalOperation::Reconcile, SubmissionStage::Running);
+}
+
+#[tokio::test]
+async fn every_native_entrance_reserves_the_aggregate_store_before_acquisition_effects() {
+    let fixture = Fixture::new();
+    for destination in [
+        fixture.path().join(".xget-runs"),
+        fixture.path().join(".xget-runs/payload"),
+    ] {
+        let failure =
+            match Native::acquire(Plan::new(&destination, requirement(b"abc")).unwrap()).await {
+                Ok(_) => panic!("managed store role must fail before acquisition"),
+                Err(failure) => failure,
+            };
+        assert!(matches!(failure.error, NativeError::InvalidState));
+        assert!(failure.state.is_none());
+    }
+    assert!(!fixture.path().join(".xget-runs").exists());
+    assert!(!fixture.path().join(".xget-native.lock").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outer_workspace_lease_survives_waiter_drop_until_native_physical_work_settles() {
+    let fixture = Fixture::new();
+    let store = fixture.path().join("owned-store");
+    fs::create_dir(&store).unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+    let registration = Native::lease_directory(store.to_path_buf()).await.unwrap();
+    let native = Native::acquire_registered(
+        Plan::new(&fixture.output(), requirement(b"abc")).unwrap(),
+        Some(registration),
+    )
+    .await
+    .unwrap();
+    let barrier = native.hooks().write.install();
+    let released = Arc::clone(&native.hooks().released);
+    let mut waiter =
+        Box::pin(async move { native.write(ByteCount(0), Bytes::from_static(b"abc")).await });
+    tokio::select! {
+        result = &mut waiter => panic!("physical write should be held, got {result:?}"),
+        () = barrier.entered.notified() => {}
+    }
+    drop(waiter);
+    assert!(matches!(
+        Native::lease_directory(store.to_path_buf()).await,
+        Err(NativeError::Busy)
+    ));
+    barrier.release();
+    released.notified().await;
+    let registration = Native::lease_directory(store).await.unwrap();
+    drop(registration);
+}
 
 #[tokio::test]
 async fn a_real_stage_read_failure_keeps_its_phase_and_io_cause() {
@@ -805,6 +1019,21 @@ fn subprocess_ownership_probe() {
         return;
     };
     let expected = std::env::var("XGET_NATIVE_TEST_EXPECTED").unwrap();
+    if expected.starts_with("owned-") {
+        let workspace = Directory(File::open(&parent).unwrap());
+        let result = workspace.lock(
+            c"lease",
+            crate::transfer::OWNED_LEASE_MARKER,
+            LockAccess::Existing,
+            Phase::Acquire,
+        );
+        match expected.as_str() {
+            "owned-busy" => assert!(matches!(result, Err(NativeError::Busy))),
+            "owned-free" => assert!(result.is_ok()),
+            other => panic!("unexpected aggregate probe mode {other}"),
+        }
+        return;
+    }
     if expected.starts_with("workspace-") {
         let workspace = Directory(File::open(&parent).unwrap());
         let result = workspace.lock(

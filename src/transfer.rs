@@ -42,6 +42,7 @@ use core::fmt;
 use core::future::{Future, pending};
 use core::str::FromStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::Stream;
@@ -68,6 +69,44 @@ mod record;
 
 use native::{Native, NativeError};
 use plan::Plan;
+pub(crate) use plan::validate_file_spelling;
+
+// Private physical-operation registration. Lower layers know only an owned lifetime, not its caller.
+pub(crate) type OperationOwner = Arc<dyn Send + Sync>;
+pub(crate) const OWNED_RUN_STORE: &str = ".xget-runs";
+#[cfg(unix)]
+pub(crate) const OWNED_LEASE_MARKER: &[u8] = b"XGET-OWNED-DIRECTORY-1\n";
+
+fn is_run_store(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(OWNED_RUN_STORE))
+    })
+}
+
+#[cfg_attr(not(unix), allow(dead_code))] // Unsupported hosts retain the private registration signature.
+struct RecoveryBinding {
+    destination: PathBuf,
+    checks: CheckPolicy,
+}
+
+pub(crate) async fn lease_directory(
+    path: PathBuf,
+) -> Result<OperationOwner, Box<Failure<Infallible>>> {
+    Native::lease_directory(path)
+        .await
+        .map_err(|error| Failure::native(error, Partial::default(), None))
+}
+
+pub(crate) async fn lease_existing_directory(
+    path: PathBuf,
+) -> Result<OperationOwner, Box<Failure<Infallible>>> {
+    Native::lease_existing_directory(path)
+        .await
+        .map_err(|error| Failure::native(error, Partial::default(), None))
+}
 
 #[cfg(all(test, unix))]
 #[path = "transfer_tests.rs"]
@@ -138,6 +177,9 @@ impl<B> Transfer<B> {
             requirements,
             measurement: self.measurement,
         };
+        if is_run_store(destination.as_ref()) {
+            return Err(RequestError::InvalidDestination);
+        }
         let plan = Plan::new(destination.as_ref(), checks)?;
         Ok(PendingFile {
             body: self.body,
@@ -180,9 +222,31 @@ impl<B> PendingFile<B> {
         B: Stream<Item = Result<Bytes, E>>,
         S: Future<Output = ()>,
     {
+        self.run_owned(stop, None).await
+    }
+
+    pub(crate) async fn run_registered<E>(
+        self,
+        owner: OperationOwner,
+    ) -> Result<Receipt, Box<Failure<E>>>
+    where
+        B: Stream<Item = Result<Bytes, E>>,
+    {
+        self.run_owned(pending(), Some(owner)).await
+    }
+
+    async fn run_owned<E, S>(
+        self,
+        stop: S,
+        owner: Option<OperationOwner>,
+    ) -> Result<Receipt, Box<Failure<E>>>
+    where
+        B: Stream<Item = Result<Bytes, E>>,
+        S: Future<Output = ()>,
+    {
         let Self { body, length, plan } = self;
         let state = StateRef::clone(plan.state());
-        let native = Native::acquire(plan)
+        let native = Native::acquire_registered(plan, owner)
             .await
             .map_err(|failure| Failure::native(failure.error, Partial::default(), failure.state))?;
         pipeline::Run {
@@ -414,6 +478,24 @@ impl StateRef {
         Native::reconcile(Self::clone(self))
             .await
             .map_err(|error| Failure::native(error, Partial::default(), Some(Self::clone(self))))
+    }
+
+    pub(crate) async fn reconcile_registered(
+        &self,
+        owner: OperationOwner,
+        destination: PathBuf,
+        checks: CheckPolicy,
+    ) -> Result<Reconciliation, Box<Failure<Infallible>>> {
+        Native::reconcile_registered(
+            Self::clone(self),
+            Some(owner),
+            Some(RecoveryBinding {
+                destination,
+                checks,
+            }),
+        )
+        .await
+        .map_err(|error| Failure::native(error, Partial::default(), Some(Self::clone(self))))
     }
 }
 

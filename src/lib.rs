@@ -4,7 +4,9 @@
 //! output planning. [`Input`] distinguishes remote intent from local grouping; [`Inventory`] exposes
 //! resolved files without acquiring their payloads. The current Client executes files serially and
 //! rejects unsupported provider/tree inputs explicitly. Native publication is absent-only on supported
-//! Unix filesystems; this Client does not yet implement aggregate recovery or overwrite.
+//! Unix filesystems. [`SavedRun`] inspects frozen aggregate state offline; ordinary re-entry finds a
+//! unique matching unfinished run before new discovery. Pending members continue with fresh full HTTP
+//! responses, not partial-byte reuse. Restart and overwrite are not implemented by this Client.
 //!
 //! Use [`Transfer`] for an already-open application body, either checked native publication or
 //! [`transfer::live`] delivery to an application-owned consumer/writer. [`Transfer::from_reader`] accepts
@@ -61,7 +63,7 @@ mod plan_tests;
 
 pub use crate::builder::{Download, from, get};
 pub use crate::checksum::{Checksum, UnknownChecksum};
-pub use crate::client::Client;
+pub use crate::client::{Client, SavedRun};
 pub use crate::engine::{Report, sweep_orphans};
 pub use crate::input::Input;
 pub use crate::inventory::{File, Inventory};

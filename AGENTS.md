@@ -6,9 +6,9 @@
 - Read `STYLE.md` before writing code. It is the contract, including the narrow private-pipeline
   exception. `../craft/REVIEW.md` defines review evidence, severity and closure vocabulary.
 - `notes/craft-backlog.md` tracks open work. Historical reviews are not rewritten when a later fix lands.
-- The ordinary Client currently implements exact HTTP inventory, selection, frozen multi-input layout
-  and serial native publication/live opening. The approved redesign is broader: provider collections,
-  trees, pinned ranges, aggregate recovery and the new CLI are not implemented by this surface.
+- The ordinary Client implements exact HTTP inventory, selection, frozen multi-input layout, serial
+  native publication/live opening and owned frozen-run continuation. It does not implement provider
+  collections, trees, parallel ranges/partial-byte reuse, restart/overwrite or the redesigned CLI.
 
 ## Workspace boundary
 
@@ -121,6 +121,26 @@ Reader/check/body/error families remain concrete and conditionally Send. Generic
 borrow's F/B/E families with equality bounds; do not replace that with an HRTB or static requirement.
 No reader-session pin or resumable range map is persisted by this entrance, and it does not enable
 ordinary Client parallel ranges, retries, source reopening or cooperative pause.
+
+## Owned aggregate continuation
+
+Ordinary exact-HTTP runs use the designated root's bounded `.xget-runs` store. Unique unfinished
+matching precedes mutable discovery; complete prior runs do not match and ambiguity exposes actual
+paths. Request fingerprints are private intent matching, not source identity, authorization or reopen
+capabilities. Records freeze members, assignments, validators and check policies, never raw access
+references/cookies/foreign errors. Offline inspection has no execution lease or payload/network effects.
+
+An aggregate registration enters every native acquisition closure before submission and stays in the
+operation-owning Arc, as it does for manifest I/O. Dropping the waiter must not unlock the store while
+queued/running physical work remains. Stable leases are never unlinked; final-owner acquiring-PID
+protection still applies. Expected destination/check policy must bind native reconciliation to that member.
+
+Native attempts are recorded before execution. Missing intent/evidence is uncertainty, not refetch or
+publication authority. Completed entries require recorded strong content plus identity; nohash/weak-only
+completion remains NotRevalidatable. Pending work opens fresh full ordered HTTP bodies with frozen ETag
+checks, never appends old partial bytes or invents a saved reader pin. Old attempts remain untouched.
+Fresh bypasses continuation, not overwrite or cleanup. No restart/legacy import or successful pause is
+claimed. Atomic normalized metadata checksums are not hidden payload fingerprints or authenticated state.
 
 ## Transport scope
 

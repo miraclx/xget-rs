@@ -6,13 +6,16 @@
 //! as a fake that ignores a range or short-serves a length, which is the exact failure the engine must
 //! turn into a typed [`Error`].
 
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicU32, Ordering};
+use core::time::Duration;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::stream;
+use futures::{StreamExt as _, stream};
 use sha2::{Digest as _, Sha256};
+use tokio::sync::{Barrier, Notify};
 use xget::{ByteRange, ByteStream, Checksum, Error, Output, Probe, Progress, Report, Source};
 
 /// A deterministic in-memory resource, served either range by range (honestly) or with an injected
@@ -156,16 +159,23 @@ async fn run<S: Source>(
     parts: u32,
     retries: u32,
     checksum: Checksum,
-    resume: bool,
+    resume: Resume,
 ) -> Result<Report, Error> {
-    let mut plan = xget::from(source)
+    let plan = xget::from(source)
         .chunks(parts)
         .tries(retries)
         .checksum(checksum);
-    if resume {
-        plan = plan.resume();
-    }
+    let plan = match resume {
+        Resume::Continue => plan.resume(),
+        Resume::Fresh => plan,
+    };
     plan.write(output).await
+}
+
+#[derive(Clone, Copy)]
+enum Resume {
+    Fresh,
+    Continue,
 }
 
 #[tokio::test]
@@ -179,7 +189,7 @@ async fn a_clean_parallel_download_verifies_to_the_right_hash() {
         5,
         10,
         Checksum::Sha256,
-        false,
+        Resume::Fresh,
     )
     .await
     .expect("a clean parallel download succeeds");
@@ -192,6 +202,131 @@ async fn a_clean_parallel_download_verifies_to_the_right_hash() {
     );
     let written = std::fs::read(&scratch.path).expect("the output file is in place");
     assert_eq!(written, body, "every byte landed at its offset");
+}
+
+#[tokio::test]
+async fn verification_waits_for_the_first_hole_and_advances_before_its_chunk_finishes() {
+    let body = sample_body(12_288);
+    let scratch = Scratch::new("verify-frontier");
+    let tails_received = Arc::new(Notify::new());
+    let prefix_verified = Arc::new(Notify::new());
+    let source = OutOfOrderSource {
+        body: Arc::new(Vec::clone(&body)),
+        started: Arc::new(Barrier::new(3)),
+        tails_received: Arc::clone(&tails_received),
+        prefix_verified: Arc::clone(&prefix_verified),
+    };
+    let progress = FrontierProgress {
+        received: RefCell::new(Vec::new()),
+        wrote: RefCell::new(Vec::new()),
+        tails: Cell::new(0),
+        tails_received,
+        prefix_verified,
+    };
+
+    // A lost wake or waiting for the whole first chunk deadlocks the fixture, not the test process.
+    let report = tokio::time::timeout(
+        Duration::from_secs(5),
+        xget::from(source)
+            .chunks(3)
+            .tries(0)
+            .progress(&progress)
+            .write(Output::File(&scratch.path)),
+    )
+    .await
+    .expect("the verifier wakes while the first chunk is still incomplete")
+    .expect("out-of-order delivery completes");
+
+    let received = progress.received.borrow();
+    assert_eq!(received.len(), 4);
+    assert!(received[..2].iter().all(|index| *index != 0));
+    assert_eq!(&received[2..], &[0, 0], "both tails land before the head");
+    assert_eq!(
+        *progress.wrote.borrow(),
+        [(0, 2048), (0, 2048), (1, 4096), (2, 4096)],
+        "verification follows only the contiguous prefix, including a partial first chunk"
+    );
+    assert_eq!(report.hash.as_deref(), Some(sha256_hex(&body).as_str()));
+    assert_eq!(std::fs::read(&scratch.path).expect("finished output"), body);
+}
+
+/// All fetches meet at a barrier; the head waits for both tails to reach disk, then pauses halfway
+/// until the verifier reports that prefix. No sleep or scheduler timing decides the delivery order.
+struct OutOfOrderSource {
+    body: Arc<Vec<u8>>,
+    started: Arc<Barrier>,
+    tails_received: Arc<Notify>,
+    prefix_verified: Arc<Notify>,
+}
+
+impl Source for OutOfOrderSource {
+    async fn probe(&self) -> Result<Probe, Error> {
+        Ok(Probe {
+            length: self.body.len() as u64,
+            supports_ranges: true,
+            ..Probe::default()
+        })
+    }
+
+    async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
+        let Some(range) = range else {
+            return Err(Error::Transport(Box::new(std::io::Error::other(
+                "the frontier fixture requires a range",
+            ))));
+        };
+        let bytes = Bytes::copy_from_slice(&self.body[range.start as usize..range.end as usize]);
+        let started = Arc::clone(&self.started);
+        if range.start != 0 {
+            return Ok(Box::pin(stream::once(async move {
+                started.wait().await;
+                Ok(bytes)
+            })));
+        }
+        let midpoint = bytes.len() / 2;
+        let first = bytes.slice(..midpoint);
+        let second = bytes.slice(midpoint..);
+        let tails_received = Arc::clone(&self.tails_received);
+        let prefix_verified = Arc::clone(&self.prefix_verified);
+        Ok(Box::pin(
+            stream::once(async move {
+                started.wait().await;
+                tails_received.notified().await;
+                Ok(first)
+            })
+            .chain(stream::once(async move {
+                prefix_verified.notified().await;
+                Ok(second)
+            })),
+        ))
+    }
+}
+
+struct FrontierProgress {
+    received: RefCell<Vec<usize>>,
+    wrote: RefCell<Vec<(usize, u64)>>,
+    tails: Cell<u32>,
+    tails_received: Arc<Notify>,
+    prefix_verified: Arc<Notify>,
+}
+
+impl Progress for FrontierProgress {
+    fn received(&self, index: usize, _bytes: u64) {
+        self.received.borrow_mut().push(index);
+        if index != 0 {
+            assert!(self.wrote.borrow().is_empty(), "the head is still a hole");
+            self.tails.set(self.tails.get() + 1);
+            if self.tails.get() == 2 {
+                self.tails_received.notify_one();
+            }
+        }
+    }
+
+    fn wrote(&self, index: usize, bytes: u64) {
+        self.wrote.borrow_mut().push((index, bytes));
+        if index == 0 {
+            self.prefix_verified.notify_one();
+        }
+    }
 }
 
 #[tokio::test]
@@ -293,7 +428,7 @@ async fn a_source_that_ignores_the_range_is_a_typed_error() {
         5,
         1,
         Checksum::Sha256,
-        false,
+        Resume::Fresh,
     )
     .await
     .expect_err("a range-ignoring source must not be certified");
@@ -320,7 +455,7 @@ async fn a_short_served_chunk_becomes_a_length_mismatch() {
         1,
         1,
         Checksum::Sha256,
-        false,
+        Resume::Fresh,
     )
     .await
     .expect_err("a chunk that never reaches its end cannot complete");
@@ -344,7 +479,7 @@ async fn a_dropped_chunk_resumes_and_still_verifies() {
         1,
         3,
         Checksum::Sha256,
-        false,
+        Resume::Fresh,
     )
     .await
     .expect("the retry recovers the dropped chunk");
@@ -404,7 +539,7 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
         4,
         1,
         Checksum::Sha256,
-        true,
+        Resume::Continue,
     )
     .await;
     assert!(first.is_err(), "the first pass fails on the dropped tail");
@@ -422,7 +557,7 @@ async fn resume_via_the_control_file_completes_a_partial_download() {
         4,
         1,
         Checksum::Sha256,
-        true,
+        Resume::Continue,
     )
     .await
     .expect("the resume completes the download");
@@ -482,7 +617,7 @@ async fn resume_re_chunks_with_a_different_parts_count() {
         8,
         1,
         Checksum::Sha256,
-        true,
+        Resume::Continue,
     )
     .await;
     assert!(first.is_err(), "the first pass fails on the dropped tail");
@@ -496,7 +631,7 @@ async fn resume_re_chunks_with_a_different_parts_count() {
         3,
         1,
         Checksum::Sha256,
-        true,
+        Resume::Continue,
     )
     .await
     .expect("the resume completes with a different chunk count");
@@ -558,7 +693,7 @@ async fn a_changed_validator_discards_the_partial_and_restarts_clean() {
         4,
         1,
         Checksum::Sha256,
-        true,
+        Resume::Continue,
     )
     .await;
     assert!(first.is_err(), "the first pass drops its tail");
@@ -579,7 +714,7 @@ async fn a_changed_validator_discards_the_partial_and_restarts_clean() {
         4,
         1,
         Checksum::Sha256,
-        true,
+        Resume::Continue,
     )
     .await
     .expect("the restart completes against the new version");
@@ -607,7 +742,7 @@ async fn a_non_range_source_streams_and_verifies() {
         5,
         10,
         Checksum::Sha256,
-        false,
+        Resume::Fresh,
     )
     .await
     .expect("a non-range source is fetched as a single stream");
@@ -632,7 +767,7 @@ async fn no_checksum_requested_returns_no_hash() {
         5,
         10,
         Checksum::None,
-        false,
+        Resume::Fresh,
     )
     .await
     .expect("a download with hashing off still completes");
@@ -651,9 +786,16 @@ async fn discard_verifies_but_writes_no_file() {
     let scratch = Scratch::new("discard");
     // A discard scatters and verifies exactly as a file would, so the report is identical, but it keeps
     // nothing: no output file and no `.xget` beside the (unused) scratch path.
-    let report = run(source, Output::Discard, 5, 10, Checksum::Sha256, false)
-        .await
-        .expect("a discard download verifies");
+    let report = run(
+        source,
+        Output::Discard,
+        5,
+        10,
+        Checksum::Sha256,
+        Resume::Fresh,
+    )
+    .await
+    .expect("a discard download verifies");
 
     assert_eq!(report.length, body.len() as u64, "the whole resource");
     assert_eq!(
@@ -682,7 +824,7 @@ async fn writer_streams_the_exact_bytes_and_hash() {
             5,
             10,
             Checksum::Sha256,
-            false,
+            Resume::Fresh,
         )
         .await
         .expect("a writer download streams the verified bytes")
@@ -698,7 +840,7 @@ async fn writer_streams_the_exact_bytes_and_hash() {
             5,
             10,
             Checksum::Sha256,
-            false,
+            Resume::Fresh,
         )
         .await
         .expect("the reference file download succeeds")
@@ -728,7 +870,7 @@ async fn a_tee_delivers_the_same_bytes_to_a_file_and_a_writer() {
     let mut buf: Vec<u8> = Vec::new();
     let report = {
         let sink = Output::tee(&scratch.path, &mut buf);
-        run(source, sink, 5, 10, Checksum::Sha256, false)
+        run(source, sink, 5, 10, Checksum::Sha256, Resume::Fresh)
             .await
             .expect("a tee download verifies and finalizes")
     };
@@ -788,7 +930,7 @@ async fn the_control_file_records_the_source_url_for_a_standalone_resume() {
         4,
         1,
         Checksum::Sha256,
-        true,
+        Resume::Continue,
     )
     .await;
 

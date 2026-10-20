@@ -49,70 +49,72 @@ pub(crate) struct Control {
     pub done: Vec<ByteRange>,
 }
 
-/// Read the embedded control from `path`, or `None` if the file is missing, too short, or its footer
-/// does not validate.
-pub(crate) async fn read(path: &Path) -> Option<Control> {
-    let mut file = File::open(path).await.ok()?;
-    let size = file.metadata().await.ok()?.len();
-    if size < FOOTER {
-        return None;
-    }
-    file.seek(SeekFrom::Start(size - FOOTER)).await.ok()?;
-    let mut footer = [0u8; FOOTER as usize];
-    file.read_exact(&mut footer).await.ok()?;
-    if footer[0..8] != MAGIC {
-        return None;
-    }
-    let total = u64::from_le_bytes(footer[8..16].try_into().ok()?);
-    let trailer = u64::from_le_bytes(footer[16..24].try_into().ok()?);
-    // The layout must add up exactly, or this is not a control we wrote.
-    if total.checked_add(trailer)?.checked_add(FOOTER)? != size {
-        return None;
-    }
-    file.seek(SeekFrom::Start(total)).await.ok()?;
-    let mut text = vec![0u8; trailer as usize];
-    file.read_exact(&mut text).await.ok()?;
-    let text = String::from_utf8(text).ok()?;
+impl Control {
+    /// Read the embedded control from `path`, or `None` if the file is missing, too short, or its footer
+    /// does not validate.
+    pub(crate) async fn read(path: &Path) -> Option<Self> {
+        let mut file = File::open(path).await.ok()?;
+        let size = file.metadata().await.ok()?.len();
+        if size < FOOTER {
+            return None;
+        }
+        file.seek(SeekFrom::Start(size - FOOTER)).await.ok()?;
+        let mut footer = [0u8; FOOTER as usize];
+        file.read_exact(&mut footer).await.ok()?;
+        if footer[0..8] != MAGIC {
+            return None;
+        }
+        let total = u64::from_le_bytes(footer[8..16].try_into().ok()?);
+        let trailer = u64::from_le_bytes(footer[16..24].try_into().ok()?);
+        // The layout must add up exactly, or this is not a control we wrote.
+        if total.checked_add(trailer)?.checked_add(FOOTER)? != size {
+            return None;
+        }
+        file.seek(SeekFrom::Start(total)).await.ok()?;
+        let mut text = vec![0u8; trailer as usize];
+        file.read_exact(&mut text).await.ok()?;
+        let text = String::from_utf8(text).ok()?;
 
-    let mut done = Vec::new();
-    let mut validator = None;
-    let mut source = None;
-    let mut checksum = None;
-    for line in text.lines() {
-        // The value is the rest of the line, so it may carry spaces (a `Last-Modified` date does, and a
-        // URL may too once decoded).
-        if let Some(value) = line.strip_prefix("url ") {
-            source = Some(value.to_owned());
-            continue;
+        let mut done = Vec::new();
+        let mut validator = None;
+        let mut source = None;
+        let mut checksum = None;
+        for line in text.lines() {
+            // The value is the rest of the line, so it may carry spaces (a `Last-Modified` date does, and a
+            // URL may too once decoded).
+            if let Some(value) = line.strip_prefix("url ") {
+                source = Some(value.to_owned());
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("tag ") {
+                validator = Some(value.to_owned());
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("algo ") {
+                checksum = Checksum::from_str(value).ok();
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            if fields.next() == Some("done")
+                && let (Some(Ok(start)), Some(Ok(end))) =
+                    (fields.next().map(str::parse), fields.next().map(str::parse))
+            {
+                done.push(ByteRange { start, end });
+            }
         }
-        if let Some(value) = line.strip_prefix("tag ") {
-            validator = Some(value.to_owned());
-            continue;
-        }
-        if let Some(value) = line.strip_prefix("algo ") {
-            checksum = Checksum::from_str(value).ok();
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        if fields.next() == Some("done")
-            && let (Some(Ok(start)), Some(Ok(end))) =
-                (fields.next().map(str::parse), fields.next().map(str::parse))
-        {
-            done.push(ByteRange { start, end });
-        }
+        Some(Control {
+            total,
+            validator,
+            source,
+            checksum,
+            done,
+        })
     }
-    Some(Control {
-        total,
-        validator,
-        source,
-        checksum,
-        done,
-    })
-}
 
-/// Whether `path` holds a resumable download: a valid control footer of the given total.
-pub(crate) async fn is_resumable(path: &Path) -> bool {
-    read(path).await.is_some()
+    /// Whether `path` holds a resumable download: a valid control footer of the given total.
+    pub(crate) async fn is_resumable(path: &Path) -> bool {
+        Self::read(path).await.is_some()
+    }
 }
 
 /// A handle over an open `.xget` file that appends completed or checkpointed byte ranges to its trailer,
@@ -132,9 +134,9 @@ pub(crate) struct Writer {
 }
 
 impl Writer {
-    /// Begin control for a freshly allocated file whose data region is already `set_len` to `total`:
-    /// seed the trailer with the resource `source` (its URL, if any) as a `url` line and the `validator`
-    /// (if any) as a `tag` line, then write the footer.
+    /// Allocate a fresh sparse data region, then seed its control trailer with the source, validator,
+    /// and checksum. Allocation belongs here: truncating the file after writing the trailer would
+    /// destroy the resume state.
     pub(crate) async fn create(
         path: &Path,
         total: u64,
@@ -142,7 +144,15 @@ impl Writer {
         source: Option<&str>,
         checksum: Checksum,
     ) -> Result<Writer, Error> {
-        let mut file = open_rw(path).await?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .await
+            .map_err(Error::transport)?;
+        file.set_len(total).await.map_err(Error::transport)?;
         let mut trailer_text = String::new();
         if let Some(source) = source {
             let _ = writeln!(trailer_text, "url {source}");
@@ -167,7 +177,7 @@ impl Writer {
     }
 
     /// Reopen control for a resumed file, positioned to append after its existing trailer. The caller has
-    /// already validated the footer (via [`read`]) and that its total matches.
+    /// already validated the footer (via [`Control::read`]) and that its total matches.
     pub(crate) async fn open(path: &Path, total: u64) -> Result<Writer, Error> {
         let file = open_rw(path).await?;
         let size = file.metadata().await.map_err(Error::transport)?.len();

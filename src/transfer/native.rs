@@ -21,7 +21,8 @@ use super::record::{
 };
 use super::{
     AcquisitionFailure, ByteCount, FailureKind, Measurement, OperationOwner, Partial, Phase,
-    Receipt, Reconciliation, RecoveryBinding, StateRef,
+    ReaderCheckpoint as Checkpoint, ReaderSession as Session, Receipt, Reconciliation,
+    RecoveryBinding, StateRef,
 };
 use crate::checks::{CheckPolicy, Requirements};
 
@@ -39,6 +40,7 @@ static CHECKPOINT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(super) struct Native(Arc<Lease>);
 
 impl Native {
+    #[cfg(test)]
     pub(super) async fn acquire(plan: Plan) -> Result<Self, AcquisitionFailure> {
         Self::acquire_registered(plan, None).await
     }
@@ -62,7 +64,7 @@ impl Native {
         })?;
         let owner_runtime = Handle::clone(&runtime);
         runtime
-            .spawn_blocking(move || Self::open(plan, owner_runtime, registration))
+            .spawn_blocking(move || Self::open(plan, owner_runtime, registration, None))
             .await
             .map_err(|cause| AcquisitionFailure {
                 error: NativeError::io(Phase::Acquire, io::Error::other(cause)),
@@ -70,13 +72,149 @@ impl Native {
             })?
     }
 
+    pub(super) async fn acquire_reader(
+        plan: Plan,
+        session: Session,
+        resume: Option<StateRef>,
+        registration: Option<OperationOwner>,
+    ) -> Result<Self, AcquisitionFailure> {
+        let runtime = Handle::try_current().map_err(|_| AcquisitionFailure {
+            error: NativeError::RuntimeUnavailable,
+            state: None,
+        })?;
+        let owner_runtime = Handle::clone(&runtime);
+        runtime
+            .spawn_blocking(move || {
+                if let Some(state) = resume {
+                    Self::reopen_reader(plan, session, state, owner_runtime, registration)
+                } else {
+                    Self::open(
+                        plan,
+                        owner_runtime,
+                        registration,
+                        Some(Checkpoint {
+                            session,
+                            closed: false,
+                            prefix: None,
+                        }),
+                    )
+                }
+            })
+            .await
+            .map_err(|cause| AcquisitionFailure {
+                error: NativeError::io(Phase::Acquire, io::Error::other(cause)),
+                state: None,
+            })?
+    }
+
+    fn reopen_reader(
+        plan: Plan,
+        session: Session,
+        state: StateRef,
+        runtime: Handle,
+        registration: Option<OperationOwner>,
+    ) -> Result<Self, AcquisitionFailure> {
+        let result = (|| {
+            #[cfg(test)]
+            tests::enter_registered_work(state.path(), tests::PhysicalOperation::Acquire);
+            let parent = state.path().parent().ok_or(NativeError::InvalidState)?;
+            let name = state.path().file_name().ok_or(NativeError::InvalidState)?;
+            if parent != plan.parent
+                || !name.as_bytes().starts_with(b".xget-native-")
+                || super::is_run_store(parent)
+                || super::is_run_store(Path::new(&plan.destination))
+            {
+                return Err(NativeError::InvalidState);
+            }
+            let directory = DirectoryLease::reacquire(parent)?;
+            let workspace = directory
+                .parent
+                .directory(&Name::from_os(name)?, Phase::Acquire)?;
+            workspace.check_private_directory(Phase::Acquire)?;
+            let workspace_lock = workspace.lock(
+                c"lease",
+                WORKSPACE_MARKER,
+                LockAccess::Existing,
+                Phase::Acquire,
+            )?;
+            let record = workspace.read_record(Phase::Acquire)?;
+            let Some(reader) = &record.reader else {
+                return Err(NativeError::InvalidState);
+            };
+            if record.status != Status::NeedsBody
+                || reader.closed
+                || reader.session != session
+                || record.binding.checks != plan.checks
+                || record.binding.destination.as_slice() != plan.destination.as_os_str().as_bytes()
+                || record.binding.parent != directory.parent.identity(Phase::Acquire)?
+                || record.binding.workspace != workspace.identity(Phase::Acquire)?
+                || reader.prefix.is_none()
+            {
+                return Err(NativeError::InvalidState);
+            }
+            // Check the retained name read-only before opening writable. Only receiving v3 state
+            // can cross this boundary; v1/v2, sealed and publication-intent inodes never do.
+            let witness = workspace.open(DATA, libc::O_RDONLY, 0, Phase::Acquire)?;
+            let metadata = witness
+                .metadata()
+                .map_err(|cause| NativeError::io(Phase::Acquire, cause))?;
+            Role::Data.check(&metadata)?;
+            if Identity::of(&metadata) != record.binding.data
+                || metadata.nlink() != 1
+                || metadata.len() > session.size.0
+                || metadata.len() < reader.prefix.map_or(0, |(length, _)| length.0)
+            {
+                return Err(NativeError::InvalidState);
+            }
+            let data = workspace.open(DATA, libc::O_RDWR, 0, Phase::Acquire)?;
+            let metadata = data
+                .metadata()
+                .map_err(|cause| NativeError::io(Phase::Acquire, cause))?;
+            Role::Data.check(&metadata)?;
+            if Identity::of(&metadata) != record.binding.data || metadata.nlink() != 1 {
+                return Err(NativeError::InvalidState);
+            }
+            #[cfg(test)]
+            let released = Arc::new(tokio::sync::Notify::new());
+            Ok(Self(Arc::new(Lease {
+                directory,
+                workspace,
+                _workspace_lock: workspace_lock,
+                data,
+                binding: record.binding,
+                runtime,
+                mode: AtomicU8::new(RECEIVING),
+                initialized: AtomicBool::new(true),
+                reader: record.reader,
+                _registration: registration,
+                #[cfg(test)]
+                hooks: Hooks {
+                    released: Arc::clone(&released),
+                    ..Hooks::default()
+                },
+                #[cfg(test)]
+                _released: Released(released),
+            })))
+        })();
+        result.map_err(|error| AcquisitionFailure {
+            error,
+            state: Some(state),
+        })
+    }
+
     fn open(
         plan: Plan,
         runtime: Handle,
         registration: Option<OperationOwner>,
+        reader: Option<Checkpoint>,
     ) -> Result<Self, AcquisitionFailure> {
         let mut retained = None;
         let result = (|| {
+            if super::is_run_store(&plan.parent)
+                || super::is_run_store(Path::new(&plan.destination))
+            {
+                return Err(NativeError::InvalidState);
+            }
             #[cfg(test)]
             tests::enter_registered_work(plan.state.path(), tests::PhysicalOperation::Acquire);
             let directory = DirectoryLease::acquire(&plan.parent)?;
@@ -117,6 +255,7 @@ impl Native {
                 runtime,
                 mode: AtomicU8::new(RECEIVING),
                 initialized: AtomicBool::new(false),
+                reader,
                 _registration: registration,
                 #[cfg(test)]
                 hooks: Hooks {
@@ -248,6 +387,18 @@ impl Native {
 
     pub(super) async fn seal(&self, length: ByteCount) -> Result<(), NativeError> {
         self.submit(Phase::Seal, move |lease| {
+            if lease.reader.is_some() {
+                let mut record = lease.workspace.read_record(Phase::Seal)?;
+                let Some(reader) = &mut record.reader else {
+                    return Err(NativeError::InvalidState);
+                };
+                reader.closed = true;
+                // Persist the irreversible reader lifecycle before validation, hooks, or a dropped
+                // waiter can leave the old receiving checkpoint looking writable again.
+                lease
+                    .workspace
+                    .replace_record(&record, RecordAccess::Existing)?;
+            }
             lease
                 .mode
                 .compare_exchange(RECEIVING, SEALED, Ordering::AcqRel, Ordering::Acquire)
@@ -256,6 +407,74 @@ impl Native {
             lease.hooks.seal.enter();
             lease.validate_data(length)?;
             Ok(())
+        })
+        .await
+    }
+
+    pub(super) async fn restore_reader(
+        &self,
+    ) -> Result<(crate::checks::Checks, ByteCount), NativeError> {
+        self.submit(Phase::ReadStage, |lease| {
+            #[cfg(test)]
+            lease.hooks.read.enter();
+            let record = lease.workspace.read_record(Phase::ReadStage)?;
+            let mut checks = lease.binding.checks.start();
+            let Some((length, anchor)) = record.reader.and_then(|reader| reader.prefix) else {
+                return Ok((checks, ByteCount(0)));
+            };
+            let mut offset = 0;
+            let mut buffer = [0; 64 * 1024];
+            while offset < length.0 {
+                let limit = (length.0 - offset).min(buffer.len() as u64) as usize;
+                let count = lease
+                    .data
+                    .read_at(&mut buffer[..limit], offset)
+                    .map_err(|cause| NativeError::io(Phase::ReadStage, cause))?;
+                if count == 0 {
+                    return Err(NativeError::InvalidState);
+                }
+                checks.update(&buffer[..count]);
+                offset += count as u64;
+            }
+            if checks.prefix_anchor() != Some(anchor)
+                || Identity::of(&lease.workspace.metadata(DATA, Phase::ReadStage)?)
+                    != lease.binding.data
+            {
+                return Err(NativeError::InvalidState);
+            }
+            Ok((checks, length))
+        })
+        .await
+    }
+
+    pub(super) async fn checkpoint_prefix(
+        &self,
+        partial: Partial,
+        length: ByteCount,
+        digest: super::Digest,
+    ) -> Result<(), NativeError> {
+        self.submit(Phase::Checkpoint, move |lease| {
+            if lease.mode.load(Ordering::Acquire) != RECEIVING {
+                return Err(NativeError::InvalidState);
+            }
+            let mut record = lease.workspace.read_record(Phase::Checkpoint)?;
+            let Some(reader) = &mut record.reader else {
+                return Err(NativeError::InvalidState);
+            };
+            if reader.closed
+                || length == ByteCount(0)
+                || length >= reader.session.size
+                || length > partial.hashed
+                || length > partial.written
+                || reader.prefix.is_some_and(|(previous, _)| previous > length)
+            {
+                return Err(NativeError::InvalidState);
+            }
+            reader.prefix = Some((length, digest));
+            record.partial = partial;
+            lease
+                .workspace
+                .replace_record(&record, RecordAccess::Existing)
         })
         .await
     }
@@ -515,6 +734,7 @@ impl Native {
                 binding: Binding::clone(&record.binding),
                 status: Status::Published,
                 partial: record.partial,
+                reader: record.reader,
             },
             RecordAccess::Existing,
         )?;
@@ -545,6 +765,7 @@ struct Lease {
     // These atomics enforce a monotonic inode lifecycle and distinguish initial create from replace.
     mode: AtomicU8,
     initialized: AtomicBool,
+    reader: Option<Checkpoint>,
     // The outer workspace stays owned until the final queued/running physical operation settles.
     _registration: Option<OperationOwner>,
     #[cfg(test)]
@@ -593,11 +814,17 @@ impl Lease {
         } else {
             RecordAccess::Create
         };
+        let reader = if self.initialized.load(Ordering::Acquire) {
+            self.workspace.read_record(Phase::Checkpoint)?.reader
+        } else {
+            Option::<Checkpoint>::clone(&self.reader)
+        };
         self.workspace.replace_record(
             &Record {
                 binding: Binding::clone(&self.binding),
                 status,
                 partial,
+                reader,
             },
             access,
         )?;

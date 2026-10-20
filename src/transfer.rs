@@ -71,6 +71,23 @@ use native::{Native, NativeError};
 use plan::Plan;
 pub(crate) use plan::validate_file_spelling;
 
+/// Pure frozen reader metadata shared by the coordinator and private native codec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReaderSession {
+    size: ByteCount,
+    representation: String,
+    version: Option<Vec<u8>>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReaderCheckpoint {
+    session: ReaderSession,
+    // Irreversible even when whole-file checks fail after sealing.
+    closed: bool,
+    prefix: Option<(ByteCount, Digest)>,
+}
+
 // Private physical-operation registration. Lower layers know only an owned lifetime, not its caller.
 pub(crate) type OperationOwner = Arc<dyn Send + Sync>;
 pub(crate) const OWNED_RUN_STORE: &str = ".xget-runs";
@@ -609,8 +626,9 @@ pub enum FailureKind<E> {
     /// At least one required check failed, independently of optional measurement.
     #[error("whole-file requirement did not match")]
     DigestMismatch(#[source] Box<Mismatch>),
-    /// Cooperative stop successfully settled and checkpointed the one-shot partial.
-    #[error("transfer stopped; supply a fresh body for a new attempt")]
+    /// Cooperative stop successfully settled and checkpointed the retained partial.
+    /// A one-shot body still needs fresh access; a reader may have an anchored resumable prefix.
+    #[error("transfer stopped; inspect the retained state before continuing")]
     Stopped,
     /// Checkpointing failed while retaining the original interruption or body failure.
     #[error("checkpoint failed; retained data is not a successfully paused transfer")]

@@ -31,7 +31,7 @@ fn every_truncated_record_is_refused_without_partial_adoption() {
 #[test]
 fn a_future_storage_version_is_not_interpreted_as_current_state() {
     let mut bytes = sample(Status::Publishing).encode();
-    bytes[7] = b'3';
+    bytes[7] = b'4';
     assert!(matches!(Record::decode(&bytes), Err(InvalidRecord)));
 }
 
@@ -102,7 +102,60 @@ fn sample(status: Status) -> Record {
             checks: requirement(b"abc").into(),
         },
         partial: complete(b"abc"),
+        reader: None,
         status,
+    }
+}
+
+#[test]
+fn v3_reader_prefix_is_bounded_normalized_and_never_a_full_size_eof_claim() {
+    use super::super::{ReaderCheckpoint as Checkpoint, ReaderSession as Session};
+    let mut record = sample(Status::NeedsBody);
+    let anchor = record.binding.checks.start().prefix_anchor().unwrap();
+    record.reader = Some(Checkpoint {
+        session: Session {
+            size: ByteCount(4),
+            representation: "bytes".to_owned(),
+            version: Some(b"one".to_vec()),
+        },
+        closed: false,
+        prefix: Some((ByteCount(3), anchor)),
+    });
+    let bytes = record.encode();
+    assert_eq!(&bytes[..8], b"XGETNF03");
+    assert!(bytes.len() as u64 <= super::MAX_RECORD);
+    assert_eq!(Record::decode(&bytes).unwrap().reader, record.reader);
+    for end in 0..bytes.len() {
+        assert!(Record::decode(&bytes[..end]).is_err());
+    }
+    let mut extra = Vec::clone(&bytes);
+    extra.push(0);
+    assert!(Record::decode(&extra).is_err());
+    record.reader.as_mut().unwrap().prefix = Some((ByteCount(4), anchor));
+    assert!(Record::decode(&record.encode()).is_err());
+    record.reader.as_mut().unwrap().prefix = None;
+    record.reader.as_mut().unwrap().session.representation = "x".repeat(257);
+    assert!(Record::decode(&record.encode()).is_err());
+}
+
+#[test]
+fn completed_reader_records_must_cover_the_frozen_size() {
+    use super::super::{ReaderCheckpoint as Checkpoint, ReaderSession as Session};
+
+    for status in [Status::Sealed, Status::Publishing, Status::Published] {
+        for size in [2, 3, 4] {
+            let mut record = sample(status);
+            record.reader = Some(Checkpoint {
+                session: Session {
+                    size: ByteCount(size),
+                    representation: "bytes".to_owned(),
+                    version: Some(b"one".to_vec()),
+                },
+                closed: true,
+                prefix: None,
+            });
+            assert_eq!(Record::decode(&record.encode()).is_ok(), size == 3);
+        }
     }
 }
 

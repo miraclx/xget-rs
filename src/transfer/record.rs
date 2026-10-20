@@ -2,19 +2,22 @@
 
 use super::{
     Algorithm, ByteCount, CheckResults, Digest, Measurement, Origins, Partial, Provenance,
-    RequiredSha256, Sha256Digest, WriteExtent,
+    ReaderCheckpoint as Checkpoint, ReaderSession as Session, RequiredSha256, Sha256Digest,
+    WriteExtent,
 };
 use crate::checks::{CheckPolicy, Requirements};
 
+const V3_MAGIC: &[u8; 8] = b"XGETNF03";
 const MAGIC: &[u8; 8] = b"XGETNF02";
 const V1_MAGIC: &[u8; 8] = b"XGETNF01";
-pub(super) const MAX_RECORD: u64 = 1024;
+pub(super) const MAX_RECORD: u64 = 4096;
 
-/// Stored independently of the public report, with explicit conversion for both supported versions.
+/// Stored independently of the public report, with explicit conversion for each supported version.
 pub(super) struct Record {
     pub(super) binding: Binding,
     pub(super) status: Status,
     pub(super) partial: Partial,
+    pub(super) reader: Option<Checkpoint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,7 +58,11 @@ pub(super) enum Status {
 impl Record {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(1024);
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(if self.reader.is_some() {
+            V3_MAGIC
+        } else {
+            MAGIC
+        });
         bytes.push(match self.status {
             Status::NeedsBody => 0,
             Status::Sealed => 1,
@@ -100,6 +107,28 @@ impl Record {
                 }
             }
         }
+        if let Some(reader) = &self.reader {
+            bytes.extend_from_slice(&reader.session.size.0.to_le_bytes());
+            bytes.push(u8::from(reader.closed));
+            bytes.extend_from_slice(&(reader.session.representation.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(reader.session.representation.as_bytes());
+            match &reader.session.version {
+                None => bytes.push(0),
+                Some(version) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&(version.len() as u16).to_le_bytes());
+                    bytes.extend_from_slice(version);
+                }
+            }
+            match reader.prefix {
+                None => bytes.push(0),
+                Some((length, digest)) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&length.0.to_le_bytes());
+                    Self::write_digest(&mut bytes, digest);
+                }
+            }
+        }
         // The request boundary and decoder bound a destination to one component of at most 255 bytes.
         bytes.extend_from_slice(&(self.binding.destination.len() as u16).to_le_bytes());
         bytes.extend_from_slice(&self.binding.destination);
@@ -112,7 +141,7 @@ impl Record {
         }
         let mut input = Input(bytes);
         let magic = input.take::<8>()?;
-        if magic != *MAGIC && magic != *V1_MAGIC {
+        if magic != *MAGIC && magic != *V1_MAGIC && magic != *V3_MAGIC {
             return Err(InvalidRecord);
         }
         let status = match input.take::<1>()? {
@@ -129,6 +158,11 @@ impl Record {
             input.v1()?
         } else {
             input.v2()?
+        };
+        let reader = if magic == *V3_MAGIC {
+            Some(input.reader(checks, partial, status)?)
+        } else {
+            None
         };
         let length = usize::from(u16::from_le_bytes(input.take::<2>()?));
         let Input(destination) = input;
@@ -159,6 +193,7 @@ impl Record {
             },
             status,
             partial,
+            reader,
         })
     }
 
@@ -189,6 +224,80 @@ impl Record {
 struct Input<'a>(&'a [u8]);
 
 impl<'a> Input<'a> {
+    fn reader(
+        &mut self,
+        checks: CheckPolicy,
+        partial: Partial,
+        status: Status,
+    ) -> Result<Checkpoint, InvalidRecord> {
+        let size = ByteCount(u64::from_le_bytes(self.take::<8>()?));
+        let closed = match self.take::<1>()? {
+            [0] => false,
+            [1] => true,
+            _ => return Err(InvalidRecord),
+        };
+        let length = usize::from(u16::from_le_bytes(self.take::<2>()?));
+        if length == 0 || length > 256 {
+            return Err(InvalidRecord);
+        }
+        let representation = core::str::from_utf8(self.bytes(length)?)
+            .map_err(|_| InvalidRecord)?
+            .to_owned();
+        let version = match self.take::<1>()? {
+            [0] => None,
+            [1] => {
+                let length = usize::from(u16::from_le_bytes(self.take::<2>()?));
+                if length == 0 || length > 256 {
+                    return Err(InvalidRecord);
+                }
+                Some(self.bytes(length)?.to_vec())
+            }
+            _ => return Err(InvalidRecord),
+        };
+        let prefix = match self.take::<1>()? {
+            [0] => None,
+            [1] => {
+                let length = ByteCount(u64::from_le_bytes(self.take::<8>()?));
+                let [tag] = self.take::<1>()?;
+                let digest = self.digest_with_tag(tag)?;
+                if length == ByteCount(0)
+                    || length >= size
+                    || length > partial.hashed
+                    || !matches!(
+                        digest.algorithm(),
+                        Algorithm::Sha256 | Algorithm::Sha512 | Algorithm::Blake3
+                    )
+                    || checks.prefix_algorithm() != Some(digest.algorithm())
+                {
+                    return Err(InvalidRecord);
+                }
+                Some((length, digest))
+            }
+            _ => return Err(InvalidRecord),
+        };
+        if (status != Status::NeedsBody && (!closed || partial.written != size))
+            || partial.written > size
+            || (version.is_none()
+                && !checks.requirements.iter().any(|requirement| {
+                    matches!(
+                        requirement.digest.algorithm(),
+                        Algorithm::Sha256 | Algorithm::Sha512 | Algorithm::Blake3
+                    )
+                }))
+        {
+            return Err(InvalidRecord);
+        }
+        Ok(Checkpoint {
+            session: Session {
+                size,
+                representation,
+                version,
+            },
+            closed,
+            prefix,
+        })
+    }
+
     fn bytes(&mut self, count: usize) -> Result<&'a [u8], InvalidRecord> {
         let Self(bytes) = self;
         let input = *bytes;

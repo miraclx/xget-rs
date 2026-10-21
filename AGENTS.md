@@ -6,10 +6,12 @@
 - Read `STYLE.md` before writing code. It is the contract, including the narrow private-pipeline
   exception. `../craft/REVIEW.md` defines review evidence, severity and closure vocabulary.
 - `notes/craft-backlog.md` tracks open work. Historical reviews are not rewritten when a later fix lands.
-- The ordinary Client implements exact HTTP and optional bounded SwissTransfer inventories, literal
-  member and bounded original-path selection, frozen multi-input layout, serial native publication/live opening and owned frozen-run
-  continuation. Eligible pinned exact HTTP uses the common range reader and anchored-prefix recovery.
-  Other provider trees/catalogues, restart/overwrite and the redesigned CLI remain unimplemented.
+- The ordinary Client implements exact HTTP, optional bounded SwissTransfer inventories and caller-SDK
+  S3 exact objects/explicit prefix inventories. Shared bounded resolution, literal/original-path selection,
+  inspection-only directory metadata, frozen layout, serial checked publication/live opening and owned
+  continuation use the same coordinator. Eligible exact HTTP uses anchored-prefix range recovery;
+  S3 and Swiss stay whole mode. WebDAV/catalogues, restart/overwrite and the redesigned CLI remain
+  unimplemented in this prefix.
 
 ## Workspace boundary
 
@@ -175,6 +177,36 @@ native submission; renewed access cannot silently select latest. One expired-den
 a live denial is not renewal permission. Keep signatures/cookies/remote diagnostics out of records and
 source chains. Foreign parser temporary wiping and hard CPU deadline preemption are not promised.
 
+## Common S3 and bounded shared discovery
+
+`ClientBuilder::s3_client` consumes a caller-configured SDK without ambient configuration loading.
+The SDK retains caller credential/endpoint/retry policy, not HTTP defaults. Metadata/header deadlines
+and request/body admission are shared across Client clones. Exact missing/denied objects never list.
+Prefix ListObjectsV2 pagination is literal and complete, with real nonrepeating tokens, not a snapshot.
+Each member's conditional HEAD/whole GET preserves known versionId and opaque strong ETag; an ETag is
+not expected MD5 or a recovery content anchor. No S3 range/partial-byte reuse is introduced.
+
+Before SDK collection/XML parsing, each S3 metadata/error response body is limited to 2 MiB, including
+chunked responses. Successful GET payloads are not capped; HEAD Content-Length describes object size.
+Rejected streams drop before admission releases, even when a typed SDK error is retained. This is not
+an all-transport/RSS or synchronous CPU guarantee. The common retained budget is independently 1 MiB,
+with 128 combined files/directory entries and 128 original inputs across resolve_all or planning.
+
+Zero-byte slash markers are genuine inspection-only directory metadata, conditionally HEAD-checked.
+They do not materialize empty directories or become persisted jobs. Directory-only unconfigured or
+exclusion-only scopes create no output. Nonempty slash payloads require exact acquisition plus an
+explicit safe filename. Whole discovery is charged before both literal and path selection; the public
+metadata receipt retains that full charge. MemberToken is compact and non-Copy, with explicit shared
+zeroizing S3 key ownership and canonical Swiss UUID spelling. Ordinary whole-body errors now use
+SourceError; HTTP range and legacy Source/get/from/Download/Output/Report contracts remain separate.
+
+V4 aggregate records preserve genuine S3 key/version evidence and optional nonsecret binding intent:
+scope, namespace, ordered patterns and an original-reference-only fingerprint, never raw references
+or credentials. SavedMember::binding_input verifies both that fingerprint and the existing full binding
+before restoring intent without discovery/matching. Older/default records work only when the full
+binding agrees; complex older recipes require the original explicit Input. V1/V2/V3 encoding is retained.
+Saved key correlation and declared requirement provenance APIs from the parent remain available.
+
 ## Original-path selection
 
 Input-local include/exclude intent is parsed once and shared immutably across discovered members.
@@ -188,19 +220,23 @@ Debit complete discovery and pattern text before filtering. Validate collection 
 but do not apply local filename/device/role restrictions to exact HTTP routing ancestors. Only matcher
 bounds of 4096 UTF-8 bytes and 64 slash-separated source components apply there; exceeding them is
 an inventory-limit error. Local assignment retains its own validation. Preserve the pre-filter
-accounted metadata amount. Genuine empty discovery is no-op; a nonempty occurrence filtered to none
-is an error even when another occurrence still matches.
+accounted metadata amount. Every positive criterion must match the complete original file scope before
+exclusions; a positive on empty is unmatched. Exclusion-only/unconfigured genuine empty is a no-op;
+a nonempty occurrence filtered to none is an error even when another occurrence still matches.
+Already-checked criteria survive selecting a frozen File subset; newly appended positives need subset
+matches. Literal identity is checked against complete metadata before path subtraction.
 
 Frame ordered include/exclude spellings in intent/bindings without changing no-pattern fingerprints.
 Match frozen work before discovery or selector reevaluation. Explicit bindings reconstruct original
-reference, namespace and pattern intent; fingerprints are not a stored recipe. Literal member tokens,
+reference, namespace and pattern intent; V4 can retain a bounded nonsecret recipe, while older complex
+bindings need their original explicit intent. Literal member tokens,
 version/requirements and stored range mode retain their separate authority. The legacy CLI has not
 adopted pattern flags.
 
 ## Transport scope
 
-HTTP validates the full requested response window and declared length. The current S3 policy instead
-trusts a matching Content-Range start, otherwise matching response length; the engine checks final
+HTTP validates the full requested response window and declared length. The legacy S3 Source policy
+instead trusts a matching Content-Range start, otherwise matching response length; the engine checks final
 chunk completion. The seven actual SDK loopback tests pin that limited policy, not strict HTTP parity
 or version continuity. Their client uses explicit fixture credentials/region/endpoint without ambient
 AWS configuration or metadata discovery. Do not substitute a handwritten response struct for SDK I/O.

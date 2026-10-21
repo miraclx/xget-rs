@@ -109,6 +109,32 @@ impl Selection {
         path.len() <= MAX_PATH_BYTES && path.split('/').count() <= MAX_DEPTH
     }
 
+    /// Every positive criterion must match the complete scope before exclusion subtraction.
+    /// A bounded flag vector avoids retaining paths or repeatedly traversing the scope iterator.
+    pub(crate) fn all_includes_match<'path>(
+        &self,
+        paths: impl IntoIterator<Item = &'path str>,
+    ) -> bool {
+        let mut matched = vec![false; self.includes.len()];
+        if matched.is_empty() {
+            return true;
+        }
+        for path in paths {
+            if !Self::path_is_bounded(path) {
+                continue;
+            }
+            for (pattern, seen) in self.includes.iter().zip(&mut matched) {
+                if !*seen && pattern.matches(path) {
+                    *seen = true;
+                }
+            }
+            if matched.iter().all(|seen| *seen) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Matches a complete ORIGINAL source-relative path, never a namespace or destination path.
     ///
     /// The transport supplies its original path spelling; collections separately validate their

@@ -43,6 +43,62 @@ impl Layout {
         Ok(())
     }
 
+    #[cfg(feature = "s3")]
+    pub(super) fn source_tree<'a>(
+        files: impl IntoIterator<Item = &'a str>,
+        directories: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), Error> {
+        let mut layout = Self {
+            files: BTreeSet::new(),
+            directories: BTreeMap::new(),
+        };
+        for path in directories {
+            // Only a marker for the explicitly requested prefix root has an empty relative path.
+            if path.is_empty() {
+                continue;
+            }
+            Self::source_path(path)?;
+            layout.claim_directory(&path.split('/').collect::<Vec<_>>())?;
+        }
+        for path in files {
+            Self::source_path(path)?;
+            layout.claim(&path.split('/').collect::<Vec<_>>())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "s3")]
+    fn claim_directory(&mut self, components: &[&str]) -> Result<(), Error> {
+        let mut key = Zeroizing::new(String::new());
+        let mut spelling = Zeroizing::new(String::new());
+        for component in components {
+            let canonical = Self::component(component)?;
+            if !key.is_empty() {
+                key.push('/');
+                spelling.push('/');
+            }
+            key.push_str(&canonical);
+            spelling.push_str(component);
+            if key.len() > 4096 {
+                return Err(Error::LayoutLimit);
+            }
+            if self.files.contains(key.as_str()) {
+                return Err(Error::LayoutConflict);
+            }
+            if let Some(previous) = self.directories.get(key.as_str()) {
+                if previous.as_str() != spelling.as_str() {
+                    return Err(Error::LayoutConflict);
+                }
+            } else {
+                self.directories.insert(
+                    CollisionKey(Zeroizing::clone(&key)),
+                    Zeroizing::clone(&spelling),
+                );
+            }
+        }
+        Ok(())
+    }
+
     // Recovery validates stored assignments using exactly the same managed-role/collision policy,
     // without deriving names again or changing frozen assignments.
     #[cfg(unix)]
@@ -134,11 +190,20 @@ impl Layout {
             }) {
                 return Err(Error::LayoutLimit);
             }
-            let collection = file.input.scope() == crate::input::InputScope::Collection;
+            let collection = matches!(
+                file.input.scope(),
+                crate::input::InputScope::Collection | crate::input::InputScope::Tree
+            );
             // No title field is evidenced by the service protocol. This is an honest readable
             // fallback, never a share UUID or a silently suffixed namespace.
             let group = namespace.or_else(|| {
-                (collection && (!explicit_directory || multiple_inputs)).then_some("SwissTransfer")
+                if !collection || (explicit_directory && !multiple_inputs) {
+                    return None;
+                }
+                match file.input.kind() {
+                    crate::input::InputKind::S3 => file.input.parsed_reference().host_str(),
+                    _ => Some("SwissTransfer"),
+                }
             });
             if collection && let Some(group) = group {
                 let key = group

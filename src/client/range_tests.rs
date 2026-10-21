@@ -773,7 +773,22 @@ fn a_queued_reader_acquisition_retains_the_aggregate_lease_after_waiter_drop() {
     use std::sync::mpsc;
 
     use crate::client::saved::Owned;
-    use crate::transfer::Transfer;
+    use crate::transfer::{OperationOwner, Transfer};
+
+    struct SettledRegistration {
+        owner: Option<OperationOwner>,
+        settled: Option<oneshot::Sender<()>>,
+    }
+    impl Drop for SettledRegistration {
+        fn drop(&mut self) {
+            // Arc::strong_count can become zero before its payload destructor releases the flock.
+            // Signal only after the actual inner owner has finished that cleanup.
+            drop(self.owner.take());
+            if let Some(settled) = self.settled.take() {
+                let _ = settled.send(());
+            }
+        }
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -805,8 +820,11 @@ fn a_queued_reader_acquisition_retains_the_aggregate_lease_after_waiter_drop() {
             .unwrap();
         let state = pending.state().path().to_path_buf();
         owned.submit_reader(0, pending.state()).await.unwrap();
-        let registration = owned.registration();
-        let remaining = Arc::downgrade(&registration);
+        let (settled, complete) = oneshot::channel();
+        let registration: OperationOwner = Arc::new(SettledRegistration {
+            owner: Some(owned.registration()),
+            settled: Some(settled),
+        });
         let (entered, occupied) = oneshot::channel();
         let (release, blocked) = mpsc::channel::<()>();
         let blocker = tokio::task::spawn_blocking(move || {
@@ -828,13 +846,10 @@ fn a_queued_reader_acquisition_retains_the_aggregate_lease_after_waiter_drop() {
         assert!(!state.exists());
         release.send(()).unwrap();
         blocker.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while remaining.strong_count() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("queued acquisition owns registration through settlement");
+        tokio::time::timeout(Duration::from_secs(5), complete)
+            .await
+            .expect("queued acquisition owns registration through cleanup")
+            .expect("registration cleanup signal");
         // SAFETY: acquisition has settled, so this independent probe now acquires its own lease.
         assert_eq!(
             unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },

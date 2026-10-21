@@ -29,6 +29,97 @@ fn file(name: &str) -> File {
     }
 }
 
+fn directory(path: &str) -> super::Directory {
+    let mut input = Input::tree("s3://bucket/prefix/")
+        .expect("tree")
+        .under("local/group")
+        .expect("namespace");
+    input.member = Some(crate::input::MemberToken::s3(&format!("prefix/{path}/")).expect("key"));
+    input.s3_version = Some(Zeroizing::new("version-one".to_owned()));
+    super::Directory {
+        input,
+        description: Description {
+            source_path: Zeroizing::new(path.to_owned()),
+            name: None,
+            length: Length::Known(crate::transfer::ByteCount(0)),
+            etag: Some(Zeroizing::new("\"marker-version\"".to_owned())),
+            requirements: Requirements::default(),
+        },
+    }
+}
+
+#[test]
+fn directory_inspection_is_separate_from_files_and_preserves_original_group_and_version_facts() {
+    let selected = file("one");
+    let id = FileId::clone(selected.id());
+    let mut inventory = Inventory::discovered(super::Discovered {
+        files: vec![selected],
+        directories: vec![directory("private-dir")],
+    })
+    .expect("complete scope");
+    let accounted = inventory.metadata_bytes();
+    let marker = inventory.directories().next().expect("directory metadata");
+    assert_eq!(marker.kind(), super::DirectoryKind::S3FolderMarker);
+    assert_eq!(marker.source_path(), "private-dir");
+    assert_eq!(
+        marker.member_token().expect("key").as_str(),
+        "prefix/private-dir/"
+    );
+    assert_eq!(marker.namespace().expect("group").as_str(), "local/group");
+    assert_eq!(marker.input.original_reference(), "s3://bucket/prefix/");
+    assert_eq!(
+        marker.input.s3_version.as_deref().map(String::as_str),
+        Some("version-one")
+    );
+    assert_eq!(marker.version(), VersionEvidence::StrongEtag);
+    assert!(!format!("{marker:?} {inventory:?}").contains("private-dir"));
+    inventory.retain(|file| file.id() == &id);
+    assert_eq!(inventory.into_files().next().expect("file only").id(), &id);
+    let mut inventory = Inventory::discovered(super::Discovered {
+        files: vec![file("one")],
+        directories: vec![directory("private-dir")],
+    })
+    .expect("complete scope");
+    assert_eq!(inventory.metadata_bytes(), accounted);
+    inventory.retain(|_| false);
+    assert_eq!(inventory.files().len(), 0);
+    assert_eq!(inventory.directories().len(), 1);
+    assert_eq!(inventory.metadata_bytes(), accounted);
+    assert!(matches!(
+        inventory.select_one(|_| true),
+        Err(SelectionError::NoMatch)
+    ));
+}
+
+#[test]
+fn files_and_directory_metadata_share_one_count_and_text_ceiling() {
+    let directories = (0..MAX_FILES).map(|_| directory("dir")).collect();
+    assert!(matches!(
+        Inventory::discovered(super::Discovered {
+            files: vec![file("one")],
+            directories,
+        }),
+        Err(InventoryError::Limit)
+    ));
+    let mut marker = directory("dir");
+    marker.description.source_path = Zeroizing::new("x".repeat(MAX_METADATA_BYTES));
+    assert!(matches!(
+        Inventory::discovered(super::Discovered {
+            files: Vec::new(),
+            directories: vec![marker],
+        }),
+        Err(InventoryError::Limit)
+    ));
+    let inventory = Inventory::discovered(super::Discovered {
+        files: Vec::new(),
+        directories: vec![directory("dir")],
+    })
+    .expect("inspection-only scope");
+    assert_eq!(inventory.files().len(), 0);
+    assert_eq!(inventory.directories().len(), 1);
+    assert_eq!(inventory.into_files().count(), 0);
+}
+
 #[test]
 fn complete_empty_metadata_is_inspectable_but_selection_is_no_match() {
     let inventory = Inventory::complete(Vec::new()).expect("complete empty metadata fixture");

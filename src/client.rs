@@ -3,11 +3,17 @@
 //! Exact HTTP inputs and, with `swisstransfer`, bounded SwissTransfer collections use the same serial
 //! native Transfer implementation. Exact HTTP with known nonzero length, a bounded strong HEAD ETag
 //! and explicit byte-range support uses Transfer's bounded reader coordinator. Other exact HTTP and
-//! SwissTransfer retain ordered whole-body access. Client clones share reusable HTTP connections and
-//! bounded control/body admission, not a provider-owned scheduler or the legacy range engine.
-//! Owned run metadata stays in the designated destination's `.xget-runs` store. Redirects, catalogues
-//! and unsupported tree/provider inputs fail explicitly. SwissTransfer members currently open whole
-//! ordered responses, not parallel ranges or byte-resume sessions.
+//! SwissTransfer retain ordered whole-body access. With `s3` and a caller-configured SDK, exact S3
+//! objects and explicit literal bucket/prefix trees use ordered whole bodies and the same coordinator.
+//! Client clones share reusable transports and bounded control/body admission, not a provider-owned
+//! scheduler or the legacy range engine. Owned run metadata stays in the destination's `.xget-runs`
+//! store. Redirects, catalogues and unsupported trees fail explicitly. S3 listing is not a snapshot:
+//! each object's conditional HEAD/GET continuity is independent of other listed objects. Tree scopes
+//! retain zero-byte slash-ending objects as inspection-only directory metadata. Nonempty slash-key
+//! payloads fail explicitly rather than being dropped as folder markers. No empty directories are
+//! restored; directory-only scopes have zero file jobs and create no output. Exact slash keys work
+//! with an explicit file target. S3 and
+//! SwissTransfer have no parallel ranges or partial-byte resume in this entrance.
 //!
 //! ```no_run
 //! use xget::Client;
@@ -46,22 +52,30 @@ use std::sync::Arc;
 use crate::checks::Requirements;
 use crate::input::{Input, InputError, InputKind, InputScope};
 use crate::inventory::{
-    File, FileId, Inventory, InventoryError, MAX_FILES, MAX_METADATA_BYTES, Selected,
+    Discovered, File, FileId, Inventory, InventoryError, MAX_FILES, MAX_METADATA_BYTES, Selected,
 };
 pub use crate::transfer::live::{BodyError, BodyFailure, FinishError, Progress as LiveProgress};
 use crate::transfer::{Conflict, Digest, Measurement, Provenance, Receipt, Requirement, Transfer};
 
+mod builtin;
 mod http;
 mod layout;
 mod live;
 mod range;
+#[cfg(feature = "s3")]
+mod s3;
 mod saved;
 #[cfg(feature = "swisstransfer")]
 mod swiss;
 
+pub use builtin::SourceError;
 use http::Http;
 pub use http::{HttpError, HttpErrorKind, RequestStage};
 pub use live::{CheckedBody, LiveReceipt, OpenedFile};
+#[cfg(feature = "s3")]
+use s3::S3;
+#[cfg(feature = "s3")]
+pub use s3::{S3Error, S3ErrorKind};
 pub use saved::{
     BindingKey, BindingKeyParseError, Fresh, Resume, RunId, SavedError, SavedMember, SavedRun,
     SavedStatus,
@@ -70,13 +84,18 @@ pub use saved::{
 use swiss::Swiss;
 
 #[cfg(test)]
+#[path = "client/discovery_tests.rs"]
+mod discovery_tests;
+#[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
 
 /// Reusable native HTTP transport and a shared bound on active requests/response bodies.
 ///
 /// Construction performs no network discovery and loads no `.env`, proxy or credential profile.
-/// A caller-owned Tokio runtime is required only when performing asynchronous HTTP/native work.
+/// A configured S3 SDK retains its caller-selected credential/endpoint/retry policies; xget does not
+/// replace those with HTTP defaults. See `ClientBuilder::s3_client` when `s3` is enabled.
+/// A caller-owned Tokio runtime is required only when performing asynchronous transport/native work.
 ///
 /// # Request deadlines
 ///
@@ -168,32 +187,132 @@ impl Client {
     ///
     /// Selected Files preserve their frozen metadata. Exact HTTP uses HEAD; the optional SwissTransfer
     /// adapter uses a bounded share-page metadata GET and preserves Collection at every cardinality.
+    /// Configured S3 uses HEAD for exact objects and bounded ListObjectsV2 followed by conditional
+    /// per-object HEADs for explicit trees. It preserves known versionId and opaque strong ETag
+    /// separately from key selectors and digests. Listing has no point-in-time snapshot claim.
+    /// Tree source paths are relative to the prefix's last complete slash ancestor: `dir/fo` lists
+    /// `dir/foo` as `foo`, while selectors always retain `dir/foo`. No key normalization occurs.
+    /// At most 128 pages are accepted, with nonempty nonrepeating continuation tokens up to 8192 bytes;
+    /// object keys/version IDs allow 1024 bytes and ETags 8192 bytes. All calls share body admission.
     /// Unsupported providers/trees return errors, not fake inventories. HTTP 405/501 leaves a usable
-    /// exact unpinned reference without probing GET. Limits are 128 discovered files and 1 MiB retained
-    /// inventory text; exceeding either fails the entire discovery, never returning a truncated value.
+    /// exact unpinned reference without probing GET. Limits are 128 combined files/directory entries
+    /// and 1 MiB accounted inventory text; exceeding either fails discovery, never returning a prefix.
+    /// Zero-byte S3 slash markers remain inspectable through Inventory::directories, not file jobs.
+    /// File path patterns do not remove directory facts; directory-only scopes are zero-file no-ops.
     /// Input-local includes/exclusions apply to original source-relative paths only after complete
-    /// discovery and accounting. Nonempty discovery filtered to none returns [`Error::PathSelection`];
-    /// genuine empty collections remain empty. See [`Input::include`] for syntax and fixed budgets.
+    /// discovery and accounting. Every positive criterion must match the complete file scope before
+    /// exclusions, including duplicate criteria. A positive on an empty scope or nonempty files
+    /// filtered to none returns [`Error::PathSelection`]. Exclusion-only/unconfigured genuine empty
+    /// collections remain empty. See [`Input::include`] for syntax and fixed budgets.
     pub async fn resolve<T>(&self, input: T) -> Result<Inventory, Error>
     where
         T: TryInto<Input>,
         T::Error: Into<Error>,
     {
-        self.resolve_input(input.try_into().map_err(Into::into)?)
-            .await
+        self.resolve_all(core::iter::once(input)).await
+    }
+
+    /// Resolves a complete multi-input inventory under one original-input, metadata and time budget.
+    ///
+    /// At most 128 original inputs and 128 combined discovered file/directory entries are accepted,
+    /// with 1 MiB accounted text and one 15-second complete-discovery deadline. Inputs retain separate
+    /// original occurrences and grouping, even when references are equal. No payload GET or output
+    /// creation occurs. Each positive input-local include must match its complete executable-file
+    /// scope before exclusions; a positive criterion on an empty scope is unmatched. Directory facts
+    /// are inspection-only and cannot satisfy a file include. See [`Self::resolve`] for transport limits.
+    pub async fn resolve_all<I, T>(&self, inputs: I) -> Result<Inventory, Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: TryInto<Input>,
+        T::Error: Into<Error>,
+    {
+        self.resolve_inputs(Self::collect_inputs(inputs)?).await
     }
 
     async fn resolve_input(&self, input: Input) -> Result<Inventory, Error> {
-        let files = self
-            .resolve_bounded(input, &mut DiscoveryBudget::default())
-            .await?;
-        Self::select_paths(files)
+        self.resolve_inputs(Self::collect_inputs(core::iter::once(input))?)
+            .await
+    }
+
+    async fn resolve_inputs(&self, inputs: Vec<Input>) -> Result<Inventory, Error> {
+        let retained = inputs.iter().fold(0_usize, |bytes, input| {
+            bytes.saturating_add(input.retained_bytes())
+        });
+        let mut budget = DiscoveryBudget {
+            files: MAX_FILES,
+            bytes: MAX_METADATA_BYTES
+                .checked_sub(retained)
+                .ok_or(Error::Inventory(InventoryError::Limit))?,
+        };
+        for input in &inputs {
+            Self::supported(input)?;
+            self.capability(input)?;
+        }
+        let needs_metadata = inputs.iter().any(|input| input.selected.is_none());
+        if needs_metadata {
+            Http::runtime()?;
+        }
+        let discovery = async {
+            let mut discovered = Discovered::default();
+            let mut intents = Vec::new();
+            let mut members = Vec::new();
+            for (index, mut input) in inputs.into_iter().enumerate() {
+                input.occurrence = crate::input::InputOccurrence(index as u32);
+                if let Some(selection) = input.pending_includes()? {
+                    intents.push(PathIntent {
+                        occurrence: input.occurrence,
+                        selection,
+                    });
+                }
+                if input.selected.is_none()
+                    && let Some(token) = &input.member
+                {
+                    members.push((input.occurrence, crate::input::MemberToken::clone(token)));
+                }
+                budget.bytes += input.retained_bytes();
+                let scope = self.resolve_bounded(input, &mut budget).await?;
+                discovered.files.extend(scope.files);
+                discovered.directories.extend(scope.directories);
+            }
+            Ok::<_, Error>((discovered, intents, members))
+        };
+        let (discovered, intents, members) = if needs_metadata {
+            tokio::time::timeout(core::time::Duration::from_secs(15), discovery)
+                .await
+                .map_err(|_| Error::DiscoveryTimeout)??
+        } else {
+            discovery.await?
+        };
+        Self::select_paths(discovered, intents, members)
     }
 
     // Resolve, live opening and Download planning share this one post-discovery selection seam.
     // Account the COMPLETE scope before filtering; never manufacture an executable truncated scope.
-    fn select_paths(files: Vec<File>) -> Result<Inventory, Error> {
-        let mut inventory = Inventory::complete(files)?;
+    fn select_paths(
+        discovered: Discovered,
+        intents: Vec<PathIntent>,
+        members: Vec<(crate::input::InputOccurrence, crate::input::MemberToken)>,
+    ) -> Result<Inventory, Error> {
+        let mut inventory = if discovered.directories.is_empty() {
+            Inventory::complete(discovered.files)?
+        } else {
+            Inventory::discovered(discovered)?
+        };
+        // Resolve literal identity against complete metadata, not a path-filtered subset. An
+        // existing member excluded by another criterion is unmatched intent, not a stale identity.
+        for (occurrence, token) in &members {
+            let file_match = inventory.files().any(|file| {
+                file.input.occurrence == *occurrence && file.member_token() == Some(token)
+            });
+            let marker_match = token.is_s3()
+                && inventory.directories().any(|directory| {
+                    directory.input.occurrence == *occurrence
+                        && directory.member_token() == Some(token)
+                });
+            if !file_match && !marker_match {
+                return Err(Error::Selection);
+            }
+        }
         let mut requested = Vec::new();
         for file in inventory.files() {
             if file
@@ -202,7 +321,9 @@ impl Client {
                 .as_ref()
                 .is_some_and(|selection| selection.is_configured())
             {
-                if file.input.kind() == InputKind::Http && file.input.scope() == InputScope::Exact {
+                if matches!(file.input.kind(), InputKind::Http | InputKind::S3)
+                    && file.input.scope() == InputScope::Exact
+                {
                     // Exact remote ancestors are routing data, not local destination components.
                     if !crate::selection::Selection::path_is_bounded(file.source_path()) {
                         return Err(Error::Inventory(InventoryError::Limit));
@@ -215,12 +336,29 @@ impl Client {
                 }
             }
         }
+        // Keep original immutable intent even when discovery produced no files. Test every positive
+        // criterion on the complete per-occurrence file scope, before exclusions remove any matches.
+        for intent in intents {
+            if !intent.selection.all_includes_match(
+                inventory
+                    .files()
+                    .filter(|file| file.input.occurrence == intent.occurrence)
+                    .map(File::source_path),
+            ) {
+                return Err(Error::PathSelection);
+            }
+        }
         inventory.retain(|file| {
             file.input
                 .selection
                 .as_ref()
                 .is_none_or(|selection| selection.matches(file.source_path()))
         });
+        for (occurrence, token) in members {
+            inventory.retain(|file| {
+                file.input.occurrence != occurrence || file.member_token() == Some(&token)
+            });
+        }
         // A genuine empty discovery contributed no requested occurrence. In a mixed request, one
         // input's matches cannot hide another nonempty input whose local intent selected nothing.
         if requested.iter().any(|occurrence| {
@@ -230,6 +368,7 @@ impl Client {
         }) {
             return Err(Error::PathSelection);
         }
+        inventory.freeze_path_selection();
         Ok(inventory)
     }
 
@@ -237,8 +376,9 @@ impl Client {
         &self,
         mut input: Input,
         budget: &mut DiscoveryBudget,
-    ) -> Result<Vec<File>, Error> {
+    ) -> Result<Discovered, Error> {
         Self::supported(&input)?;
+        self.capability(&input)?;
         if input.retained_bytes() > MAX_METADATA_BYTES {
             return Err(Error::Inventory(InventoryError::Limit));
         }
@@ -248,11 +388,22 @@ impl Client {
                 selected: *selected,
             };
             budget.reserve(&file)?;
-            return Ok(vec![file]);
+            return Ok(vec![file].into());
         }
         #[cfg(feature = "swisstransfer")]
         if input.kind() == InputKind::SwissTransfer {
-            return Swiss::resolve(&self.http, input, budget).await;
+            return Swiss::resolve(&self.http, input, budget)
+                .await
+                .map(Into::into);
+        }
+        if input.kind() == InputKind::S3 {
+            #[cfg(feature = "s3")]
+            {
+                let s3 = self.http.s3.as_ref().ok_or(Error::S3Unavailable)?;
+                return s3.resolve(&self.http, input, budget).await;
+            }
+            #[cfg(not(feature = "s3"))]
+            return Err(Error::S3Unavailable);
         }
         let description = self.http.describe(&mut input).await?;
         let file = File {
@@ -263,10 +414,24 @@ impl Client {
             },
         };
         budget.reserve(&file)?;
-        Ok(vec![file])
+        Ok(vec![file].into())
+    }
+
+    fn capability(&self, input: &Input) -> Result<(), Error> {
+        if input.kind() != InputKind::S3 {
+            return Ok(());
+        }
+        #[cfg(feature = "s3")]
+        if self.http.s3.is_some() {
+            return Ok(());
+        }
+        Err(Error::S3Unavailable)
     }
 
     fn supported(input: &Input) -> Result<(), Error> {
+        if input.kind() == InputKind::S3 {
+            return Ok(());
+        }
         #[cfg(feature = "swisstransfer")]
         if input.kind() == InputKind::SwissTransfer && input.scope() == InputScope::Collection {
             return Ok(());
@@ -303,12 +468,26 @@ impl Client {
         Ok(OpenedFile::new(file, opened))
     }
 
-    async fn open_file(&self, file: &mut File) -> Result<http::Opened, Error> {
+    async fn open_file(&self, file: &mut File) -> Result<builtin::Opened, Error> {
+        if file.input.kind() == InputKind::S3 {
+            #[cfg(feature = "s3")]
+            {
+                return self
+                    .http
+                    .s3
+                    .as_ref()
+                    .ok_or(Error::S3Unavailable)?
+                    .open(&self.http, file)
+                    .await;
+            }
+            #[cfg(not(feature = "s3"))]
+            return Err(Error::S3Unavailable);
+        }
         #[cfg(feature = "swisstransfer")]
         if file.input.kind() == InputKind::SwissTransfer {
-            return Swiss::open(&self.http, file).await;
+            return Swiss::open(&self.http, file).await.map(Into::into);
         }
-        self.http.open(file).await
+        self.http.open(file).await.map(Into::into)
     }
 
     /// Executes frozen assignments serially using actual checked native Transfer publication.
@@ -354,6 +533,15 @@ impl Client {
         }
         if plan.files.is_empty() {
             return Ok(report);
+        }
+        for planned in &plan.files {
+            if let Err(error) = self.capability(&planned.file.input) {
+                return Err(Box::new(RunFailure {
+                    error,
+                    report,
+                    failed: None,
+                }));
+            }
         }
         if let Err(error) = Self::prepare_directories(&plan).await {
             return Err(Box::new(RunFailure {
@@ -704,12 +892,16 @@ impl fmt::Debug for Client {
 #[must_use]
 pub struct ClientBuilder {
     max_requests: NonZeroUsize,
+    #[cfg(feature = "s3")]
+    s3: Option<S3>,
 }
 
 impl Default for ClientBuilder {
     fn default() -> Self {
         Self {
             max_requests: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
+            #[cfg(feature = "s3")]
+            s3: None,
         }
     }
 }
@@ -723,9 +915,34 @@ impl ClientBuilder {
         self
     }
 
+    /// Installs a caller-configured reusable S3 SDK client without loading AWS configuration.
+    ///
+    /// Credentials, endpoint, retry, checksum-validation and connection policies remain the caller
+    /// SDK's policies, not the HTTP adapter's defaults. Each SDK metadata call/page and GET opening
+    /// has a fixed 15-second async deadline including common admission. Complete discovery also has
+    /// a 15-second deadline. These cancel awaited futures, not synchronous parser CPU work or a
+    /// caller credential provider's separately spawned work. Payload reading has no added deadline.
+    /// A separate fixed 2 MiB metadata HTTP-body limit is installed before the SDK's collector/XML
+    /// parser, including chunked pages. Oversized declared listing/error lengths fail before polling.
+    /// HEAD Content-Length describes the object and is not mistaken for a metadata body length.
+    /// Successful GET payloads remain unbounded streaming. Common decoded count/text limits still
+    /// apply independently; neither bound claims total SDK/transport RSS or parser CPU preemption.
+    /// Each listing asks for 129 keys, but that request hint is not trusted as a response-size bound.
+    /// No SDK is constructed implicitly and no profiles, environment or IMDS are consulted here.
+    #[cfg(feature = "s3")]
+    pub fn s3_client(mut self, client: aws_sdk_s3::Client) -> Self {
+        self.s3 = Some(S3::from(client));
+        self
+    }
+
     /// Builds reusable transports without network or filesystem effects.
     pub fn build(self) -> Result<Client, Error> {
-        let http = Http::new(self.max_requests)?;
+        #[allow(unused_mut)] // The optional SDK is installed only when its capability is compiled.
+        let mut http = Http::new(self.max_requests)?;
+        #[cfg(feature = "s3")]
+        {
+            http.s3 = self.s3.map(Arc::new);
+        }
         Ok(Client {
             http: Arc::new(http),
         })
@@ -863,39 +1080,7 @@ impl Download<'_> {
             })
             .count();
         let requirements = requirements.map_err(Error::ConflictingRequirements)?;
-        let retained = inputs.iter().fold(0_usize, |bytes, input| {
-            bytes.saturating_add(input.retained_bytes())
-        });
-        let mut budget = DiscoveryBudget {
-            files: MAX_FILES,
-            bytes: MAX_METADATA_BYTES
-                .checked_sub(retained)
-                .ok_or(Error::Inventory(InventoryError::Limit))?,
-        };
-        for input in &inputs {
-            Client::supported(input)?;
-        }
-        let needs_metadata = inputs.iter().any(|input| input.selected.is_none());
-        if needs_metadata {
-            Http::runtime()?;
-        }
-        let discovery = async {
-            let mut files = Vec::new();
-            for (index, mut input) in inputs.into_iter().enumerate() {
-                input.occurrence = crate::input::InputOccurrence(index as u32);
-                budget.bytes += input.retained_bytes();
-                files.extend(client.resolve_bounded(input, &mut budget).await?);
-            }
-            Ok::<_, Error>(files)
-        };
-        let files = if needs_metadata {
-            tokio::time::timeout(core::time::Duration::from_secs(15), discovery)
-                .await
-                .map_err(|_| Error::HeaderTimeout)??
-        } else {
-            discovery.await?
-        };
-        let inventory = Client::select_paths(files)?;
+        let inventory = client.resolve_inputs(inputs).await?;
         let files: Vec<_> = inventory.into_files().collect();
         if requirements.iter().next().is_some() && files.len() != 1 {
             return Err(Error::GlobalRequirementCardinality);
@@ -980,6 +1165,11 @@ impl fmt::Debug for Download<'_> {
 
 // One request-wide retained inventory budget, debited before selection. A selector cannot hide a
 // larger discovery, and later inputs cannot independently each retain the entire common allowance.
+struct PathIntent {
+    occurrence: crate::input::InputOccurrence,
+    selection: Arc<crate::selection::Selection>,
+}
+
 struct DiscoveryBudget {
     files: usize,
     bytes: usize,
@@ -994,13 +1184,23 @@ impl Default for DiscoveryBudget {
 }
 impl DiscoveryBudget {
     fn reserve(&mut self, file: &File) -> Result<(), Error> {
+        self.reserve_entry(file.retained_bytes())
+    }
+
+    #[cfg(feature = "s3")]
+    fn reserve_directory(&mut self, directory: &crate::inventory::Directory) -> Result<(), Error> {
+        self.reserve_entry(directory.retained_bytes())
+    }
+
+    fn reserve_entry(&mut self, retained_bytes: usize) -> Result<(), Error> {
+        // The historical field name counts all discovered entries, including inspection-only markers.
         self.files = self
             .files
             .checked_sub(1)
             .ok_or(Error::Inventory(InventoryError::Limit))?;
         self.bytes = self
             .bytes
-            .checked_sub(file.retained_bytes())
+            .checked_sub(retained_bytes)
             .ok_or(Error::Inventory(InventoryError::Limit))?;
         Ok(())
     }
@@ -1200,6 +1400,15 @@ impl RunFailure {
 /// Built-in errors expose only safe typed context, never a bearer reference or unsafe remote name.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Exact S3 and explicit S3 trees require the feature and a caller-configured SDK client.
+    #[error(
+        "s3 capability unavailable; enable s3 and configure the client builder with an sdk client"
+    )]
+    S3Unavailable,
+    /// Concrete SDK failure or bounded S3 protocol category, with remote diagnostics redacted.
+    #[cfg(feature = "s3")]
+    #[error("s3 operation failed; inspect the safe transport category")]
+    S3(#[from] S3Error),
     /// Offline owned persistence and frozen continuation errors remain matchable.
     #[error("saved run operation failed; inspect the typed recovery error")]
     Saved(#[from] SavedError),
@@ -1208,7 +1417,7 @@ pub enum Error {
     RunCheckpoint {
         /// Original transfer failure, including confirmed or unconfirmed extents.
         #[source]
-        transfer: Box<crate::transfer::Failure<HttpError>>,
+        transfer: Box<crate::transfer::Failure<SourceError>>,
         /// Aggregate persistence failure; it is not a successful pause.
         checkpoint: SavedError,
     },
@@ -1259,6 +1468,9 @@ pub enum Error {
         "http request admission or headers timed out; release retained bodies or check the endpoint"
     )]
     HeaderTimeout,
+    /// The complete transport-neutral metadata scope exceeded its shared discovery deadline.
+    #[error("metadata discovery timed out; release retained bodies or request a smaller scope")]
+    DiscoveryTimeout,
     /// Redirect targets can change origin/credential authority and are not followed in this slice.
     #[error("http redirects are unsupported; supply the authorized final reference explicitly")]
     Redirect,
@@ -1336,7 +1548,7 @@ pub enum Error {
     },
     /// Actual native partial counts, settled extents and retained state survive failure.
     #[error("native transfer failed; inspect its partial report and retained state")]
-    Transfer(#[source] Box<crate::transfer::Failure<HttpError>>),
+    Transfer(#[source] Box<crate::transfer::Failure<SourceError>>),
 }
 
 impl From<Infallible> for Error {

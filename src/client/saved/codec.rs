@@ -1,6 +1,12 @@
-//! Bounded normalized private V1/V2/V3 encoding. No references, foreign errors or hasher state.
+//! Bounded normalized private V1/V2/V3/V4 encoding. No access references, foreign errors or hasher state.
 //! V1/V2 round-trip unchanged. V3 adds a per-member execution-mode byte after the ETag field:
-//! 0 is ordered whole-body, 1 is exact HTTP reader. Its pin/size remain the existing member fields.
+//! 0 is ordered whole-body, 1 is exact HTTP reader. V4 retains that byte, and adds remote tag 2:
+//! literal S3 key (1024 bytes), original source path (4096 bytes), optional HEAD versionId (1024 bytes).
+//! After each V4 ETag comes an optional nonsecret binding recipe: original-reference-only hash,
+//! scope, optional namespace (4096 bytes/64 components), ordered include/exclude strings (64 total,
+//! 1024 bytes each/16384 combined). V1/V2/V3 have no recipe bytes and round-trip unchanged.
+//! Remote tags 0/1 keep their old exact/Swiss layout. S3 must have known length, a strong opaque ETag
+//! and whole mode; versionId is additional conditional evidence, not a digest or access credential.
 
 use std::path::Path;
 #[cfg(unix)]
@@ -32,18 +38,19 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
     {
         return Err(SavedError::Limit);
     }
-    if !matches!(record.version, 1..=3) {
+    if !matches!(record.version, 1..=4) {
         return Err(SavedError::Version);
     }
     for (index, member) in record.members.iter().enumerate() {
-        if member.occurrence.0 as usize >= MAX_FILES
+        if (record.version < 4 && member.intent.is_some())
+            || member.occurrence.0 as usize >= MAX_FILES
             || (record.version == 1
                 && (member.remote.is_some() || member.occurrence.0 as usize != index))
         {
             return Err(SavedError::Corrupt);
         }
         if member.mode == crate::client::range::Mode::Ranges
-            && (record.version != 3
+            && (record.version < 3
                 || member.remote.is_some()
                 || !crate::client::range::Mode::supports(
                     member.length,
@@ -53,8 +60,26 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
             return Err(SavedError::Corrupt);
         }
         if let Some(remote) = &member.remote {
-            crate::client::layout::Layout::source_path(&remote.source_path)
-                .map_err(|_| SavedError::Corrupt)?;
+            if remote.token.is_s3() {
+                if record.version != 4
+                    || member.etag.is_none()
+                    || remote.source_path.is_empty()
+                    || remote.source_path.len() > MAX_PATH
+                    || remote.s3_version.as_ref().is_some_and(|version| {
+                        version.is_empty()
+                            || version.len() > 1024
+                            || version.chars().any(char::is_control)
+                    })
+                {
+                    return Err(SavedError::Corrupt);
+                }
+            } else {
+                if remote.s3_version.is_some() {
+                    return Err(SavedError::Corrupt);
+                }
+                crate::client::layout::Layout::source_path(&remote.source_path)
+                    .map_err(|_| SavedError::Corrupt)?;
+            }
             if matches!(member.length, Length::Unknown)
                 || (!member.attempts.is_empty() && member.etag.is_none())
             {
@@ -66,8 +91,8 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                 && (previous.binding != member.binding
                     || previous.remote.is_none()
                     || member.remote.is_none()
-                    || previous.remote.as_ref().map(|remote| remote.token)
-                        == member.remote.as_ref().map(|remote| remote.token))
+                    || previous.remote.as_ref().map(|remote| &remote.token)
+                        == member.remote.as_ref().map(|remote| &remote.token))
             {
                 return Err(SavedError::Corrupt);
             }
@@ -105,9 +130,21 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
             match &member.remote {
                 None => out.byte(0),
                 Some(remote) => {
-                    out.byte(1);
-                    out.bytes(remote.token.as_str().as_bytes(), 36)?;
+                    out.byte(if remote.token.is_s3() { 2 } else { 1 });
+                    out.bytes(
+                        remote.token.as_str().as_bytes(),
+                        if remote.token.is_s3() { 1024 } else { 36 },
+                    )?;
                     out.bytes(remote.source_path.as_bytes(), MAX_PATH)?;
+                    if remote.token.is_s3() {
+                        match &remote.s3_version {
+                            None => out.byte(0),
+                            Some(version) => {
+                                out.byte(1);
+                                out.bytes(version.as_bytes(), 1024)?;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -126,7 +163,10 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                 out.bytes(etag.as_bytes(), MAX_VALIDATOR)?;
             }
         }
-        if record.version == 3 {
+        if record.version == 4 {
+            out.intent(member.intent.as_ref())?;
+        }
+        if record.version >= 3 {
             out.byte(match member.mode {
                 crate::client::range::Mode::Whole => 0,
                 crate::client::range::Mode::Ranges => 1,
@@ -163,7 +203,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
         return Err(SavedError::Corrupt);
     }
     let version = input.u32()?;
-    if !matches!(version, 1..=3) {
+    if !matches!(version, 1..=4) {
         return Err(SavedError::Version);
     }
     let payload_length = bytes.len() - 32;
@@ -211,7 +251,23 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
                     token: crate::input::MemberToken::parse(input.text(36)?)
                         .ok_or(SavedError::Corrupt)?,
                     source_path: Zeroizing::new(input.text(MAX_PATH)?.to_owned()),
+                    s3_version: None,
                 }),
+                2 if version == 4 => {
+                    let token = crate::input::MemberToken::s3(input.text(1024)?)
+                        .ok_or(SavedError::Corrupt)?;
+                    let source_path = Zeroizing::new(input.text(MAX_PATH)?.to_owned());
+                    let s3_version = match input.byte()? {
+                        0 => None,
+                        1 => Some(Zeroizing::new(input.text(1024)?.to_owned())),
+                        _ => return Err(SavedError::Corrupt),
+                    };
+                    Some(super::FrozenMember {
+                        token,
+                        source_path,
+                        s3_version,
+                    })
+                }
                 _ => return Err(SavedError::Corrupt),
             };
             (occurrence, remote)
@@ -240,7 +296,8 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
             }
             _ => return Err(SavedError::Corrupt),
         };
-        let mode = if version == 3 {
+        let intent = if version == 4 { input.intent()? } else { None };
+        let mode = if version >= 3 {
             match input.byte()? {
                 0 => crate::client::range::Mode::Whole,
                 1 => crate::client::range::Mode::Ranges,
@@ -286,6 +343,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
         }
         members.push(Member {
             occurrence,
+            intent,
             remote,
             binding,
             destination,
@@ -354,6 +412,48 @@ fn algorithm_tag(algorithm: Algorithm) -> u8 {
 
 struct Encoder(Vec<u8>);
 impl Encoder {
+    fn intent(&mut self, intent: Option<&super::FrozenIntent>) -> Result<(), SavedError> {
+        let Some(intent) = intent else {
+            self.byte(0);
+            return Ok(());
+        };
+        self.byte(1);
+        self.0.extend_from_slice(&intent.original.0);
+        self.byte(match intent.scope {
+            crate::input::InputScope::Exact => 0,
+            crate::input::InputScope::Collection => 1,
+            crate::input::InputScope::Catalogue => 2,
+            crate::input::InputScope::Tree => 3,
+        });
+        match &intent.namespace {
+            None => self.byte(0),
+            Some(namespace) => {
+                if namespace.as_str().split('/').count() > 64 {
+                    return Err(SavedError::Limit);
+                }
+                self.byte(1);
+                self.bytes(namespace.as_str().as_bytes(), 4096)?;
+            }
+        }
+        match &intent.selection {
+            None => {
+                self.u32(0);
+                self.u32(0);
+            }
+            Some(selection) => {
+                self.u32(selection.includes().count() as u32);
+                for pattern in selection.includes() {
+                    self.bytes(pattern.as_bytes(), 1024)?;
+                }
+                self.u32(selection.excludes().count() as u32);
+                for pattern in selection.excludes() {
+                    self.bytes(pattern.as_bytes(), 1024)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn byte(&mut self, value: u8) {
         self.0.push(value);
     }
@@ -382,6 +482,61 @@ impl Encoder {
 struct Decoder<'a>(&'a [u8]);
 #[cfg(unix)]
 impl<'a> Decoder<'a> {
+    fn intent(&mut self) -> Result<Option<super::FrozenIntent>, SavedError> {
+        match self.byte()? {
+            0 => return Ok(None),
+            1 => {}
+            _ => return Err(SavedError::Corrupt),
+        }
+        let original = self.fingerprint()?;
+        let scope = match self.byte()? {
+            0 => crate::input::InputScope::Exact,
+            1 => crate::input::InputScope::Collection,
+            2 => crate::input::InputScope::Catalogue,
+            3 => crate::input::InputScope::Tree,
+            _ => return Err(SavedError::Corrupt),
+        };
+        let namespace = match self.byte()? {
+            0 => None,
+            1 => {
+                let text = self.text(4096)?;
+                if text.split('/').count() > 64 {
+                    return Err(SavedError::Corrupt);
+                }
+                Some(crate::input::Namespace::parse(text).map_err(|_| SavedError::Corrupt)?)
+            }
+            _ => return Err(SavedError::Corrupt),
+        };
+        let mut selection = crate::selection::Selection::default();
+        let includes = self.u32()?;
+        if includes > 64 {
+            return Err(SavedError::Corrupt);
+        }
+        for _ in 0..includes {
+            selection = selection
+                .including(self.text(1024)?)
+                .map_err(|_| SavedError::Corrupt)?;
+        }
+        let excludes = self.u32()?;
+        if excludes > 64 - includes {
+            return Err(SavedError::Corrupt);
+        }
+        for _ in 0..excludes {
+            selection = selection
+                .excluding(self.text(1024)?)
+                .map_err(|_| SavedError::Corrupt)?;
+        }
+        let selection = selection
+            .is_configured()
+            .then(|| std::sync::Arc::new(selection));
+        Ok(Some(super::FrozenIntent {
+            original,
+            scope,
+            namespace,
+            selection,
+        }))
+    }
+
     fn take(&mut self, count: usize) -> Result<&'a [u8], SavedError> {
         let (value, rest) = self.0.split_at_checked(count).ok_or(SavedError::Corrupt)?;
         self.0 = rest;

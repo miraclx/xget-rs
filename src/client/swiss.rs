@@ -31,7 +31,6 @@ impl Swiss {
     ) -> Result<Vec<File>, Error> {
         let page = http.metadata(&input, MAX_PAGE).await?;
         let members = Manifest::parse(&input, &page)?;
-        let wanted = input.member;
         let mut files = Vec::with_capacity(members.len());
         for member in members {
             let mut origin = input.duplicate_reference()?;
@@ -60,17 +59,12 @@ impl Swiss {
         // The COMPLETE inventory is accounted before applying intent. Selection cannot conceal a count
         // or retained-text overflow in the original scope.
         let inventory = Inventory::complete(files)?;
-        if let Some(wanted) = wanted {
-            return inventory
-                .select_one(|file| file.member_token() == Some(&wanted))
-                .map(|file| vec![file])
-                .map_err(|_| Error::Selection);
-        }
+        // Common selection, after complete Inventory accounting, owns literal member filtering.
         Ok(inventory.into_files().collect())
     }
 
     pub(super) async fn open(http: &Http, file: &mut File) -> Result<Opened, Error> {
-        let token = file.input.member.ok_or(Error::SwissProtocol)?;
+        let token = file.input.member.as_ref().ok_or(Error::SwissProtocol)?;
         let share = Manifest::share(&file.input)?;
         let reference = Input::parse(&format!(
             "https://www.swisstransfer.com/api/1/links/{}/files/{}",
@@ -154,7 +148,7 @@ impl Manifest {
         let mut members = Vec::with_capacity(files.len());
         for remote in files {
             let token = MemberToken::parse(&remote.id.0).ok_or(Error::SwissProtocol)?;
-            if !ids.insert(token) {
+            if !ids.insert(MemberToken::clone(&token)) {
                 return Err(Error::SwissProtocol);
             }
             // Source paths are validated by the common policy, not a second provider layout policy.

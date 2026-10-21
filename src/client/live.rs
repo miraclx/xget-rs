@@ -5,8 +5,8 @@ use core::task::{Context, Poll};
 use bytes::Bytes;
 use futures::Stream;
 
-use super::http::{HttpBody, Opened};
-use super::{Error, HttpError, VersionConsistency};
+use super::builtin::{Body, Opened};
+use super::{Error, SourceError, VersionConsistency};
 use crate::checks::Requirements;
 use crate::inventory::{File, FileId};
 use crate::transfer::{Digest, Length, Measurement, Provenance, live as body};
@@ -100,14 +100,14 @@ impl fmt::Debug for OpenedFile {
     }
 }
 
-/// HTTP source context around the common checked live stream, not a second checking engine.
+/// Built-in source context around the common checked live stream, not a second checking engine.
 ///
 /// Stream failures and progress use the same public types as [`crate::transfer::live`]. Released
 /// prefixes are irreversible. Actual source EOF, exact declared length and every required match
-/// precede clean API EOF. Dropping early yields no success receipt and drops the HTTP body owner.
+/// precede clean API EOF. Dropping early yields no success receipt and drops the owning response.
 #[must_use]
 pub struct CheckedBody {
-    inner: body::CheckedBody<HttpBody>,
+    inner: body::CheckedBody<Body>,
     file: File,
     version: VersionConsistency,
 }
@@ -123,7 +123,7 @@ impl CheckedBody {
         self.inner.progress()
     }
 
-    /// Consumes the body after clean EOF, preserving HTTP context around the common receipt.
+    /// Consumes the body after clean EOF, preserving source context around the common receipt.
     /// Neither this context nor the underlying body receipt claims sink commit or publication.
     pub fn finish(self) -> Result<LiveReceipt, body::FinishError> {
         let Self {
@@ -141,7 +141,7 @@ impl CheckedBody {
 }
 
 impl Stream for CheckedBody {
-    type Item = Result<Bytes, body::BodyFailure<HttpError>>;
+    type Item = Result<Bytes, body::BodyFailure<SourceError>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.get_mut().inner).poll_next(cx)
@@ -158,7 +158,7 @@ impl fmt::Debug for CheckedBody {
     }
 }
 
-/// HTTP occurrence/version context for common streamed completion, never native publication.
+/// Built-in occurrence/version context for streamed completion, never native publication.
 #[derive(Debug)]
 pub struct LiveReceipt {
     file_id: FileId,

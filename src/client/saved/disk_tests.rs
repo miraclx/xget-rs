@@ -74,6 +74,7 @@ async fn seed(root: &Path) -> (PathBuf, Vec<u8>, OperationOwner, oneshot::Receiv
         None,
         vec![Member {
             occurrence: crate::input::InputOccurrence(0),
+            intent: None,
             remote: None,
             binding: Fingerprint::bytes(b"owned manifest fixture"),
             destination: root.join("payload"),

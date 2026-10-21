@@ -15,6 +15,21 @@ fn no_patterns_include_every_valid_path_without_configured_intent() {
 }
 
 #[test]
+fn each_positive_pattern_requires_a_match_before_exclusion_subtraction() {
+    let selection = Selection::parse(&["a/*.bin", "b/*.bin"], &["b/**"]).unwrap();
+    assert!(selection.matches("a/one.bin"));
+    assert!(!selection.all_includes_match(["a/one.bin"]));
+    assert!(selection.all_includes_match(["a/one.bin", "b/two.bin"]));
+    assert!(!selection.matches("b/two.bin"));
+    assert!(!selection.all_includes_match(core::iter::empty()));
+
+    let repeated = Selection::parse(&["a/*", "a/*"], &[]).unwrap();
+    assert!(repeated.all_includes_match(["a/one.bin"]));
+    let excluded_only = Selection::parse(&[], &["**/*.tmp"]).unwrap();
+    assert!(excluded_only.all_includes_match(core::iter::empty()));
+}
+
+#[test]
 fn include_union_is_followed_by_exclusions() {
     let selection =
         Selection::parse(&["docs/**", "*.txt"], &["docs/private/**", "secret.txt"]).unwrap();

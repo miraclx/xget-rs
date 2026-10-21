@@ -7,6 +7,114 @@ use super::{Input, InputError, InputKind, InputScope, NamespaceError};
 const SHARE: &str = "https://www.swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444";
 
 #[test]
+fn path_intent_is_parsed_once_shared_by_duplicates_and_charged_as_request_text() {
+    let bare = Input::parse(SHARE).expect("reference");
+    let bare_bytes = bare.retained_bytes();
+    let input = bare
+        .include("docs/**")
+        .expect("include")
+        .include("*.txt")
+        .expect("second include")
+        .exclude("docs/private/**")
+        .expect("exclude");
+    assert_eq!(
+        input.retained_bytes(),
+        bare_bytes + "docs/**".len() + "*.txt".len() + "docs/private/**".len()
+    );
+    let duplicate = input.duplicate_reference().expect("duplicate");
+    let selection = input.selection.as_ref().expect("configured selection");
+    assert!(std::sync::Arc::ptr_eq(
+        selection,
+        duplicate.selection.as_ref().expect("shared")
+    ));
+    assert_eq!(
+        selection.includes().collect::<Vec<_>>(),
+        ["docs/**", "*.txt"]
+    );
+    assert_eq!(
+        selection.excludes().collect::<Vec<_>>(),
+        ["docs/private/**"]
+    );
+    assert!(selection.matches("docs/readme"));
+    assert!(!selection.matches("docs/private/key"));
+    let extended = duplicate
+        .include("image.*")
+        .expect("append to shared intent");
+    assert_eq!(selection.includes().count(), 2);
+    assert_eq!(
+        extended
+            .selection
+            .as_ref()
+            .expect("new intent")
+            .includes()
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn path_intent_and_literal_member_token_do_not_replace_each_other() {
+    let token = "11111111-1111-2222-3333-444444444444";
+    let input = Input::parse(SHARE)
+        .expect("share")
+        .select_id(token)
+        .expect("literal token")
+        .include("nested/*.bin")
+        .expect("path intent")
+        .exclude("nested/private.bin")
+        .expect("exclusion");
+    assert_eq!(input.member.expect("token retained").as_str(), token);
+    assert_eq!(input.kind(), InputKind::SwissTransfer);
+    assert_eq!(input.scope(), InputScope::Collection);
+    assert_eq!(input.original_reference(), SHARE);
+}
+
+#[test]
+fn invalid_patterns_return_a_public_typed_cause_without_retaining_rejected_text() {
+    let error = Input::parse(SHARE)
+        .expect("share")
+        .include("marker-secret/**bad")
+        .expect_err("embedded recursive syntax");
+    assert!(matches!(error, super::PatternError::Syntax));
+    let error = InputError::from(error);
+    assert!(matches!(
+        &error,
+        InputError::Pattern(super::PatternError::Syntax)
+    ));
+    assert!(error.source().is_some());
+    assert!(!format!("{error:?} {error}").contains("marker-secret"));
+}
+
+#[test]
+fn incremental_path_builders_enforce_shared_count_and_byte_budgets() {
+    let mut input = Input::parse(SHARE).expect("share");
+    for _ in 0..32 {
+        input = input
+            .include("a")
+            .expect("include")
+            .exclude("b")
+            .expect("exclude");
+    }
+    assert!(matches!(
+        input.exclude("c"),
+        Err(super::PatternError::Count)
+    ));
+    let mut input = Input::parse(SHARE).expect("share");
+    let pattern = "a".repeat(1024);
+    for _ in 0..8 {
+        input = input
+            .include(&pattern)
+            .expect("include")
+            .exclude(&pattern)
+            .expect("exclude");
+    }
+    assert!(matches!(
+        input.include("c"),
+        Err(super::PatternError::RetainedBytes)
+    ));
+}
+
+#[test]
 fn an_empty_reference_is_not_an_empty_inventory() {
     assert!(matches!(
         Input::parse(""),

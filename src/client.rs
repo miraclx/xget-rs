@@ -168,20 +168,66 @@ impl Client {
     /// Unsupported providers/trees return errors, not fake inventories. HTTP 405/501 leaves a usable
     /// exact unpinned reference without probing GET. Limits are 128 discovered files and 1 MiB retained
     /// inventory text; exceeding either fails the entire discovery, never returning a truncated value.
+    /// Input-local includes/exclusions apply to original source-relative paths only after complete
+    /// discovery and accounting. Nonempty discovery filtered to none returns [`Error::PathSelection`];
+    /// genuine empty collections remain empty. See [`Input::include`] for syntax and fixed budgets.
     pub async fn resolve<T>(&self, input: T) -> Result<Inventory, Error>
     where
         T: TryInto<Input>,
         T::Error: Into<Error>,
     {
-        let files = self
-            .resolve_input(input.try_into().map_err(Into::into)?)
-            .await?;
-        Inventory::complete(files).map_err(Error::Inventory)
+        self.resolve_input(input.try_into().map_err(Into::into)?)
+            .await
     }
 
-    async fn resolve_input(&self, input: Input) -> Result<Vec<File>, Error> {
-        self.resolve_bounded(input, &mut DiscoveryBudget::default())
-            .await
+    async fn resolve_input(&self, input: Input) -> Result<Inventory, Error> {
+        let files = self
+            .resolve_bounded(input, &mut DiscoveryBudget::default())
+            .await?;
+        Self::select_paths(files)
+    }
+
+    // Resolve, live opening and Download planning share this one post-discovery selection seam.
+    // Account the COMPLETE scope before filtering; never manufacture an executable truncated scope.
+    fn select_paths(files: Vec<File>) -> Result<Inventory, Error> {
+        let mut inventory = Inventory::complete(files)?;
+        let mut requested = Vec::new();
+        for file in inventory.files() {
+            if file
+                .input
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.is_configured())
+            {
+                if file.input.kind() == InputKind::Http && file.input.scope() == InputScope::Exact {
+                    // Exact remote ancestors are routing data, not local destination components.
+                    if !crate::selection::Selection::path_is_bounded(file.source_path()) {
+                        return Err(Error::Inventory(InventoryError::Limit));
+                    }
+                } else {
+                    layout::Layout::source_path(file.source_path())?;
+                }
+                if !requested.contains(&file.input.occurrence) {
+                    requested.push(file.input.occurrence);
+                }
+            }
+        }
+        inventory.retain(|file| {
+            file.input
+                .selection
+                .as_ref()
+                .is_none_or(|selection| selection.matches(file.source_path()))
+        });
+        // A genuine empty discovery contributed no requested occurrence. In a mixed request, one
+        // input's matches cannot hide another nonempty input whose local intent selected nothing.
+        if requested.iter().any(|occurrence| {
+            !inventory
+                .files()
+                .any(|file| file.input.occurrence == *occurrence)
+        }) {
+            return Err(Error::PathSelection);
+        }
+        Ok(inventory)
     }
 
     async fn resolve_bounded(
@@ -241,9 +287,11 @@ impl Client {
         T: TryInto<Input>,
         T::Error: Into<Error>,
     {
-        let mut files = self
+        let mut files: Vec<_> = self
             .resolve_input(input.try_into().map_err(Into::into)?)
-            .await?;
+            .await?
+            .into_files()
+            .collect();
         if files.len() != 1 {
             return Err(Error::FileCardinality);
         }
@@ -702,8 +750,7 @@ impl Download<'_> {
     /// Selects one literal repeatable adapter token for a single original input.
     ///
     /// Intent is retained before automatic unfinished-run matching, so continuation never evaluates
-    /// a mutable manifest again. This initial API supports ID selection only; path globs and exclusions
-    /// are not accepted here. Use Inventory iteration for one-shot in-memory path selection.
+    /// a mutable manifest again. Literal token intent is independent of include/exclude path intent.
     pub fn select_id(mut self, token: &str) -> Self {
         self.inputs = self.inputs.and_then(|mut inputs| {
             if inputs.len() != 1 {
@@ -711,6 +758,36 @@ impl Download<'_> {
             }
             let input = inputs.pop().ok_or(Error::NoInputs)?;
             Ok(vec![input.select_id(token)?])
+        });
+        self
+    }
+
+    /// Adds an original-path include for one original input; see [`Input::include`] for the fixed
+    /// grammar and budgets. Parse/scope failures remain sticky until plan/run is awaited.
+    /// For mixed inputs, attach intent to each Input in Rust instead of applying a global pattern.
+    /// Intent is fingerprinted before discovery; an unfinished frozen match wins before reevaluation.
+    pub fn include(mut self, pattern: &str) -> Self {
+        self.inputs = self.inputs.and_then(|mut inputs| {
+            if inputs.len() != 1 {
+                return Err(Error::SelectionScope);
+            }
+            let input = inputs.pop().ok_or(Error::NoInputs)?;
+            let input = input.include(pattern).map_err(InputError::from)?;
+            Client::collect_inputs(core::iter::once(input))
+        });
+        self
+    }
+
+    /// Adds an original-path exclusion for one original input, after include union.
+    /// See [`Input::include`] for grammar/bounds and [`Download::include`] for request scope.
+    pub fn exclude(mut self, pattern: &str) -> Self {
+        self.inputs = self.inputs.and_then(|mut inputs| {
+            if inputs.len() != 1 {
+                return Err(Error::SelectionScope);
+            }
+            let input = inputs.pop().ok_or(Error::NoInputs)?;
+            let input = input.exclude(pattern).map_err(InputError::from)?;
+            Client::collect_inputs(core::iter::once(input))
         });
         self
     }
@@ -808,7 +885,7 @@ impl Download<'_> {
         } else {
             discovery.await?
         };
-        let inventory = Inventory::complete(files).map_err(Error::Inventory)?;
+        let inventory = Client::select_paths(files)?;
         let files: Vec<_> = inventory.into_files().collect();
         if requirements.iter().next().is_some() && files.len() != 1 {
             return Err(Error::GlobalRequirementCardinality);
@@ -1146,11 +1223,14 @@ pub enum Error {
     )]
     SwissProtocol,
     /// A request-level literal selector cannot accidentally apply to several independent inputs.
-    #[error("member selector needs one original input; use input-local selection for mixed inputs")]
+    #[error("selector needs one original input; use input-local selection for mixed inputs")]
     SelectionScope,
     /// Literal selector intent never falls back to the first file or a matching path.
     #[error("member selection matched no files; list the share and choose a current member token")]
     Selection,
+    /// Complete nonempty discovery for an input cannot silently disappear under its path intent.
+    #[error("path selection matched no files; list the input and adjust includes or exclusions")]
+    PathSelection,
     /// Bounded metadata failure does not expose a truncated inventory.
     #[error("metadata limit exceeded; request a smaller scope")]
     Inventory(#[from] InventoryError),

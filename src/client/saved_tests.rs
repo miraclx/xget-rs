@@ -16,6 +16,194 @@ use super::{AttemptStatus, Fingerprint, Fresh, Owned, STORE, SavedError, SavedRu
 use crate::client::{Client, Error};
 use crate::transfer::{Algorithm, FailureKind, Measurement, lease_directory};
 
+#[test]
+fn requests_without_path_patterns_keep_the_existing_fingerprint_byte_stream() {
+    let root = Fixture::new();
+    let input = crate::Input::parse("https://example.test/payload?token=private")
+        .unwrap()
+        .under("namespace")
+        .unwrap();
+    let requirements = crate::checks::Requirements::default();
+    let measurement = Measurement::default();
+    let target = crate::client::Target::Directory(root.path().to_path_buf());
+    let mut reference = crate::checksum::OwnedSha256::default();
+    Fingerprint::field(&mut reference, b"xget exact original binding 1");
+    Fingerprint::field(&mut reference, input.original_reference().as_bytes());
+    Fingerprint::field(&mut reference, b"namespace");
+    let old_binding = Fingerprint(reference.finish());
+    assert!(Fingerprint::reference(&input) == old_binding);
+    let mut request = crate::checksum::OwnedSha256::default();
+    Fingerprint::field(&mut request, b"xget exact request intent 1");
+    Fingerprint::field(&mut request, &old_binding.0);
+    Fingerprint::field(&mut request, b"input");
+    Fingerprint::field(&mut request, &[2]);
+    Fingerprint::field(
+        &mut request,
+        disk::absolute(root.path())
+            .unwrap()
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    Fingerprint::field(&mut request, &codec::policy(requirements, measurement));
+    assert!(
+        Fingerprint::request(&[input], &target, requirements, measurement).unwrap()
+            == Fingerprint(request.finish())
+    );
+}
+
+#[test]
+fn pattern_fingerprints_bind_order_duplicates_and_list_roles_with_unambiguous_framing() {
+    let reference = "https://example.test/payload";
+    let inputs = [
+        crate::Input::parse(reference).unwrap(),
+        crate::Input::parse(reference)
+            .unwrap()
+            .include("a")
+            .unwrap()
+            .include("bc")
+            .unwrap(),
+        crate::Input::parse(reference)
+            .unwrap()
+            .include("ab")
+            .unwrap()
+            .include("c")
+            .unwrap(),
+        crate::Input::parse(reference)
+            .unwrap()
+            .include("bc")
+            .unwrap()
+            .include("a")
+            .unwrap(),
+        crate::Input::parse(reference)
+            .unwrap()
+            .include("a")
+            .unwrap()
+            .exclude("bc")
+            .unwrap(),
+        crate::Input::parse(reference)
+            .unwrap()
+            .include("a")
+            .unwrap()
+            .include("bc")
+            .unwrap()
+            .include("bc")
+            .unwrap(),
+    ];
+    let root = Fixture::new();
+    let target = crate::client::Target::Directory(root.path().to_path_buf());
+    for (index, input) in inputs.iter().enumerate() {
+        let duplicate = input.duplicate_reference().unwrap();
+        assert!(Fingerprint::reference(input) == Fingerprint::reference(&duplicate));
+        let intent = Fingerprint::request(
+            core::slice::from_ref(input),
+            &target,
+            crate::checks::Requirements::default(),
+            Measurement::default(),
+        )
+        .unwrap();
+        for other in &inputs[..index] {
+            assert!(Fingerprint::reference(input) != Fingerprint::reference(other));
+            assert!(
+                intent
+                    != Fingerprint::request(
+                        core::slice::from_ref(other),
+                        &target,
+                        crate::checks::Requirements::default(),
+                        Measurement::default()
+                    )
+                    .unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn frozen_pattern_binding_rejects_changed_intent_and_reenters_without_changed_head() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reference = format!("{}/payload", server.uri());
+    let client = Client::new().unwrap();
+    let failure = client
+        .download(reference.as_str())
+        .include("payload")
+        .exclude("*.tmp")
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap_err();
+    let path = failure.report.saved_run().unwrap().to_path_buf();
+    let saved = SavedRun::inspect(&path).await.unwrap();
+    let key = saved.members().next().unwrap().key();
+    server.reset().await;
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "999")
+                .insert_header("etag", "\"changed\""),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(header("if-match", "\"v1\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_bytes(b"abc"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let failure = client
+        .resume(saved)
+        .input(key, reference.as_str())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::Saved(SavedError::Binding)));
+    let changed = crate::Input::parse(&reference)
+        .unwrap()
+        .include("**")
+        .unwrap()
+        .exclude("*.tmp")
+        .unwrap();
+    let failure = client
+        .resume(SavedRun::inspect(&path).await.unwrap())
+        .input(key, changed)
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::Saved(SavedError::Binding)));
+    assert_eq!(count(&server, "GET").await, 0);
+    let report = client
+        .download(reference.as_str())
+        .include("payload")
+        .exclude("*.tmp")
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(report.saved_run(), Some(path.as_path()));
+    assert_eq!(report.completed().len(), 1);
+    assert_eq!(fs::read(root.path().join("payload")).unwrap(), b"abc");
+    assert_eq!(count(&server, "HEAD").await, 0);
+    assert_eq!(count(&server, "GET").await, 1);
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture(PathBuf);
 impl Fixture {

@@ -40,6 +40,11 @@ impl Inventory {
         })
     }
 
+    /// Only complete, accounted discovery may be filtered; its original charge remains visible.
+    pub(crate) fn retain(&mut self, predicate: impl FnMut(&File) -> bool) {
+        self.files.retain(predicate);
+    }
+
     /// Inspects selected-file metadata without acquiring a payload body.
     pub fn files(&self) -> impl ExactSizeIterator<Item = &File> {
         self.files.iter()
@@ -68,7 +73,8 @@ impl Inventory {
         selected.ok_or(SelectionError::NoMatch)
     }
 
-    /// Accounted retained reference, path, hint and validator bytes, not total process RSS.
+    /// Accounted discovery reference, pattern, path, hint and validator bytes before input path
+    /// filtering, not total process RSS. Excluding members does not erase their discovery charge.
     pub fn metadata_bytes(&self) -> usize {
         self.metadata_bytes
     }

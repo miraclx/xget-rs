@@ -261,8 +261,9 @@ impl<'a> Resume<'a> {
         }
     }
 
-    /// Supplies the exact original reference intent for one frozen member. A share with several
-    /// members uses the same original share input for each inspected key, without rediscovery.
+    /// Supplies the exact original reference intent for one frozen member, including its namespace
+    /// and ordered include/exclusion spellings if configured. A share with several members uses the
+    /// same original share Input for each inspected key, without rediscovery or path reevaluation.
     /// Wrong, repeated and
     /// foreign keys fail; renamed/renewed references are not accepted by guessing from paths or ETags.
     /// A supplied selected File must agree with the frozen version and advisory length, and each of
@@ -475,6 +476,29 @@ impl Fingerprint {
                 .map_or("", |value| value.as_str())
                 .as_bytes(),
         );
+        if let Some(selection) = &input.selection
+            && selection.is_configured()
+        {
+            // Keep the old reference/request fingerprints byte-for-byte unchanged when no patterns
+            // exist. Ordered role/count/length framing binds intent, not mutable discovery results.
+            Self::field(&mut hash, b"original path selection intent 1");
+            Self::field(&mut hash, b"includes");
+            Self::field(
+                &mut hash,
+                &(selection.includes().count() as u64).to_le_bytes(),
+            );
+            for spelling in selection.includes() {
+                Self::field(&mut hash, spelling.as_bytes());
+            }
+            Self::field(&mut hash, b"excludes");
+            Self::field(
+                &mut hash,
+                &(selection.excludes().count() as u64).to_le_bytes(),
+            );
+            for spelling in selection.excludes() {
+                Self::field(&mut hash, spelling.as_bytes());
+            }
+        }
         Self(hash.finish())
     }
     pub(super) fn request(

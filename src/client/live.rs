@@ -49,9 +49,20 @@ impl OpenedFile {
 
     /// Adds a whole-payload requirement before consuming the body. Conflict drops this response.
     /// A requirement determines successful EOF, not permission to release an individual prefix.
-    pub fn expect(mut self, required: impl Into<Digest>) -> Result<Self, Error> {
+    pub fn expect(self, required: impl Into<Digest>) -> Result<Self, Error> {
+        self.require(required, Provenance::Caller)
+    }
+
+    /// Adds a whole-payload requirement with its declared origin before consuming the body.
+    /// Agreeing values merge origins; conflict drops this response without polling its body.
+    /// Provenance records the caller's attribution, not authentication or prefix integrity.
+    pub fn require(
+        mut self,
+        required: impl Into<Digest>,
+        provenance: Provenance,
+    ) -> Result<Self, Error> {
         self.requirements
-            .insert(required.into(), Provenance::Caller)
+            .insert(required.into(), provenance)
             .map_err(Error::ConflictingRequirements)?;
         Ok(self)
     }

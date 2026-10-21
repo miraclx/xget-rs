@@ -19,6 +19,9 @@ use crate::transfer::{Length, Measurement, OperationOwner, Receipt, Reconciliati
 
 mod codec;
 mod disk;
+mod key;
+
+pub use key::{BindingKeyParseError, RunId};
 
 #[cfg(all(test, unix))]
 #[path = "saved_tests.rs"]

@@ -62,7 +62,10 @@ mod swiss;
 use http::Http;
 pub use http::{HttpError, HttpErrorKind, RequestStage};
 pub use live::{CheckedBody, LiveReceipt, OpenedFile};
-pub use saved::{BindingKey, Fresh, Resume, SavedError, SavedMember, SavedRun, SavedStatus};
+pub use saved::{
+    BindingKey, BindingKeyParseError, Fresh, Resume, RunId, SavedError, SavedMember, SavedRun,
+    SavedStatus,
+};
 #[cfg(feature = "swisstransfer")]
 use swiss::Swiss;
 

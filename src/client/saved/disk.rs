@@ -245,7 +245,7 @@ mod unix {
                         || member
                             .remote
                             .as_ref()
-                            .is_some_and(|remote| remote.token.is_s3())
+                            .is_some_and(|remote| remote.token.is_s3() || remote.token.is_webdav())
                 }) {
                     4
                 } else if members

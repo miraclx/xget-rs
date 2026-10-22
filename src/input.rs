@@ -122,7 +122,8 @@ impl Input {
 
     /// Requests one repeatable provider-scoped member token within this input occurrence.
     /// SwissTransfer uses canonical file UUIDs; S3 trees use literal full object keys, not paths
-    /// relative to the prefix and not percent-encoded URLs.
+    /// relative to the prefix and not percent-encoded URLs. WebDAV trees use the inventory's literal
+    /// origin-scoped absolute URI path, without credentials, query or fragment. It is not an input URL.
     ///
     /// This is not authorization or an occurrence-local FileId. Fresh discovery must contain exactly
     /// this member; a stale token fails without a path, position or filename fallback. A selected File
@@ -134,6 +135,7 @@ impl Input {
         let member = match (self.kind, self.scope) {
             (InputKind::SwissTransfer, InputScope::Collection) => MemberToken::parse(token),
             (InputKind::S3, InputScope::Tree) => MemberToken::s3(token),
+            (InputKind::Http, InputScope::Tree) => MemberToken::webdav(token),
             _ => return Err(InputError::UnsupportedMemberSelection),
         };
         self.member = Some(member.ok_or(InputError::InvalidMemberToken)?);
@@ -443,13 +445,16 @@ impl InputKind {
 ///
 /// SwissTransfer selectors are canonical UUIDs. S3 selectors are genuine literal full object keys,
 /// scoped by their original bucket/prefix input. Key spelling is not hashed or URL-normalized.
-/// Swiss UUIDs stay inline; S3 text has shared zeroizing ownership. Clone is explicit and cheap,
+/// WebDAV selectors are actual absolute URI paths scoped by their original HTTP tree origin/root,
+/// without access queries or credentials; their percent spelling is preserved, not a synthetic URL.
+/// Swiss UUIDs stay inline; S3/WebDAV text has shared zeroizing ownership. Clone is explicit and cheap,
 /// not an implicit copy of the maximum key size. Only explicit `as_str` access reveals names.
 pub struct MemberToken(MemberSelector);
 
 enum MemberSelector {
     Swiss([u8; 36]),
     S3(Arc<Zeroizing<String>>),
+    WebDav(Arc<Zeroizing<String>>),
 }
 
 impl MemberToken {
@@ -473,6 +478,62 @@ impl MemberToken {
         )))))
     }
 
+    pub(crate) fn webdav(value: &str) -> Option<Self> {
+        // A genuine origin-scoped URI path, never a bearer URL. Reject spelling that URL parsing
+        // would erase, and ambiguous encoded separators before any transport joins the path.
+        if !value.starts_with('/')
+            || value.starts_with("//")
+            || value.len() > 4096
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/-._~%!$&'()*+,;=:@".contains(&byte))
+            || value.contains(['?', '#', '\\'])
+            || value.chars().any(char::is_control)
+        {
+            return None;
+        }
+        for component in value[1..].split('/') {
+            if component.is_empty() && !value.ends_with('/') {
+                return None;
+            }
+            let decoded = percent_encoding::percent_decode_str(component)
+                .decode_utf8()
+                .ok()?;
+            if matches!(decoded.as_ref(), "." | "..")
+                || decoded.contains(['/', '\\', '%'])
+                || decoded.chars().any(char::is_control)
+            {
+                return None;
+            }
+            let mut bytes = component.bytes();
+            while let Some(byte) = bytes.next() {
+                if byte == b'%'
+                    && !(bytes.next()?.is_ascii_hexdigit() && bytes.next()?.is_ascii_hexdigit())
+                {
+                    return None;
+                }
+            }
+        }
+        if value[1..].contains("//") {
+            return None;
+        }
+        Some(Self(MemberSelector::WebDav(Arc::new(Zeroizing::new(
+            value.to_owned(),
+        )))))
+    }
+
+    pub(crate) fn is_webdav(&self) -> bool {
+        matches!(&self.0, MemberSelector::WebDav(_))
+    }
+
+    fn family(&self) -> u8 {
+        match &self.0 {
+            MemberSelector::Swiss(_) => 0,
+            MemberSelector::S3(_) => 1,
+            MemberSelector::WebDav(_) => 2,
+        }
+    }
+
     pub(crate) fn is_s3(&self) -> bool {
         matches!(&self.0, MemberSelector::S3(_))
     }
@@ -483,6 +544,7 @@ impl MemberToken {
         match &self.0 {
             MemberSelector::Swiss(_) => InputKind::SwissTransfer,
             MemberSelector::S3(_) => InputKind::S3,
+            MemberSelector::WebDav(_) => InputKind::Http,
         }
     }
 
@@ -493,7 +555,7 @@ impl MemberToken {
                 Ok(value) => value,
                 Err(_) => unreachable!("swiss member selectors contain validated ASCII"),
             },
-            MemberSelector::S3(key) => key.as_str(),
+            MemberSelector::S3(key) | MemberSelector::WebDav(key) => key.as_str(),
         }
     }
 }
@@ -503,13 +565,14 @@ impl Clone for MemberToken {
         Self(match &self.0 {
             MemberSelector::Swiss(bytes) => MemberSelector::Swiss(*bytes),
             MemberSelector::S3(key) => MemberSelector::S3(Arc::clone(key)),
+            MemberSelector::WebDav(key) => MemberSelector::WebDav(Arc::clone(key)),
         })
     }
 }
 
 impl PartialEq for MemberToken {
     fn eq(&self, other: &Self) -> bool {
-        self.is_s3() == other.is_s3() && self.as_str() == other.as_str()
+        self.family() == other.family() && self.as_str() == other.as_str()
     }
 }
 
@@ -523,8 +586,8 @@ impl PartialOrd for MemberToken {
 
 impl Ord for MemberToken {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.is_s3()
-            .cmp(&other.is_s3())
+        self.family()
+            .cmp(&other.family())
             .then_with(|| self.as_str().cmp(other.as_str()))
     }
 }

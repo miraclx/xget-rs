@@ -43,7 +43,7 @@ impl Layout {
         Ok(())
     }
 
-    #[cfg(feature = "s3")]
+    #[cfg(any(feature = "s3", feature = "webdav"))]
     pub(super) fn source_tree<'a>(
         files: impl IntoIterator<Item = &'a str>,
         directories: impl IntoIterator<Item = &'a str>,
@@ -67,7 +67,7 @@ impl Layout {
         Ok(())
     }
 
-    #[cfg(feature = "s3")]
+    #[cfg(any(feature = "s3", feature = "webdav"))]
     fn claim_directory(&mut self, components: &[&str]) -> Result<(), Error> {
         let mut key = Zeroizing::new(String::new());
         let mut spelling = Zeroizing::new(String::new());
@@ -201,7 +201,9 @@ impl Layout {
                     return None;
                 }
                 match file.input.kind() {
-                    crate::input::InputKind::S3 => file.input.parsed_reference().host_str(),
+                    crate::input::InputKind::S3 | crate::input::InputKind::Http => {
+                        file.input.parsed_reference().host_str()
+                    }
                     _ => Some("SwissTransfer"),
                 }
             });

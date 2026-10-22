@@ -5,6 +5,10 @@
 //! After each V4 ETag comes an optional nonsecret binding recipe: original-reference-only hash,
 //! scope, optional namespace (4096 bytes/64 components), ordered include/exclude strings (64 total,
 //! 1024 bytes each/16384 combined). V1/V2/V3 have no recipe bytes and round-trip unchanged.
+//! V4 remote tag 3 adds a genuine WebDAV origin-scoped URI path (4096 bytes) and original relative
+//! path (4096 bytes), without versionId or access-reference bytes. Known length and whole mode are
+//! mandatory; absent strong ETags remain unpinned, including attempted members. Tags 0/1/2 retain
+//! their original exact/Swiss/S3 byte layouts.
 //! Remote tags 0/1 keep their old exact/Swiss layout. S3 must have known length, a strong opaque ETag
 //! and whole mode; versionId is additional conditional evidence, not a digest or access credential.
 
@@ -74,6 +78,11 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                     return Err(SavedError::Corrupt);
                 }
             } else {
+                if remote.token.is_webdav()
+                    && (record.version != 4 || remote.token.as_str().ends_with('/'))
+                {
+                    return Err(SavedError::Corrupt);
+                }
                 if remote.s3_version.is_some() {
                     return Err(SavedError::Corrupt);
                 }
@@ -81,7 +90,9 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                     .map_err(|_| SavedError::Corrupt)?;
             }
             if matches!(member.length, Length::Unknown)
-                || (!member.attempts.is_empty() && member.etag.is_none())
+                || (!remote.token.is_webdav()
+                    && !member.attempts.is_empty()
+                    && member.etag.is_none())
             {
                 return Err(SavedError::Corrupt);
             }
@@ -130,10 +141,22 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
             match &member.remote {
                 None => out.byte(0),
                 Some(remote) => {
-                    out.byte(if remote.token.is_s3() { 2 } else { 1 });
+                    out.byte(if remote.token.is_s3() {
+                        2
+                    } else if remote.token.is_webdav() {
+                        3
+                    } else {
+                        1
+                    });
                     out.bytes(
                         remote.token.as_str().as_bytes(),
-                        if remote.token.is_s3() { 1024 } else { 36 },
+                        if remote.token.is_s3() {
+                            1024
+                        } else if remote.token.is_webdav() {
+                            MAX_PATH
+                        } else {
+                            36
+                        },
                     )?;
                     out.bytes(remote.source_path.as_bytes(), MAX_PATH)?;
                     if remote.token.is_s3() {
@@ -268,6 +291,12 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
                         s3_version,
                     })
                 }
+                3 if version == 4 => Some(super::FrozenMember {
+                    token: crate::input::MemberToken::webdav(input.text(MAX_PATH)?)
+                        .ok_or(SavedError::Corrupt)?,
+                    source_path: Zeroizing::new(input.text(MAX_PATH)?.to_owned()),
+                    s3_version: None,
+                }),
                 _ => return Err(SavedError::Corrupt),
             };
             (occurrence, remote)

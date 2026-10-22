@@ -228,6 +228,7 @@ async fn unsupported_providers_and_trees_fail_without_fake_inventory_success() {
         Input::parse("https://swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444")
             .expect("share intent"),
         Input::parse("https://github.com/owner/project/releases/latest").expect("catalogue intent"),
+        #[cfg(not(feature = "webdav"))]
         Input::tree("https://example.test/dav/").expect("tree intent"),
     ] {
         assert!(matches!(

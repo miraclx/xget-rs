@@ -182,6 +182,20 @@ impl Http {
                 _ => {}
             }
         }
+        if file
+            .input
+            .member
+            .as_ref()
+            .is_some_and(crate::input::MemberToken::is_webdav)
+        {
+            match (description.length, length) {
+                (Length::Known(expected), Length::Known(actual)) if expected != actual => {
+                    return Err(Error::VersionChanged);
+                }
+                (Length::Known(expected), _) => length = Length::Known(expected),
+                (Length::Unknown, _) => return Err(Error::InvalidMetadata),
+            }
+        }
         let version = if let Some(expected) = &description.etag {
             if actual.as_ref().map(|value| value.as_str()) != Some(expected.as_str()) {
                 return Err(Error::VersionChanged);
@@ -323,6 +337,46 @@ impl Http {
             .map_err(|_| Error::HeaderTimeout)?
     }
 
+    #[cfg(feature = "webdav")]
+    pub(super) async fn propfind(
+        &self,
+        input: &Input,
+        maximum: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let operation = async {
+            let method = Method::from_bytes(b"PROPFIND").map_err(|_| Error::InvalidMetadata)?;
+            let mut admitted = self.headers(input, method, None).await?;
+            if admitted.response.status().is_redirection() {
+                return Err(Error::Redirect);
+            }
+            if admitted.response.status().as_u16() != 207 {
+                return Err(Error::Status {
+                    stage: RequestStage::Metadata,
+                    status: admitted.response.status().as_u16(),
+                });
+            }
+            Self::validate_headers(&admitted.response)?;
+            if admitted.response.headers().contains_key(CONTENT_RANGE) {
+                return Err(Error::InvalidMetadata);
+            }
+            if matches!(Self::length(&admitted.response)?, Length::Known(ByteCount(count)) if count > maximum as u64)
+            {
+                return Err(Error::Inventory(crate::inventory::InventoryError::Limit));
+            }
+            let mut bytes = Zeroizing::new(Vec::new());
+            while let Some(chunk) = admitted.response.chunk().await.map_err(HttpError::new)? {
+                if chunk.len() > maximum.saturating_sub(bytes.len()) {
+                    return Err(Error::Inventory(crate::inventory::InventoryError::Limit));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
+        };
+        tokio::time::timeout(HEADERS_DEADLINE, operation)
+            .await
+            .map_err(|_| Error::HeaderTimeout)?
+    }
+
     async fn headers(
         &self,
         input: &Input,
@@ -355,10 +409,17 @@ impl Http {
             } else {
                 reference
             };
+            #[cfg(feature = "webdav")]
+            let propfind = method.as_str() == "PROPFIND";
             let mut request = self
                 .client
                 .request(method, reference)
                 .header(ACCEPT_ENCODING, "identity");
+            #[cfg(feature = "webdav")]
+            if propfind {
+                request = request.header("Depth", "1").header("Content-Type", "application/xml; charset=utf-8")
+                    .body("<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:resourcetype/><d:getcontentlength/><d:getetag/></d:prop></d:propfind>");
+            }
             if let Some(etag) = etag {
                 request = request.header(IF_MATCH, etag);
             }

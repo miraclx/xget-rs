@@ -89,6 +89,14 @@ struct ReaderCheckpoint {
     prefix: Option<(ByteCount, Digest)>,
 }
 
+/// Ordinary coordinator authority only. Advanced public entrances always construct Absent plans.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum Publication {
+    #[default]
+    Absent,
+    Replace,
+}
+
 // Private physical-operation registration. Lower layers know only an owned lifetime, not its caller.
 pub(crate) type OperationOwner = Arc<dyn Send + Sync>;
 pub(crate) const OWNED_RUN_STORE: &str = ".xget-runs";
@@ -216,6 +224,21 @@ pub struct PendingFile<B> {
 }
 
 impl<B> PendingFile<B> {
+    pub(crate) fn protect_targets(mut self, targets: Arc<[PathBuf]>) -> Self {
+        self.plan.targets = targets;
+        self
+    }
+
+    pub(crate) fn authorized(
+        mut self,
+        publication: Publication,
+        restart: Option<StateRef>,
+    ) -> Self {
+        self.plan.publication = publication;
+        self.plan.restart = restart;
+        self
+    }
+
     /// The planned private workspace, available before awaiting. A path grants no ownership authority.
     pub fn state(&self) -> &StateRef {
         self.plan.state()
@@ -414,7 +437,9 @@ pub struct Partial {
     pub checks: Option<CheckResults>,
 }
 
-/// Evidence of absent-only publication after the configured required checks, if any.
+/// Evidence of native publication after the configured required checks, if any.
+/// Public advanced entrances are absent-only. Ordinary Client execution may carry separately
+/// granted replacement permission; this receipt never transfers that execution authority.
 /// Read-only views keep final counts and check results consistent. The owned stage hardlink remains
 /// for offline reconciliation, which may be NotRevalidatable; this value is not a transferable lease.
 #[derive(Debug)]

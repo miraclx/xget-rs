@@ -941,7 +941,12 @@ async fn reader_publication_receipt_and_statistics_survive_a_real_completion_che
     let events = Rc::new(RefCell::new(Vec::new()));
     let mut observer = Capture(&events);
     let failure = client
-        .execute_owned(plan, owned, &mut observer)
+        .execute_owned(
+            plan,
+            owned,
+            crate::client::Authority::default(),
+            &mut observer,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1030,7 +1035,12 @@ async fn a_real_checkpoint_role_failure_after_publication_retains_the_partial_re
     let events = Rc::new(RefCell::new(Vec::new()));
     let mut observer = Capture(&events);
     let failure = client
-        .execute_owned(plan, owned, &mut observer)
+        .execute_owned(
+            plan,
+            owned,
+            crate::client::Authority::default(),
+            &mut observer,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1118,7 +1128,7 @@ async fn reconciled_publication_enters_the_partial_report_before_a_real_checkpoi
     fs::rename(path.join("state"), path.join("last-valid")).unwrap();
     fs::create_dir(path.join("state")).unwrap();
     let failure = client
-        .execute_owned(plan, owned, &mut ())
+        .execute_owned(plan, owned, crate::client::Authority::default(), &mut ())
         .await
         .unwrap_err();
     assert!(matches!(failure.error, Error::Saved(SavedError::Corrupt)));
@@ -1207,6 +1217,7 @@ async fn a_competing_unfinished_request_between_lookup_and_admission_refuses_the
             stale,
             Some(request),
             crate::client::Reentry::Continue,
+            crate::client::Authority::default(),
             &mut (),
         )
         .await
@@ -1912,4 +1923,325 @@ async fn public_observed_publication_then_checkpoint_role_failure_emits_one_term
             .iter()
             .any(|event| matches!(event, Observed::Completed(_)))
     );
+}
+
+async fn receiving_authority_fixture(
+    server: &MockServer,
+    root: &Fixture,
+) -> (Client, String, PathBuf, crate::transfer::StateRef) {
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\""),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+    let reference = format!("{}/payload", server.uri());
+    let client = Client::new().unwrap();
+    let plan = client
+        .download(reference.as_str())
+        .to_file(root.path().join("output"))
+        .plan()
+        .await
+        .unwrap();
+    let mut owned = Owned::create(&plan, None, crate::client::Reentry::Fresh)
+        .await
+        .unwrap();
+    let destination = owned.destinations().next().unwrap().to_path_buf();
+    let pending = crate::transfer::Transfer::from_body(
+        futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"a")),
+            Err(std::io::Error::other("fixture late source failure")),
+        ]),
+        crate::transfer::Length::Known(crate::transfer::ByteCount(3)),
+    )
+    .to_file(destination)
+    .unwrap();
+    let state = crate::transfer::StateRef::clone(pending.state());
+    owned.submit(0, &state).await.unwrap();
+    let failure = pending
+        .run_registered_observed(owned.registration(), &mut ())
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.kind, FailureKind::Body(_)));
+    owned.retained(0).await.unwrap();
+    let path = owned.path().to_path_buf();
+    drop(owned);
+    (client, reference, path, state)
+}
+
+#[tokio::test]
+async fn restart_uses_frozen_receiving_work_and_retains_the_old_attempt_verbatim() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let (client, reference, path, old) = receiving_authority_fixture(&server, &root).await;
+    let old_control = fs::read(old.path().join("state")).unwrap();
+    let old_data = fs::read(old.path().join("data")).unwrap();
+    let old_inode = fs::metadata(old.path().join("data")).unwrap().ino();
+    server.reset().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(header("if-match", "\"v1\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_bytes(b"abc".to_vec()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let saved = SavedRun::inspect(&path).await.unwrap();
+    let key = saved.members().next().unwrap().key();
+    let report = client
+        .resume(saved)
+        .input(key, reference.as_str())
+        .restart(crate::client::Restart)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(report.completed().len(), 1);
+    assert_eq!(fs::read(old.path().join("state")).unwrap(), old_control);
+    assert_eq!(fs::read(old.path().join("data")).unwrap(), old_data);
+    assert_eq!(
+        fs::metadata(old.path().join("data")).unwrap().ino(),
+        old_inode
+    );
+    let saved = SavedRun::inspect(&path).await.unwrap();
+    let member = saved.members().next().unwrap();
+    let attempts: Vec<_> = member.attempts().collect();
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0], attempts[1]);
+    assert_eq!(fs::read(root.path().join("output")).unwrap(), b"abc");
+}
+
+#[tokio::test]
+async fn restart_without_a_frozen_match_and_fresh_restart_conflicts_do_not_discover() {
+    let root = Fixture::new();
+    let client = Client::new().unwrap();
+    let failure = client
+        .download("https://example.invalid/payload")
+        .restart(crate::client::Restart)
+        .to_file(root.path().join("output"))
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.error,
+        Error::Saved(SavedError::RestartMissing)
+    ));
+    for fresh_first in [false, true] {
+        let request = client
+            .download("https://example.invalid/payload")
+            .to_file(root.path().join("output"));
+        let request = if fresh_first {
+            request.fresh(Fresh).restart(crate::client::Restart)
+        } else {
+            request.restart(crate::client::Restart).fresh(Fresh)
+        };
+        let failure = request.run().await.unwrap_err();
+        assert!(matches!(failure.error, Error::Saved(SavedError::Authority)));
+    }
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn restart_and_overwrite_do_not_refetch_a_completed_frozen_output() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_bytes(b"abc".to_vec()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reference = format!("{}/payload", server.uri());
+    let client = Client::new().unwrap();
+    let output = root.path().join("output");
+    let report = client
+        .download(reference.as_str())
+        .to_file(&output)
+        .run()
+        .await
+        .unwrap();
+    let inode = fs::metadata(&output).unwrap().ino();
+    let saved = SavedRun::inspect(report.saved_run().unwrap())
+        .await
+        .unwrap();
+    let key = saved.members().next().unwrap().key();
+    server.reset().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    client
+        .resume(saved)
+        .input(key, reference.as_str())
+        .restart(crate::client::Restart)
+        .overwrite(crate::client::Overwrite)
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(fs::metadata(&output).unwrap().ino(), inode);
+    assert_eq!(fs::read(output).unwrap(), b"abc");
+}
+
+#[tokio::test]
+async fn restart_and_overwrite_do_not_invent_an_anchor_for_a_nohash_completed_member() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let reference = exact(&server, "/payload").await;
+    let client = Client::new().unwrap();
+    let report = client
+        .download(reference.as_str())
+        .measurement(Measurement::None)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    let destination = report
+        .completed()
+        .next()
+        .unwrap()
+        .destination()
+        .to_path_buf();
+    let inode = fs::metadata(&destination).unwrap().ino();
+    let saved = SavedRun::inspect(report.saved_run().unwrap())
+        .await
+        .unwrap();
+    let key = saved.members().next().unwrap().key();
+    let failure = client
+        .resume(saved)
+        .input(key, reference.as_str())
+        .restart(crate::client::Restart)
+        .overwrite(crate::client::Overwrite)
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        failure.error,
+        Error::Saved(SavedError::NotRevalidatable)
+    ));
+    assert_eq!(count(&server, "GET").await, 1);
+    assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+    assert_eq!(fs::read(destination).unwrap(), b"abc");
+}
+
+#[tokio::test]
+async fn fresh_is_not_overwrite_but_explicit_ordinary_overwrite_uses_checked_native_publication() {
+    for replace in [false, true] {
+        let root = Fixture::new();
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "3")
+                    .insert_header("etag", "\"v1\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"abc".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let destination = root.path().join("output");
+        fs::write(&destination, b"sentinel").unwrap();
+        let inode = fs::metadata(&destination).unwrap().ino();
+        let client = Client::new().unwrap();
+        let reference = format!("{}/payload", server.uri());
+        let request = client
+            .download(reference.as_str())
+            .fresh(Fresh)
+            .to_file(&destination);
+        let request = if replace {
+            request.overwrite(crate::client::Overwrite)
+        } else {
+            request
+        };
+        let result = request.run().await;
+        if replace {
+            assert_eq!(result.unwrap().completed().len(), 1);
+            assert_ne!(fs::metadata(&destination).unwrap().ino(), inode);
+            assert_eq!(fs::read(destination).unwrap(), b"abc");
+        } else {
+            assert!(result.is_err());
+            assert_eq!(fs::metadata(&destination).unwrap().ino(), inode);
+            assert_eq!(fs::read(destination).unwrap(), b"sentinel");
+        }
+    }
+}
+
+#[tokio::test]
+async fn overwrite_never_grants_intra_run_duplicate_or_hardlinked_target_authority() {
+    for duplicate in [false, true] {
+        let root = Fixture::new();
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "3")
+                    .insert_header("etag", "\"v1\""),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(b"abc".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let first = format!("{}/a", server.uri());
+        let second = if duplicate {
+            String::clone(&first)
+        } else {
+            format!("{}/b", server.uri())
+        };
+        fs::write(root.path().join("a"), b"sentinel").unwrap();
+        fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
+        let inode = fs::metadata(root.path().join("a")).unwrap().ino();
+        let failure = Client::new()
+            .unwrap()
+            .download_all([first.as_str(), second.as_str()])
+            .overwrite(crate::client::Overwrite)
+            .to_directory(root.path())
+            .run()
+            .await
+            .unwrap_err();
+        assert_eq!(failure.report.completed().len(), 0);
+        assert_eq!(fs::metadata(root.path().join("a")).unwrap().ino(), inode);
+        assert_eq!(fs::metadata(root.path().join("b")).unwrap().ino(), inode);
+        assert_eq!(fs::read(root.path().join("a")).unwrap(), b"sentinel");
+        assert_eq!(fs::read(root.path().join("b")).unwrap(), b"sentinel");
+    }
 }

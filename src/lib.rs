@@ -3,11 +3,13 @@
 //! Start with [`Client`] for ordinary exact HTTP inputs, bounded metadata discovery and frozen native
 //! output planning. [`Input`] distinguishes remote intent from local grouping; [`Inventory`] exposes
 //! resolved files without acquiring their payloads. The current Client executes files serially and
-//! rejects unsupported provider/tree inputs explicitly. Native publication is absent-only on supported
+//! rejects unsupported provider/tree inputs explicitly. Native publication defaults to absent-only on supported
 //! Unix filesystems. [`SavedRun`] inspects frozen aggregate state offline; ordinary re-entry finds a
 //! unique matching unfinished run before new discovery. Whole-response members open fresh bodies;
 //! eligible exact-HTTP range members revalidate a recorded strong prefix and fetch only the suffix.
-//! Restart and overwrite are not implemented by this Client.
+//! [`client::Restart`] makes a new guarded attempt for frozen receiving work without deleting old state.
+//! [`client::Overwrite`] grants checked cooperating-writer replacement only to a consumed ordinary run;
+//! preview Plans and public advanced Transfer entrances retain absent-only publication.
 //! Borrow [`client::Observer`] through [`client::Download::run_with`], [`Client::execute_with`] or
 //! [`client::Resume::run_with`] for caller-task metadata, progress and outcome events without a
 //! reporting task or a static observer. Unobserved methods use the same coordinator with `()`.

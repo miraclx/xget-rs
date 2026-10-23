@@ -169,6 +169,7 @@ impl Client {
             requirements: Ok(Requirements::default()),
             measurement: Measurement::default(),
             reentry: Reentry::Continue,
+            publication: crate::transfer::Publication::Absent,
         }
     }
 
@@ -546,7 +547,7 @@ impl Client {
         observer: &mut O,
     ) -> Result<Report, Box<RunFailure>> {
         let result = self
-            .execute_with_request(plan, None, Reentry::Fresh, observer)
+            .execute_with_request(plan, None, Reentry::Fresh, Authority::default(), observer)
             .await;
         observer.observe(Event::returned(&result));
         result
@@ -557,6 +558,7 @@ impl Client {
         mut plan: Plan,
         request: Option<saved::Fingerprint>,
         reentry: Reentry,
+        authority: Authority,
         observer: &mut O,
     ) -> Result<Report, Box<RunFailure>> {
         let report = Report::default();
@@ -616,13 +618,14 @@ impl Client {
         for (file, member) in plan.files.iter_mut().zip(owned.destinations()) {
             file.destination = member.to_path_buf();
         }
-        self.execute_owned(plan, owned, observer).await
+        self.execute_owned(plan, owned, authority, observer).await
     }
 
     async fn execute_owned<O: Observer>(
         &self,
         plan: Plan,
         mut owned: saved::Owned,
+        authority: Authority,
         observer: &mut O,
     ) -> Result<Report, Box<RunFailure>> {
         let mut report = Report {
@@ -635,6 +638,7 @@ impl Client {
             saved_run: Some(owned.path()),
             files: plan.files.len(),
         });
+        let targets: Arc<[PathBuf]> = owned.destinations().map(Path::to_path_buf).collect();
         for (index, planned) in plan.files.into_iter().enumerate() {
             let Some(key) = BindingKey::for_run_member(run, index) else {
                 return Err(Box::new(RunFailure {
@@ -702,6 +706,8 @@ impl Client {
                     measurement,
                     &mut owned,
                     index,
+                    authority,
+                    Arc::clone(&targets),
                     &mut FileProgress {
                         observer: &mut *observer,
                         key,
@@ -795,6 +801,27 @@ impl Client {
                     }));
                 }
             };
+            let restart = match authority.attempt {
+                AttemptPolicy::Continue => None,
+                AttemptPolicy::Restart => match owned.restart_state(index) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return Err(Box::new(RunFailure {
+                            error: Error::Saved(error),
+                            report,
+                            failed: Some(PlannedFile {
+                                file,
+                                destination,
+                                requirements,
+                                measurement,
+                            }),
+                        }));
+                    }
+                },
+            };
+            let pending = pending
+                .authorized(authority.publication, restart)
+                .protect_targets(Arc::clone(&targets));
             if let Err(error) = owned.submit(index, pending.state()).await {
                 return Err(Box::new(RunFailure {
                     error: Error::Saved(error),
@@ -1046,12 +1073,40 @@ pub struct Download<'a> {
     requirements: Result<Requirements, Box<Conflict>>,
     measurement: Measurement,
     reentry: Reentry,
+    publication: crate::transfer::Publication,
 }
+
+/// Explicitly starts a new attempt for pending receiving work in the selected frozen run.
+/// Old partials remain untouched; this is not cleanup, fresh discovery or overwrite authority.
+pub struct Restart;
+
+/// Allows checked atomic replacement of an incumbent captured under the native destination lease.
+/// This is a cooperating-writer guarantee, not an inode CAS against arbitrary filesystem writers.
+/// Aliases of other frozen run targets are refused, even when their bytes match. Captured absence
+/// remains no-replace if a foreign file appears before commit. The captured incumbent descriptor and
+/// all native leases remain owned through submitted physical work after future drop. A later
+/// continuation must be explicitly granted this permission again; saved state is not authority.
+pub struct Overwrite;
 
 #[derive(Clone, Copy)]
 enum Reentry {
     Continue,
     Fresh,
+    Restart,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Default)]
+enum AttemptPolicy {
+    #[default]
+    Continue,
+    Restart,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Authority {
+    attempt: AttemptPolicy,
+    publication: crate::transfer::Publication,
 }
 
 impl Download<'_> {
@@ -1103,7 +1158,30 @@ impl Download<'_> {
     /// Intentionally discovers new work instead of matching unfinished owned runs. Old run artifacts
     /// remain untouched; Fresh does not grant overwrite or restart any existing attempt.
     pub fn fresh(mut self, _policy: Fresh) -> Self {
-        self.reentry = Reentry::Fresh;
+        self.reentry = match self.reentry {
+            Reentry::Restart | Reentry::Conflict => Reentry::Conflict,
+            Reentry::Continue | Reentry::Fresh => Reentry::Fresh,
+        };
+        self
+    }
+
+    /// Restarts pending receiving work only after unique frozen-run matching, without discovery.
+    /// No match is an error. Completed outputs are revalidated, not deleted or fetched again.
+    /// A new owned attempt is made; old data/control and uncertain extents remain untouched.
+    /// Fresh and Restart together are a sticky request error. Preview plans carry no authority.
+    pub fn restart(mut self, _authority: Restart) -> Self {
+        self.reentry = match self.reentry {
+            Reentry::Fresh | Reentry::Conflict => Reentry::Conflict,
+            Reentry::Continue | Reentry::Restart => Reentry::Restart,
+        };
+        self
+    }
+
+    /// Grants replacement only to this consumed run, independently of Fresh or Restart.
+    /// Checks and sealing still precede replacement. Preview plans carry no authority; executing
+    /// a separately inspected Plan retains the ordinary absent-only policy.
+    pub fn overwrite(mut self, _authority: Overwrite) -> Self {
+        self.publication = crate::transfer::Publication::Replace;
         self
     }
 
@@ -1155,8 +1233,12 @@ impl Download<'_> {
             target,
             requirements,
             measurement,
-            reentry: _,
+            reentry,
+            publication: _,
         } = self;
+        if matches!(reentry, Reentry::Conflict | Reentry::Restart) {
+            return Err(Error::Saved(SavedError::Authority));
+        }
         let inputs = inputs?;
         let input_count = inputs
             .iter()
@@ -1200,9 +1282,13 @@ impl Download<'_> {
             requirements,
             measurement,
             reentry,
+            publication,
             ..
         } = self;
         let setup = (|| {
+            if matches!(reentry, Reentry::Conflict) {
+                return Err(Error::Saved(SavedError::Authority));
+            }
             let inputs = inputs?;
             for input in &inputs {
                 Client::supported(input)?;
@@ -1228,7 +1314,15 @@ impl Download<'_> {
             Err(cause) if cause.kind() == io::ErrorKind::NotFound => {}
             Err(cause) => return Err(RunFailure::before_execution(Error::Directory(cause))),
         }
-        if matches!(reentry, Reentry::Continue)
+        let authority = Authority {
+            attempt: if matches!(reentry, Reentry::Restart) {
+                AttemptPolicy::Restart
+            } else {
+                AttemptPolicy::Continue
+            },
+            publication,
+        };
+        if matches!(reentry, Reentry::Continue | Reentry::Restart)
             && let Some(saved) = saved::matching(root, request)
                 .await
                 .map_err(|error| RunFailure::before_execution(Error::Saved(error)))?
@@ -1236,8 +1330,14 @@ impl Download<'_> {
             return saved
                 .bind_request(client, inputs)
                 .map_err(|error| RunFailure::before_execution(Error::Saved(error)))?
+                .authorized(authority)
                 .run_observed(observer)
                 .await;
+        }
+        if matches!(reentry, Reentry::Restart) {
+            return Err(RunFailure::before_execution(Error::Saved(
+                SavedError::RestartMissing,
+            )));
         }
         let plan = Download {
             client,
@@ -1246,13 +1346,14 @@ impl Download<'_> {
             requirements: Ok(requirements),
             measurement,
             reentry,
+            publication,
         }
         .plan()
         .await
         .map_err(RunFailure::before_execution)?;
         // Fresh bypasses admission matching, but its own unfinished work remains discoverable later.
         client
-            .execute_with_request(plan, Some(request), reentry, observer)
+            .execute_with_request(plan, Some(request), reentry, authority, observer)
             .await
     }
 }
@@ -1414,7 +1515,7 @@ impl fmt::Debug for Report {
     }
 }
 
-/// One absent-only native publication, not an assertion about other files in a run.
+/// One acknowledged native publication, not an assertion about other files in a run.
 pub struct PublishedFile {
     file: File,
     destination: PathBuf,

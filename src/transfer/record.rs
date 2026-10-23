@@ -7,6 +7,7 @@ use super::{
 };
 use crate::checks::{CheckPolicy, Requirements};
 
+const V4_MAGIC: &[u8; 8] = b"XGETNF04";
 const V3_MAGIC: &[u8; 8] = b"XGETNF03";
 const MAGIC: &[u8; 8] = b"XGETNF02";
 const V1_MAGIC: &[u8; 8] = b"XGETNF01";
@@ -25,6 +26,9 @@ pub(super) struct Binding {
     pub(super) parent: Identity,
     pub(super) workspace: Identity,
     pub(super) data: Identity,
+    // V4 records a captured incumbent, never transferable execution authority.
+    pub(super) incumbent: Option<Identity>,
+    pub(super) receiving_authority: bool,
     pub(super) destination: Vec<u8>,
     pub(super) checks: CheckPolicy,
 }
@@ -50,6 +54,7 @@ pub(super) struct InvalidRecord;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Status {
     NeedsBody,
+    Closed,
     Sealed,
     Publishing,
     Published,
@@ -58,13 +63,34 @@ pub(super) enum Status {
 impl Record {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(1024);
-        bytes.extend_from_slice(if self.reader.is_some() {
+        let v4 = self.binding.receiving_authority
+            || self.binding.incumbent.is_some()
+            || self.status == Status::Closed;
+        bytes.extend_from_slice(if v4 {
+            V4_MAGIC
+        } else if self.reader.is_some() {
             V3_MAGIC
         } else {
             MAGIC
         });
+        if v4 {
+            bytes.push(u8::from(self.reader.is_some()));
+            bytes.push(u8::from(self.binding.receiving_authority));
+            match self.binding.incumbent {
+                None => bytes.push(0),
+                Some(Identity {
+                    device: DeviceId(device),
+                    inode: InodeId(inode),
+                }) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&device.to_le_bytes());
+                    bytes.extend_from_slice(&inode.to_le_bytes());
+                }
+            }
+        }
         bytes.push(match self.status {
             Status::NeedsBody => 0,
+            Status::Closed => 4,
             Status::Sealed => 1,
             Status::Publishing => 2,
             Status::Published => 3,
@@ -141,14 +167,35 @@ impl Record {
         }
         let mut input = Input(bytes);
         let magic = input.take::<8>()?;
-        if magic != *MAGIC && magic != *V1_MAGIC && magic != *V3_MAGIC {
+        if magic != *MAGIC && magic != *V1_MAGIC && magic != *V3_MAGIC && magic != *V4_MAGIC {
             return Err(InvalidRecord);
         }
+        let (has_reader, receiving_authority, incumbent) = if magic == *V4_MAGIC {
+            let has_reader = match input.take::<1>()? {
+                [0] => false,
+                [1] => true,
+                _ => return Err(InvalidRecord),
+            };
+            let receiving_authority = match input.take::<1>()? {
+                [0] => false,
+                [1] => true,
+                _ => return Err(InvalidRecord),
+            };
+            let incumbent = match input.take::<1>()? {
+                [0] => None,
+                [1] => Some(input.identity()?),
+                _ => return Err(InvalidRecord),
+            };
+            (has_reader, receiving_authority, incumbent)
+        } else {
+            (magic == *V3_MAGIC, false, None)
+        };
         let status = match input.take::<1>()? {
             [0] => Status::NeedsBody,
             [1] => Status::Sealed,
             [2] => Status::Publishing,
             [3] => Status::Published,
+            [4] if magic == *V4_MAGIC => Status::Closed,
             _ => return Err(InvalidRecord),
         };
         let parent = input.identity()?;
@@ -159,7 +206,7 @@ impl Record {
         } else {
             input.v2()?
         };
-        let reader = if magic == *V3_MAGIC {
+        let reader = if has_reader {
             Some(input.reader(checks, partial, status)?)
         } else {
             None
@@ -179,7 +226,8 @@ impl Record {
             || partial.written > partial.received
             || (!checks.hashing() && partial.hashed != ByteCount(0))
             || !partial.results_fit(checks)
-            || (status != Status::NeedsBody && !partial.complete_for(checks))
+            || (!matches!(status, Status::NeedsBody | Status::Closed)
+                && !partial.complete_for(checks))
         {
             return Err(InvalidRecord);
         }
@@ -188,6 +236,8 @@ impl Record {
                 parent,
                 workspace,
                 data,
+                incumbent,
+                receiving_authority,
                 destination: destination.to_vec(),
                 checks,
             },
@@ -275,7 +325,9 @@ impl<'a> Input<'a> {
             }
             _ => return Err(InvalidRecord),
         };
-        if (status != Status::NeedsBody && (!closed || partial.written != size))
+        if (!matches!(status, Status::NeedsBody | Status::Closed)
+            && (!closed || partial.written != size))
+            || (status == Status::Closed && !closed)
             || partial.written > size
             || (version.is_none()
                 && !checks.requirements.iter().any(|requirement| {

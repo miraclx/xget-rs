@@ -24,8 +24,20 @@ impl Native {
             workspace,
             checks,
             state,
+            publication,
+            restart,
+            targets,
         } = plan;
-        drop((parent, destination, workspace, checks, state));
+        drop((
+            parent,
+            destination,
+            workspace,
+            checks,
+            state,
+            publication,
+            restart,
+            targets,
+        ));
         Err(AcquisitionFailure {
             error: NativeError,
             state: None,

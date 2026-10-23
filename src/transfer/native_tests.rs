@@ -240,6 +240,12 @@ async fn old_one_shot_receiving_records_never_acquire_reader_write_authority() {
         .await
         .unwrap();
     drop(native);
+    // Explicit delivered V2 fixture: it has no persisted one-shot receiving/closed authority.
+    let mut legacy =
+        crate::transfer::record::Record::decode(&fs::read(state.path().join("state")).unwrap())
+            .unwrap();
+    legacy.binding.receiving_authority = false;
+    fs::write(state.path().join("state"), legacy.encode()).unwrap();
     let before = fs::read(state.path().join("state")).unwrap();
     assert_eq!(&before[..8], b"XGETNF02");
     let session = super::Session {
@@ -1329,7 +1335,12 @@ async fn no_hash_lost_ack_stays_not_revalidatable_without_a_recovery_fingerprint
     assert_eq!(failure.partial.hashed, ByteCount(0));
     assert_eq!(failure.partial.actual, None);
     let before = fs::read(state.path().join("state")).unwrap();
-    assert_eq!(before[8], 2);
+    assert_eq!(
+        crate::transfer::record::Record::decode(&before)
+            .unwrap()
+            .status,
+        crate::transfer::record::Status::Publishing
+    );
     assert!(matches!(
         state.reconcile().await.unwrap(),
         Reconciliation::NotRevalidatable(_)
@@ -1371,7 +1382,8 @@ fn body() -> impl Stream<Item = Result<Bytes, Infallible>> {
     stream::iter([Ok(Bytes::from_static(b"abc"))])
 }
 
-fn probe(parent: &Path, expected: &str) {
+// Shared test-only child-process oracle for actual stable locks through path aliases.
+pub(super) fn probe(parent: &Path, expected: &str) {
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

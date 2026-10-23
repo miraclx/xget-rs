@@ -17,9 +17,12 @@ pub use crate::selection::PatternError;
 use crate::selection::Selection;
 
 mod headers;
+mod ipfs_identity;
 
 use headers::HeaderSet;
 pub use headers::{HeaderError, RequestHeader};
+pub(crate) use ipfs_identity::IpfsIdentity;
+pub use ipfs_identity::IpfsIdentityError;
 
 #[cfg(test)]
 #[path = "input_tests.rs"]
@@ -190,7 +193,9 @@ impl Input {
     /// SwissTransfer uses canonical file UUIDs; S3 trees use literal full object keys, not paths
     /// relative to the prefix and not percent-encoded URLs. WebDAV trees use the inventory's literal
     /// origin-scoped absolute URI path, without credentials, query or fragment. GitHub releases use
-    /// the API's positive numeric asset ID in canonical decimal, never a row or name. None is an input URL.
+    /// the API's positive numeric asset ID in canonical decimal, never a row or name. IPFS uses the
+    /// canonical CID plus preserved encoded exact path, without `ipfs://`. That token must identify
+    /// the original exact reference; it cannot select another path beneath it. None is an input URL.
     ///
     /// This is not authorization or an occurrence-local FileId. Fresh discovery must contain exactly
     /// this member; a stale token fails without a path, position or filename fallback. A selected File
@@ -203,6 +208,7 @@ impl Input {
             (InputKind::SwissTransfer, InputScope::Collection) => MemberToken::parse(token),
             (InputKind::S3, InputScope::Tree) => MemberToken::s3(token),
             (InputKind::Http, InputScope::Tree) => MemberToken::webdav(token),
+            (InputKind::Ipfs, InputScope::Exact) => MemberToken::ipfs(token),
             (InputKind::GithubRelease, InputScope::Catalogue) => MemberToken::github(token),
             _ => return Err(InputError::UnsupportedMemberSelection),
         };
@@ -543,7 +549,10 @@ impl InputKind {
 /// without access queries or credentials; their percent spelling is preserved, not a synthetic URL.
 /// GitHub selectors are actual positive numeric asset IDs in canonical decimal, scoped by the
 /// original repository/release input. They do not prove immutable content or a release-wide snapshot.
-/// Swiss UUIDs and GitHub IDs stay inline; S3/WebDAV text has shared zeroizing ownership. Clone is explicit and cheap,
+/// IPFS selectors are canonical CIDs with their preserved encoded exact path, without `ipfs://`.
+/// They must agree with the original exact reference, not select another file under that CID.
+/// Raw-block hashes are whole-block requirements; DAG-PB paths still trust the gateway's file bytes.
+/// Swiss UUIDs and GitHub IDs stay inline; S3/WebDAV/IPFS text has shared zeroizing ownership. Clone is explicit and cheap,
 /// not an implicit copy of the maximum key size. Only explicit `as_str` access reveals names.
 pub struct MemberToken(MemberSelector);
 
@@ -551,6 +560,7 @@ enum MemberSelector {
     Swiss([u8; 36]),
     S3(Arc<Zeroizing<String>>),
     WebDav(Arc<Zeroizing<String>>),
+    Ipfs(Arc<IpfsIdentity>),
     // Canonical decimal u64 spelling inline, never a bearer URL or catalogue row position.
     Github { text: [u8; 20], length: u8 },
 }
@@ -637,6 +647,25 @@ impl MemberToken {
         }))
     }
 
+    pub(crate) fn ipfs(value: &str) -> Option<Self> {
+        IpfsIdentity::parse(value).ok().map(Self::from_ipfs)
+    }
+
+    pub(crate) fn from_ipfs(identity: IpfsIdentity) -> Self {
+        Self(MemberSelector::Ipfs(Arc::new(identity)))
+    }
+
+    pub(crate) fn ipfs_identity(&self) -> Option<&IpfsIdentity> {
+        match &self.0 {
+            MemberSelector::Ipfs(identity) => Some(identity),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_ipfs(&self) -> bool {
+        matches!(&self.0, MemberSelector::Ipfs(_))
+    }
+
     pub(crate) fn is_github(&self) -> bool {
         matches!(&self.0, MemberSelector::Github { .. })
     }
@@ -651,6 +680,7 @@ impl MemberToken {
             MemberSelector::S3(_) => 1,
             MemberSelector::WebDav(_) => 2,
             MemberSelector::Github { .. } => 3,
+            MemberSelector::Ipfs(_) => 4,
         }
     }
 
@@ -665,6 +695,7 @@ impl MemberToken {
             MemberSelector::Swiss(_) => InputKind::SwissTransfer,
             MemberSelector::S3(_) => InputKind::S3,
             MemberSelector::WebDav(_) => InputKind::Http,
+            MemberSelector::Ipfs(_) => InputKind::Ipfs,
             MemberSelector::Github { .. } => InputKind::GithubRelease,
         }
     }
@@ -677,6 +708,7 @@ impl MemberToken {
                 Err(_) => unreachable!("swiss member selectors contain validated ASCII"),
             },
             MemberSelector::S3(key) | MemberSelector::WebDav(key) => key.as_str(),
+            MemberSelector::Ipfs(identity) => identity.as_str(),
             MemberSelector::Github { text, length } => {
                 match core::str::from_utf8(&text[..usize::from(*length)]) {
                     Ok(value) => value,
@@ -693,6 +725,7 @@ impl Clone for MemberToken {
             MemberSelector::Swiss(bytes) => MemberSelector::Swiss(*bytes),
             MemberSelector::S3(key) => MemberSelector::S3(Arc::clone(key)),
             MemberSelector::WebDav(key) => MemberSelector::WebDav(Arc::clone(key)),
+            MemberSelector::Ipfs(identity) => MemberSelector::Ipfs(Arc::clone(identity)),
             MemberSelector::Github { text, length } => MemberSelector::Github {
                 text: *text,
                 length: *length,

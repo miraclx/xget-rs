@@ -743,3 +743,29 @@ Control responses are bounded to 256 KiB each and 1 MiB cumulatively, with 16 Ki
 limits also apply. One validated redirect to GitHub's dedicated release-asset content authority is
 supported. No credentials, generic request headers, private releases, arbitrary API origins,
 source archives, implicit platform selection or CLI catalogue integration is included here.
+
+### Ordinary IPFS files (library)
+
+The optional `ipfs` backend resolves exact `ipfs://CID[/path]` references through an HTTP gateway.
+`Client::builder().ipfs_gateway(base)?.build()?` selects gateway access explicitly; the default is
+`https://ipfs.io`. The library reads neither environment gateway settings nor Kubo configuration.
+Gateway bases may include a routing prefix but not credentials, a query or a fragment. No gateway
+URL is persisted as member identity or saved-run authority.
+
+The bounded pure CID/path parser is available to offline saved-member validation even when transport
+is disabled. Tokens contain the canonical CID plus preserved encoded exact path; source paths retain
+decoded Unicode. CID spelling is parsed before URL-host lowercasing, preserving case-sensitive CIDv0.
+Limits are 4096 token bytes, 512 CID spelling bytes and 64 path components. Exact paths reject
+traversal, empty/trailing components and encoded separators, percent signs or controls. Gateway routing
+prefixes do not spend the logical identity's path allowance; ordinary HTTP keeps its own path bound.
+
+Raw-block CIDs require their supported complete SHA-1, SHA-256, SHA-512 or BLAKE3 digest as a Source
+check, including with `Measurement::None`. A DAG-PB/UnixFS CID hashes a node, not the flat file bytes
+returned by a gateway: those responses remain gateway-trusted and do not acquire a fabricated root
+checksum. This backend does not reconstruct or verify UnixFS DAGs, enumerate directories or follow
+gateway redirects. Weak digests do not become strong native recovery evidence.
+
+The common coordinator stores genuine CID/path metadata and check policy as V4 remote tag 5, using
+whole responses only, never range assembly. Frozen reentry can use a newly configured gateway without
+new HEAD discovery; frozen identity, version/check policy and destination still bind the request.
+This addition does not cut over the compiled CLI or retire the old engine.

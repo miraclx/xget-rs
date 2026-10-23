@@ -13,6 +13,9 @@
 //! name/path (4096 bytes), release ID (u64) and canonical UTC API updated_at (20 bytes). Known length,
 //! whole mode and no fabricated HTTP ETag are mandatory. Source digest remains in the check policy.
 //! Catalogue recipe scope tags 4/5 encode explicit All/Chosen; prior scope tags retain exact layouts.
+//! V4 remote tag 5 adds a canonical CID/exact path token and decoded logical source path, both
+//! bounded to 4096 bytes, without gateway access. Pure identity and raw Source checks are validated
+//! even without the IPFS transport feature. Members remain whole-mode; unknown length is allowed.
 //! Remote tags 0/1 keep their old exact/Swiss layout. S3 must have known length, a strong opaque ETag
 //! and whole mode; versionId is additional conditional evidence, not a digest or access credential.
 
@@ -68,6 +71,25 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
             return Err(SavedError::Corrupt);
         }
         if let Some(remote) = &member.remote {
+            if let Some(identity) = remote.token.ipfs_identity() {
+                if record.version != 4
+                    || member.mode != crate::client::range::Mode::Whole
+                    || identity.source_path() != remote.source_path.as_str()
+                {
+                    return Err(SavedError::Corrupt);
+                }
+                if let Some(expected) = identity.required()
+                    && !member.requirements.iter().any(|requirement| {
+                        requirement.digest == expected
+                            && requirement
+                                .origins
+                                .iter()
+                                .any(|origin| origin == crate::transfer::Provenance::Source)
+                    })
+                {
+                    return Err(SavedError::Corrupt);
+                }
+            }
             if remote.token.is_github() {
                 let evidence = remote.github.as_ref().ok_or(SavedError::Corrupt)?;
                 let updated =
@@ -106,12 +128,17 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                 if remote.s3_version.is_some() {
                     return Err(SavedError::Corrupt);
                 }
-                crate::client::layout::Layout::source_path(&remote.source_path)
-                    .map_err(|_| SavedError::Corrupt)?;
+                // Exact IPFS routing ancestors are bounded by the identity parser above, not local
+                // filename rules. Only the frozen destination is local filesystem authority.
+                if !remote.token.is_ipfs() {
+                    crate::client::layout::Layout::source_path(&remote.source_path)
+                        .map_err(|_| SavedError::Corrupt)?;
+                }
             }
-            if matches!(member.length, Length::Unknown)
+            if (matches!(member.length, Length::Unknown) && !remote.token.is_ipfs())
                 || (!remote.token.is_webdav()
                     && !remote.token.is_github()
+                    && !remote.token.is_ipfs()
                     && !member.attempts.is_empty()
                     && member.etag.is_none())
             {
@@ -168,6 +195,8 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                         3
                     } else if remote.token.is_github() {
                         4
+                    } else if remote.token.is_ipfs() {
+                        5
                     } else {
                         1
                     });
@@ -175,7 +204,7 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                         remote.token.as_str().as_bytes(),
                         if remote.token.is_s3() {
                             1024
-                        } else if remote.token.is_webdav() {
+                        } else if remote.token.is_webdav() || remote.token.is_ipfs() {
                             MAX_PATH
                         } else {
                             36
@@ -322,6 +351,13 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
                 }
                 3 if version == 4 => Some(super::FrozenMember {
                     token: crate::input::MemberToken::webdav(input.text(MAX_PATH)?)
+                        .ok_or(SavedError::Corrupt)?,
+                    source_path: Zeroizing::new(input.text(MAX_PATH)?.to_owned()),
+                    s3_version: None,
+                    github: None,
+                }),
+                5 if version == 4 => Some(super::FrozenMember {
+                    token: crate::input::MemberToken::ipfs(input.text(MAX_PATH)?)
                         .ok_or(SavedError::Corrupt)?,
                     source_path: Zeroizing::new(input.text(MAX_PATH)?.to_owned()),
                     s3_version: None,

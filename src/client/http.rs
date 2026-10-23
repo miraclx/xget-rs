@@ -45,6 +45,8 @@ pub(super) struct Http {
     // Optional configured SDK shares this transport root's admission, never its HTTP policies.
     #[cfg(feature = "s3")]
     pub(super) s3: Option<Arc<super::s3::S3>>,
+    #[cfg(feature = "ipfs")]
+    pub(super) ipfs: Option<Arc<super::ipfs::Ipfs>>,
     // Tests map already-validated service/object authorities onto one owned loopback listener.
     // There is deliberately no production endpoint override or credential-origin bypass.
     #[cfg(test)]
@@ -73,6 +75,8 @@ impl Http {
             admission: Arc::new(Semaphore::new(maximum.get())),
             #[cfg(feature = "s3")]
             s3: None,
+            #[cfg(feature = "ipfs")]
+            ipfs: None,
             #[cfg(test)]
             fixture: None,
         })
@@ -117,6 +121,19 @@ impl Http {
                     .ok()
             })
             .map(|name| Zeroizing::new(name.into_owned()));
+        self.describe_source(input, source_path, name).await
+    }
+
+    // Provider routing prefixes belong to transient access, not the logical source-path allowance.
+    pub(super) async fn describe_source(
+        &self,
+        input: &mut Input,
+        source_path: Zeroizing<String>,
+        name: Option<Zeroizing<String>>,
+    ) -> Result<Description, Error> {
+        if source_path.len() > MAX_PATH {
+            return Err(Error::Inventory(crate::inventory::InventoryError::Limit));
+        }
         let admitted = self.headers(input, Method::HEAD, None).await?;
         let response = &admitted.response;
         let status = response.status();

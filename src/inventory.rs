@@ -312,6 +312,9 @@ impl From<File> for Input {
             selected,
         } = file;
         input.selected = Some(Box::new(selected));
+        if input.kind() == crate::input::InputKind::GithubRelease {
+            input.alternatives = crate::input::Alternatives::Chosen;
+        }
         input
     }
 }

@@ -97,6 +97,7 @@ pub(super) async fn create(
                         token: crate::input::MemberToken::clone(token),
                         source_path: zeroize::Zeroizing::new(file.file.source_path().to_owned()),
                         s3_version: Option::clone(&file.file.input.s3_version),
+                        github: file.file.input.github.as_ref().map(std::sync::Arc::clone),
                     }),
                 binding: Fingerprint::reference(&file.file.input),
                 destination: PathBuf::clone(&file.destination),

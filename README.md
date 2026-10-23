@@ -719,3 +719,27 @@ custom headers and pluggable sources, with S3 and IPFS added.
 ## License
 
 Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
+
+### Public GitHub release catalogues (library)
+
+Enable the library's `github` feature to resolve public
+`https://github.com/OWNER/REPOSITORY/releases/latest` or `/releases/tag/TAG` references.
+`Client::resolve` lists the complete bounded asset catalogue without payload requests. The adapter
+ignores the release object's embedded asset page and enumerates the dedicated asset endpoint.
+Acquisition never guesses a platform or chooses the first asset, even in a singleton release.
+Use `Input::select_id` with the inventory's canonical numeric asset ID, an include path, a consumed
+selected `File`, or `Input::all()` / `Download::all()` explicitly. Mixed requests attach intent to
+each original input. Complete discovery is charged before member or path filtering.
+
+Each asset retains its release ID, numeric asset ID, name, size and API revision timestamp.
+Reentry rechecks that frozen asset route rather than rediscovering latest/tag or searching by name.
+API revision facts are not immutable payload evidence or a release-wide snapshot. A supplied GitHub
+SHA-256 digest is a required Source check, including with `Measurement::None`; absent digests do
+not invent a check. Whole payloads remain HTTP-unpinned and must reach clean checked EOF before
+native publication. Signed content access is transient and excluded from saved records.
+
+Control responses are bounded to 256 KiB each and 1 MiB cumulatively, with 16 KiB string text,
+32 nesting levels, 30 assets per dedicated page and at most 128 page requests; the common inventory
+limits also apply. One validated redirect to GitHub's dedicated release-asset content authority is
+supported. No credentials, generic request headers, private releases, arbitrary API origins,
+source archives, implicit platform selection or CLI catalogue integration is included here.

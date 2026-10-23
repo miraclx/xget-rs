@@ -52,7 +52,7 @@ impl Stream for Body {
 /// Foreign SDK and HTTP diagnostics remain behind their transport's redaction boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
-    /// A consumed HTTP or SwissTransfer response failed.
+    /// A consumed HTTP-backed response failed.
     #[error("http body failed; inspect the safe transport category")]
     Http(#[source] HttpError),
     /// A consumed S3 SDK response failed.

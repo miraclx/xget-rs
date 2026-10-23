@@ -33,6 +33,7 @@ s3 = [
     "dep:http-body-04",
     "dep:tokio-util",
 ]
+github = ["dep:serde", "dep:serde_json"]
 ipfs = ["dep:cid"]
 swisstransfer = ["dep:scraper", "dep:serde", "dep:serde_json", "dep:time"]
 webdav = ["dep:roxmltree"]

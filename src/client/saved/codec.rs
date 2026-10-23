@@ -9,6 +9,10 @@
 //! path (4096 bytes), without versionId or access-reference bytes. Known length and whole mode are
 //! mandatory; absent strong ETags remain unpinned, including attempted members. Tags 0/1/2 retain
 //! their original exact/Swiss/S3 byte layouts.
+//! V4 remote tag 4 adds a canonical positive decimal GitHub asset ID (20 bytes), original asset
+//! name/path (4096 bytes), release ID (u64) and canonical UTC API updated_at (20 bytes). Known length,
+//! whole mode and no fabricated HTTP ETag are mandatory. Source digest remains in the check policy.
+//! Catalogue recipe scope tags 4/5 encode explicit All/Chosen; prior scope tags retain exact layouts.
 //! Remote tags 0/1 keep their old exact/Swiss layout. S3 must have known length, a strong opaque ETag
 //! and whole mode; versionId is additional conditional evidence, not a digest or access credential.
 
@@ -64,6 +68,22 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
             return Err(SavedError::Corrupt);
         }
         if let Some(remote) = &member.remote {
+            if remote.token.is_github() {
+                let evidence = remote.github.as_ref().ok_or(SavedError::Corrupt)?;
+                let updated =
+                    core::str::from_utf8(&evidence.updated).map_err(|_| SavedError::Corrupt)?;
+                if record.version != 4
+                    || member.mode != crate::client::range::Mode::Whole
+                    || member.etag.is_some()
+                    || remote.s3_version.is_some()
+                    || crate::input::GithubEvidence::parse(evidence.release.0, updated).is_none()
+                    || remote.source_path.contains('/')
+                {
+                    return Err(SavedError::Corrupt);
+                }
+            } else if remote.github.is_some() {
+                return Err(SavedError::Corrupt);
+            }
             if remote.token.is_s3() {
                 if record.version != 4
                     || member.etag.is_none()
@@ -91,6 +111,7 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
             }
             if matches!(member.length, Length::Unknown)
                 || (!remote.token.is_webdav()
+                    && !remote.token.is_github()
                     && !member.attempts.is_empty()
                     && member.etag.is_none())
             {
@@ -145,6 +166,8 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                         2
                     } else if remote.token.is_webdav() {
                         3
+                    } else if remote.token.is_github() {
+                        4
                     } else {
                         1
                     });
@@ -159,6 +182,10 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                         },
                     )?;
                     out.bytes(remote.source_path.as_bytes(), MAX_PATH)?;
+                    if let Some(evidence) = &remote.github {
+                        out.u64(evidence.release.0);
+                        out.0.extend_from_slice(&evidence.updated);
+                    }
                     if remote.token.is_s3() {
                         match &remote.s3_version {
                             None => out.byte(0),
@@ -275,6 +302,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
                         .ok_or(SavedError::Corrupt)?,
                     source_path: Zeroizing::new(input.text(MAX_PATH)?.to_owned()),
                     s3_version: None,
+                    github: None,
                 }),
                 2 if version == 4 => {
                     let token = crate::input::MemberToken::s3(input.text(1024)?)
@@ -289,6 +317,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
                         token,
                         source_path,
                         s3_version,
+                        github: None,
                     })
                 }
                 3 if version == 4 => Some(super::FrozenMember {
@@ -296,7 +325,24 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
                         .ok_or(SavedError::Corrupt)?,
                     source_path: Zeroizing::new(input.text(MAX_PATH)?.to_owned()),
                     s3_version: None,
+                    github: None,
                 }),
+                4 if version == 4 => {
+                    let token = crate::input::MemberToken::github(input.text(20)?)
+                        .ok_or(SavedError::Corrupt)?;
+                    let source_path = Zeroizing::new(input.text(MAX_PATH)?.to_owned());
+                    let release = input.u64()?;
+                    let updated =
+                        core::str::from_utf8(input.take(20)?).map_err(|_| SavedError::Corrupt)?;
+                    let evidence = crate::input::GithubEvidence::parse(release, updated)
+                        .ok_or(SavedError::Corrupt)?;
+                    Some(super::FrozenMember {
+                        token,
+                        source_path,
+                        s3_version: None,
+                        github: Some(std::sync::Arc::new(evidence)),
+                    })
+                }
                 _ => return Err(SavedError::Corrupt),
             };
             (occurrence, remote)
@@ -451,7 +497,11 @@ impl Encoder {
         self.byte(match intent.scope {
             crate::input::InputScope::Exact => 0,
             crate::input::InputScope::Collection => 1,
-            crate::input::InputScope::Catalogue => 2,
+            crate::input::InputScope::Catalogue => match intent.alternatives {
+                crate::input::Alternatives::Select => 2,
+                crate::input::Alternatives::All => 4,
+                crate::input::Alternatives::Chosen => 5,
+            },
             crate::input::InputScope::Tree => 3,
         });
         match &intent.namespace {
@@ -518,10 +568,16 @@ impl<'a> Decoder<'a> {
             _ => return Err(SavedError::Corrupt),
         }
         let original = self.fingerprint()?;
-        let scope = match self.byte()? {
+        let tag = self.byte()?;
+        let alternatives = match tag {
+            4 => crate::input::Alternatives::All,
+            5 => crate::input::Alternatives::Chosen,
+            _ => crate::input::Alternatives::Select,
+        };
+        let scope = match tag {
             0 => crate::input::InputScope::Exact,
             1 => crate::input::InputScope::Collection,
-            2 => crate::input::InputScope::Catalogue,
+            2 | 4 | 5 => crate::input::InputScope::Catalogue,
             3 => crate::input::InputScope::Tree,
             _ => return Err(SavedError::Corrupt),
         };
@@ -561,6 +617,7 @@ impl<'a> Decoder<'a> {
         Ok(Some(super::FrozenIntent {
             original,
             scope,
+            alternatives,
             namespace,
             selection,
         }))

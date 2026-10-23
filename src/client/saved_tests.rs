@@ -1858,6 +1858,98 @@ fn native_owned_http_run_and_resume_futures_are_send() {
     let _check = resume_send;
 }
 
+#[test]
+fn github_v4_remote_evidence_roundtrips_without_changing_older_tags_or_adding_bearers() {
+    use std::sync::Arc;
+
+    use zeroize::Zeroizing;
+
+    use crate::input::{GithubEvidence, Input, InputOccurrence, MemberToken};
+    use crate::transfer::{ByteCount, Length};
+
+    let original = "https://github.com/example/project/releases/latest";
+    for input in [
+        Input::parse(original).unwrap().all(),
+        Input::parse(original).unwrap().select_id("73").unwrap(),
+        Input::parse(original).unwrap().include("*.bin").unwrap(),
+    ] {
+        let identity = super::RootIdentity {
+            device: super::RootDevice(1),
+            inode: super::RootInode(2),
+        };
+        let mut record = super::Record {
+            version: 4,
+            root: PathBuf::from("/owned"),
+            identity,
+            store_identity: identity,
+            workspace_identity: identity,
+            request: None,
+            complete: false,
+            members: vec![super::Member {
+                occurrence: InputOccurrence(0),
+                intent: super::FrozenIntent::capture(&input).unwrap(),
+                remote: Some(super::FrozenMember {
+                    token: MemberToken::github("73").unwrap(),
+                    source_path: Zeroizing::new("actual.bin".to_owned()),
+                    s3_version: None,
+                    github: Some(Arc::new(
+                        GithubEvidence::parse(42, "2026-10-20T12:00:00Z").unwrap(),
+                    )),
+                }),
+                binding: Fingerprint::reference(&input),
+                destination: PathBuf::from("/owned/actual.bin"),
+                length: Length::Known(ByteCount(3)),
+                etag: None,
+                requirements: crate::checks::Requirements::default(),
+                measurement: Measurement::None,
+                mode: crate::client::range::Mode::Whole,
+                attempts: Vec::new(),
+            }],
+        };
+        let bytes = codec::encode(&record).unwrap();
+        let decoded = codec::decode(&bytes).unwrap();
+        assert_eq!(codec::encode(&decoded).unwrap(), bytes);
+        let restored = decoded.members[0]
+            .intent
+            .as_ref()
+            .unwrap()
+            .input(original, decoded.members[0].binding)
+            .unwrap();
+        assert!(restored.alternatives == input.alternatives);
+        assert!(
+            !bytes
+                .windows(original.len())
+                .any(|part| part == original.as_bytes())
+        );
+        assert!(
+            !bytes
+                .windows(b"https://".len())
+                .any(|part| part == b"https://")
+        );
+        assert_eq!(
+            decoded.members[0].remote.as_ref().unwrap().token.as_str(),
+            "73"
+        );
+        assert!(
+            decoded.members[0]
+                .remote
+                .as_ref()
+                .unwrap()
+                .github
+                .as_deref()
+                .unwrap()
+                == &GithubEvidence::parse(42, "2026-10-20T12:00:00Z").unwrap()
+        );
+        for version in [1, 2, 3] {
+            record.version = version;
+            assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
+        }
+        record.version = 4;
+        record.members[0].remote.as_mut().unwrap().github = None;
+        assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
+    }
+}
+
 #[tokio::test]
 async fn public_observed_publication_then_checkpoint_role_failure_emits_one_terminal_failure() {
     struct ExchangeOnPublication<'a> {

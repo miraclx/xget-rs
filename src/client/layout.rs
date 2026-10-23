@@ -29,7 +29,7 @@ impl Layout {
         Ok(())
     }
 
-    #[cfg(feature = "swisstransfer")]
+    #[cfg(any(feature = "swisstransfer", feature = "github"))]
     pub(super) fn source_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<(), Error> {
         let mut layout = Self {
             files: BTreeSet::new(),
@@ -135,6 +135,9 @@ impl Layout {
         measurement: Measurement,
         input_count: usize,
     ) -> Result<Plan, Error> {
+        for file in &files {
+            Self::alternatives(&file.input)?;
+        }
         if let Target::File(destination) = target {
             if files.len() != 1 {
                 return Err(Error::FileCardinality);
@@ -192,7 +195,9 @@ impl Layout {
             }
             let collection = matches!(
                 file.input.scope(),
-                crate::input::InputScope::Collection | crate::input::InputScope::Tree
+                crate::input::InputScope::Collection
+                    | crate::input::InputScope::Tree
+                    | crate::input::InputScope::Catalogue
             );
             // No title field is evidenced by the service protocol. This is an honest readable
             // fallback, never a share UUID or a silently suffixed namespace.
@@ -204,6 +209,7 @@ impl Layout {
                     crate::input::InputKind::S3 | crate::input::InputKind::Http => {
                         file.input.parsed_reference().host_str()
                     }
+                    crate::input::InputKind::GithubRelease => Some("GitHub"),
                     _ => Some("SwissTransfer"),
                 }
             });
@@ -261,6 +267,20 @@ impl Layout {
             directory_root: Some(root),
             directories: output_directories.into_iter().collect(),
         })
+    }
+
+    pub(super) fn alternatives(input: &crate::input::Input) -> Result<(), Error> {
+        if input.scope() == crate::input::InputScope::Catalogue
+            && input.selected.is_none()
+            && input.alternatives == crate::input::Alternatives::Select
+            && input
+                .selection
+                .as_ref()
+                .is_none_or(|selection| selection.includes().next().is_none())
+        {
+            return Err(Error::CatalogueChoice);
+        }
+        Ok(())
     }
 
     fn requirements(file: &File, global: Requirements) -> Result<Requirements, Error> {

@@ -1,6 +1,8 @@
 //! Frozen aggregate continuation. V3 adds exact HTTP reader mode to V2 member bindings.
 //! V4 adds genuine S3 key selectors and optional versionId without changing V1/V2/V3 encoding.
 //! S3 stays whole mode, with fresh conditional GETs, no listing/HEAD on reentry and no byte reuse.
+//! V4 also freezes DAV hrefs and GitHub asset IDs/API revisions separately from access references.
+//! GitHub reentry rechecks the frozen asset API route, never mutable latest/tag selection.
 //! This codec is not a public manifest API.
 
 use core::convert::Infallible;
@@ -587,6 +589,11 @@ impl Fingerprint {
         if input.kind() == crate::input::InputKind::Http && input.scope() == InputScope::Tree {
             Self::field(&mut hash, b"webdav tree scope 1");
         }
+        if input.kind() == crate::input::InputKind::GithubRelease
+            && input.alternatives == crate::input::Alternatives::All
+        {
+            Self::field(&mut hash, b"github explicit all alternatives 1");
+        }
         Self::field(&mut hash, input.original_reference().as_bytes());
         Self::field(
             &mut hash,
@@ -632,7 +639,9 @@ impl Fingerprint {
             Self::field(&mut hash, &Self::reference(input).0);
             if (matches!(
                 input.kind(),
-                crate::input::InputKind::SwissTransfer | crate::input::InputKind::S3
+                crate::input::InputKind::SwissTransfer
+                    | crate::input::InputKind::S3
+                    | crate::input::InputKind::GithubRelease
             ) || input.scope() == InputScope::Tree)
                 && input.selected.is_some()
             {
@@ -650,6 +659,8 @@ impl Fingerprint {
                         b"s3 object key 1"
                     } else if token.is_webdav() {
                         b"webdav scoped href 1"
+                    } else if token.is_github() {
+                        b"github asset id 1"
                     } else {
                         b"swiss member token 1"
                     },
@@ -659,6 +670,12 @@ impl Fingerprint {
             // Selected-file requests carry a frozen session; do not merge with mutable discovery.
             if let Some(selected) = &input.selected {
                 Self::field(&mut hash, b"selected");
+                if let Some(evidence) = &input.github {
+                    Self::field(&mut hash, b"github frozen API revision 1");
+                    Self::field(&mut hash, &evidence.release.0.to_le_bytes());
+                    Self::field(&mut hash, &evidence.updated);
+                    Self::field(&mut hash, selected.description.source_path.as_bytes());
+                }
                 if input.kind() == crate::input::InputKind::S3 {
                     Self::field(&mut hash, b"s3 frozen version 1");
                     Self::field(
@@ -738,11 +755,13 @@ struct FrozenMember {
     source_path: Zeroizing<String>,
     // V4 only: an S3 HEAD versionId, separate from opaque conditional ETag and key selector.
     s3_version: Option<Zeroizing<String>>,
+    github: Option<Arc<crate::input::GithubEvidence>>,
 }
 
 struct FrozenIntent {
     original: Fingerprint,
     scope: InputScope,
+    alternatives: crate::input::Alternatives,
     namespace: Option<Namespace>,
     selection: Option<Arc<Selection>>,
 }
@@ -750,6 +769,7 @@ struct FrozenIntent {
 impl FrozenIntent {
     fn capture(input: &Input) -> Result<Option<Self>, SavedError> {
         if input.kind() != crate::input::InputKind::S3
+            && input.kind() != crate::input::InputKind::GithubRelease
             && input.scope() != InputScope::Tree
             && input.namespace().is_none()
             && input
@@ -771,6 +791,7 @@ impl FrozenIntent {
         Ok(Some(Self {
             original: Fingerprint::original(input),
             scope: input.scope(),
+            alternatives: input.alternatives,
             namespace,
             selection: input
                 .selection
@@ -796,6 +817,7 @@ impl FrozenIntent {
                 .map_err(|_| SavedError::Binding)?;
         }
         input.selection = self.selection.as_ref().map(Arc::clone);
+        input.alternatives = self.alternatives;
         if Fingerprint::reference(&input) != binding {
             return Err(SavedError::Binding);
         }
@@ -825,6 +847,10 @@ impl Member {
         }
         let provider_matches = match &self.remote {
             Some(remote) if remote.token.is_s3() => input.kind() == crate::input::InputKind::S3,
+            Some(remote) if remote.token.is_github() => {
+                input.kind() == crate::input::InputKind::GithubRelease
+                    && input.scope() == InputScope::Catalogue
+            }
             Some(remote) if remote.token.is_webdav() => {
                 input.kind() == crate::input::InputKind::Http && input.scope() == InputScope::Tree
             }
@@ -847,6 +873,10 @@ impl Member {
             && self.remote.as_ref().is_none_or(|remote| {
                 !remote.token.is_s3() || input.s3_version.as_deref() == remote.s3_version.as_deref()
             })
+            && self
+                .remote
+                .as_ref()
+                .is_none_or(|remote| !remote.token.is_github() || input.github == remote.github)
             && supplied.length == self.length
             && supplied.etag.as_deref() == self.etag.as_deref()
             && supplied.requirements.iter().all(|required| {
@@ -900,6 +930,10 @@ impl Owned {
                 .remote
                 .as_ref()
                 .and_then(|remote| Option::clone(&remote.s3_version));
+            input.github = member
+                .remote
+                .as_ref()
+                .and_then(|remote| remote.github.as_ref().map(Arc::clone));
             input.ranges = match member.mode {
                 super::range::Mode::Whole => crate::input::RangeSupport::Unknown,
                 super::range::Mode::Ranges => crate::input::RangeSupport::Bytes,
@@ -978,10 +1012,11 @@ impl Owned {
         if member
             .remote
             .as_ref()
-            .is_some_and(|remote| remote.token.is_webdav())
+            .is_some_and(|remote| remote.token.is_webdav() || remote.token.is_github())
         {
-            // Unpinned DAV is honestly a fresh whole response, not first-open snapshot evidence.
-            // A discovered strong pin is already frozen before any native submission.
+            // DAV and release assets do not invent first-open snapshot evidence. GitHub API
+            // revision facts remain separate from HTTP pins; source checks are already frozen.
+            // A discovered DAV strong pin is frozen before any native submission.
             if member.etag.as_deref() != file.selected.description.etag.as_deref()
                 || member.length != file.length()
             {

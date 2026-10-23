@@ -252,6 +252,47 @@ admission; drop or consume them to release capacity. Use a caller-owned Tokio ru
 time enabled. See the [`client` module](src/client.rs) for selection, version and failure contracts. The CLI still uses the
 legacy engine below; its feature flags do not enable new Client provider adapters.
 
+### Scoped request access headers (library)
+
+Attach access headers to one original HTTP input or WebDAV root, not to the Client globally:
+
+```rust,no_run
+use xget::{Client, Input};
+
+# async fn example() -> Result<(), Box<dyn core::error::Error>> {
+let client = Client::new()?;
+let input = Input::parse("https://example.org/private.bin")?
+    .header("Authorization", "Bearer caller-supplied-access")?;
+let report = client.download(input).to_file("private.bin").run().await?;
+# Ok(())
+# }
+```
+
+`Input::request_header` also accepts an already parsed `input::RequestHeader`. Its `FromStr` spelling
+is `Name: value`: the first colon separates the parts and surrounding ASCII spaces are omitted.
+`RequestHeader::new(name, value)` instead preserves exact value spacing. Empty values are allowed;
+values must be printable ASCII without controls, DEL or non-ASCII bytes. Names are canonicalized to
+lowercase ASCII HTTP tokens. Limits are 128 name bytes, 8192 value bytes, 32 distinct names and 32768
+combined name/value bytes per input. Repeating a canonical name replaces it in its insertion position.
+
+Headers are transient access, not selection, source identity, version evidence or a new frozen-run
+intent. They are included in retained-input text accounting but never in fingerprints or saved runs.
+A continuation may supply renewed access for the same original reference; it must still satisfy the
+frozen version, requirements and destination binding. Duplicated occurrences share their header set;
+a later update uses copy-on-write rather than modifying another occurrence's access.
+
+The HTTP transport applies only that input's headers to its requests. DAV member projections inherit
+access only after checking the original origin. Redirects remain refused rather than forwarding
+credentials. Range/conditional, framing/encoding, proxy and WebDAV Depth/Content-Type headers belong
+to the transport and cannot be overridden. Explicit Authorization also refuses competing URL-userinfo
+credentials. Provider-owned SwissTransfer/S3 and other non-HTTP input kinds reject these headers;
+they use their own access protocols.
+
+Retained values use shared zeroizing allocations and Debug redacts them; outbound foreign header
+values are marked sensitive. The library cannot wipe the caller's original text or foreign-library
+copies. Typed `HeaderError` values retain no rejected name/value. This is a library-only addition;
+it does not change the compiled CLI's header handling.
+
 ### SwissTransfer collections (library feature)
 
 Enable `swisstransfer` on the library dependency. The compiled legacy CLI has not adopted this adapter;

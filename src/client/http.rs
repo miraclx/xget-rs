@@ -10,7 +10,7 @@ use futures::Stream;
 use futures::stream::BoxStream;
 use reqwest::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG,
-    IF_MATCH, RANGE, TRANSFER_ENCODING,
+    HeaderName, HeaderValue, IF_MATCH, RANGE, TRANSFER_ENCODING,
 };
 use reqwest::{Method, Response};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -415,6 +415,14 @@ impl Http {
                 .client
                 .request(method, reference)
                 .header(ACCEPT_ENCODING, "identity");
+            for header in input.request_headers() {
+                let name = HeaderName::from_bytes(header.name().as_bytes())
+                    .map_err(|_| crate::input::HeaderError::InvalidName)?;
+                let mut value = HeaderValue::from_str(header.value())
+                    .map_err(|_| crate::input::HeaderError::InvalidValue)?;
+                value.set_sensitive(true);
+                request = request.header(name, value);
+            }
             #[cfg(feature = "webdav")]
             if propfind {
                 request = request.header("Depth", "1").header("Content-Type", "application/xml; charset=utf-8")

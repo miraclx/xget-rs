@@ -7,6 +7,53 @@ use super::{Input, InputError, InputKind, InputScope, NamespaceError};
 const SHARE: &str = "https://www.swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444";
 
 #[test]
+fn changing_duplicate_headers_preserves_the_original_access_set() {
+    let original = Input::parse("https://example.test/file")
+        .expect("reference")
+        .header("X-Context", "one")
+        .expect("first field")
+        .header("X-Other", "unchanged")
+        .expect("second field");
+    let original_bytes = original.retained_bytes();
+    let changed = original
+        .duplicate_reference()
+        .expect("duplicate")
+        .header("x-context", "two-two")
+        .expect("copy-on-write replacement");
+    assert!(!std::sync::Arc::ptr_eq(
+        original.headers.as_ref().expect("original set"),
+        changed.headers.as_ref().expect("changed set"),
+    ));
+    assert_eq!(
+        original
+            .request_headers()
+            .next()
+            .expect("original field")
+            .value(),
+        "one"
+    );
+    assert_eq!(
+        changed
+            .request_headers()
+            .next()
+            .expect("changed field")
+            .value(),
+        "two-two"
+    );
+    assert_eq!(changed.request_headers().count(), 2);
+    assert_eq!(
+        changed
+            .request_headers()
+            .nth(1)
+            .expect("retained field")
+            .value(),
+        "unchanged"
+    );
+    assert_eq!(original.retained_bytes(), original_bytes);
+    assert_eq!(changed.retained_bytes(), original_bytes + 4);
+}
+
+#[test]
 fn member_tokens_are_compact_provider_scoped_and_share_zeroizing_s3_keys_on_explicit_clone() {
     use std::sync::Arc;
 
@@ -606,4 +653,69 @@ fn semantic_and_namespace_errors_do_not_echo_secrets_in_any_rendering() {
         .expect("namespace");
     assert!(!format!("{input:?}").contains("secret-namespace"));
     assert!(!format!("{:?}", input.namespace()).contains("secret-namespace"));
+}
+
+#[test]
+fn access_headers_are_bounded_shared_and_redacted_without_becoming_provider_configuration() {
+    let input = Input::parse("https://example.test/file")
+        .expect("reference")
+        .header("Authorization", "Bearer secret-marker")
+        .expect("access")
+        .header("X-Context", "first")
+        .expect("context")
+        .header("x-context", "second")
+        .expect("explicit replacement");
+    assert_eq!(input.request_headers().count(), 2);
+    assert!(!format!("{input:?}").contains("secret-marker"));
+    let duplicate = input.duplicate_reference().expect("repeatable access");
+    assert!(std::sync::Arc::ptr_eq(
+        input.headers.as_ref().expect("headers"),
+        duplicate.headers.as_ref().expect("shared headers")
+    ));
+    assert_eq!(
+        duplicate
+            .request_headers()
+            .next()
+            .expect("authorization")
+            .value(),
+        "Bearer secret-marker"
+    );
+    for reference in [
+        SHARE,
+        "s3://bucket/key",
+        "ipfs://bafyexample/path",
+        "https://github.com/o/r/releases/latest",
+    ] {
+        assert!(matches!(
+            Input::parse(reference)
+                .expect("intent")
+                .header("Authorization", "secret"),
+            Err(super::HeaderError::UnsupportedInput)
+        ));
+    }
+}
+
+#[test]
+fn access_projection_cannot_forward_headers_to_another_origin_or_compete_with_url_auth() {
+    let original = Input::tree("https://example.test/dav/")
+        .expect("root")
+        .header("Authorization", "Bearer secret-marker")
+        .expect("access");
+    let mut member = Input::parse("https://example.test/dav/a").expect("same origin");
+    member
+        .copy_request_headers_from(&original)
+        .expect("scoped projection");
+    assert_eq!(member.request_headers().count(), 1);
+    let mut foreign = Input::parse("https://other.test/dav/a").expect("different origin");
+    assert!(matches!(
+        foreign.copy_request_headers_from(&original),
+        Err(super::HeaderError::OriginChanged)
+    ));
+    assert_eq!(foreign.request_headers().count(), 0);
+    assert!(matches!(
+        Input::parse("https://user:password@example.test/file")
+            .expect("userinfo")
+            .header("Authorization", "secret"),
+        Err(super::HeaderError::ConflictingAuthorization)
+    ));
 }

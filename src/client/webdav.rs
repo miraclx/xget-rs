@@ -224,7 +224,9 @@ impl Address {
         url.set_path(token.as_str());
         // The ephemeral transport request is not the member's public Input or stored binding.
         let serialization = Zeroizing::new(String::from(url));
-        Input::parse(&serialization).map_err(Into::into)
+        let mut access = Input::parse(&serialization)?;
+        access.copy_request_headers_from(input)?;
+        Ok(access)
     }
 
     fn immediate(parent: &str, child: &str) -> bool {

@@ -1601,6 +1601,9 @@ impl RunFailure {
 /// Built-in errors expose only safe typed context, never a bearer reference or unsafe remote name.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Per-input access headers were invalid or crossed their original authority.
+    #[error("request header configuration failed; correct the input access headers")]
+    RequestHeader(#[from] crate::input::HeaderError),
     /// Bounded namespace-aware DAV discovery failure, without remote diagnostic text.
     #[cfg(feature = "webdav")]
     #[error("webdav discovery failed; inspect the typed metadata category")]

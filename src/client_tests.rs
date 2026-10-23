@@ -1,6 +1,7 @@
 //! Actual loopback HTTP fixtures; authored source, not execution evidence.
 #![allow(clippy::expect_used)]
 
+use core::cell::{Cell, RefCell};
 use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::Poll;
@@ -9,6 +10,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use futures::StreamExt as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1680,13 +1682,26 @@ async fn genuinely_empty_exclusion_only_run_creates_no_owned_store_or_payload_ou
     let server = MockServer::start().await;
     path_share_manifest(&server, &[], 1).await;
     let root = Directory::new();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = Capture(&events);
     let report = path_share_client(&server)
         .download(path_share_input())
         .exclude("**")
         .to_directory(root.path())
-        .run()
+        .run_with(&mut observer)
         .await
         .expect("genuine empty no-op");
+    assert_eq!(
+        *events.borrow(),
+        [
+            Observed::Started {
+                run: None,
+                saved: None,
+                files: 0
+            },
+            Observed::Completed(0),
+        ]
+    );
     assert_eq!(report.completed().len(), 0);
     assert!(report.saved_run().is_none());
     assert_eq!(
@@ -1881,4 +1896,344 @@ impl Drop for Directory {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).expect("remove only this fixture's uniquely created directory");
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Observed {
+    Started {
+        run: Option<super::RunId>,
+        saved: Option<PathBuf>,
+        files: usize,
+    },
+    File {
+        key: super::BindingKey,
+        destination: PathBuf,
+    },
+    Progress {
+        key: super::BindingKey,
+        facts: super::ProgressFacts,
+    },
+    Published {
+        key: super::BindingKey,
+        written: crate::transfer::ByteCount,
+    },
+    Completed(usize),
+    Failed,
+}
+
+pub(super) struct Capture<'a>(pub(super) &'a Rc<RefCell<Vec<Observed>>>);
+
+impl super::Observer for Capture<'_> {
+    fn observe(&mut self, event: super::Event<'_>) {
+        let event = match event {
+            super::Event::RunStarted {
+                run,
+                saved_run,
+                files,
+            } => {
+                if let Some(path) = saved_run {
+                    assert!(
+                        path.is_dir(),
+                        "run starts only after acquiring its saved workspace"
+                    );
+                }
+                Observed::Started {
+                    run,
+                    saved: saved_run.map(Path::to_path_buf),
+                    files,
+                }
+            }
+            super::Event::FileStarted { key, planned } => Observed::File {
+                key,
+                destination: planned.destination().to_path_buf(),
+            },
+            super::Event::Progress { key, facts } => Observed::Progress { key, facts },
+            super::Event::FileCompleted { key, published } => Observed::Published {
+                key,
+                written: published.receipt().partial().written,
+            },
+            super::Event::RunCompleted { report } => Observed::Completed(report.completed().len()),
+            super::Event::RunFailed { .. } => Observed::Failed,
+        };
+        self.0.borrow_mut().push(event);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn borrowed_local_observers_see_frozen_http_work_and_exact_nohash_progress_in_order() {
+    use crate::transfer::ByteCount;
+    for execute_plan in [false, true] {
+        let root = Directory::new();
+        let server = MockServer::start().await;
+        let reference = exact(&server, "/observed").await;
+        let client = Client::new().expect("client");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut observer = Capture(&events);
+        let download = client
+            .download(reference.as_str())
+            .measurement(Measurement::None)
+            .to_file(root.path().join("payload"));
+        let report = if execute_plan {
+            client
+                .execute_with(download.plan().await.expect("plan"), &mut observer)
+                .await
+        } else {
+            download.run_with(&mut observer).await
+        }
+        .expect("observed publication");
+        let payload_gets = get_count(&server).await;
+        let events = events.borrow();
+        let key = report
+            .bound_completed()
+            .expect("saved context")
+            .next()
+            .expect("file")
+            .0;
+        assert_eq!(
+            events.first(),
+            Some(&Observed::Started {
+                run: report.run_id(),
+                saved: report.saved_run().map(Path::to_path_buf),
+                files: 1,
+            })
+        );
+        assert_eq!(
+            events.get(1),
+            Some(&Observed::File {
+                key,
+                destination: report
+                    .completed()
+                    .next()
+                    .expect("published file")
+                    .destination()
+                    .to_path_buf(),
+            })
+        );
+        assert!(events.iter().any(|event| matches!(event, Observed::Progress { key: actual, facts }
+            if *actual == key && facts.received() == ByteCount(3) && facts.written() == ByteCount(3)
+                && facts.attempt_received() == ByteCount(3) && facts.attempt_written() == ByteCount(3))));
+        for event in events.iter() {
+            if let Observed::Progress { key: actual, facts } = event {
+                assert_eq!(*actual, key);
+                assert_eq!(facts.hashed(), ByteCount(0));
+                assert_eq!(facts.restored(), ByteCount(0));
+            }
+        }
+        assert_eq!(
+            events.get(events.len() - 2),
+            Some(&Observed::Published {
+                key,
+                written: ByteCount(3)
+            })
+        );
+        assert_eq!(events.last(), Some(&Observed::Completed(1)));
+        assert!(!events.contains(&Observed::Failed));
+        assert_eq!(payload_gets, 1);
+    }
+}
+
+#[tokio::test]
+async fn setup_failures_emit_one_typed_failure_without_started_or_completed_events() {
+    let client = Client::new().expect("client");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = Capture(&events);
+    let failure = client
+        .download("not a supported reference")
+        .run_with(&mut observer)
+        .await
+        .expect_err("invalid input");
+    assert_eq!(failure.report.completed().len(), 0);
+    assert_eq!(*events.borrow(), [Observed::Failed]);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_check_failure_emits_progress_but_no_spurious_file_or_run_completion() {
+    let root = Directory::new();
+    let server = MockServer::start().await;
+    let reference = exact(&server, "/bad-check").await;
+    let client = Client::new().expect("client");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = Capture(&events);
+    let wrong: Digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        .parse()
+        .expect("digest");
+    let failure = client
+        .download(reference.as_str())
+        .expect(wrong)
+        .to_file(root.path().join("payload"))
+        .run_with(&mut observer)
+        .await
+        .expect_err("mismatch");
+    assert!(matches!(failure.error, Error::Transfer(_)));
+    let events = events.borrow();
+    assert_eq!(events.last(), Some(&Observed::Failed));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Observed::Failed))
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| matches!(event, Observed::Progress { facts, .. } if facts.hashed() == crate::transfer::ByteCount(3))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Observed::Published { .. } | Observed::Completed(_)))
+    );
+    assert!(!root.path().join("payload").exists());
+}
+
+#[test]
+fn default_and_send_but_not_sync_observed_client_futures_remain_send() {
+    struct SendObservation(Cell<usize>);
+    impl super::Observer for SendObservation {
+        fn observe(&mut self, _: super::Event<'_>) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+    fn needs_send(_: impl Send) {}
+    let client = Client::new().expect("client");
+    let mut observer = SendObservation(Cell::new(0));
+    needs_send(client.download("https://example.test/payload").run());
+    needs_send(
+        client
+            .download("https://example.test/payload")
+            .run_with(&mut observer),
+    );
+    fn execute_send(client: &Client, plan: super::Plan) {
+        let mut observer = SendObservation(Cell::new(0));
+        needs_send(client.execute_with(plan, &mut observer));
+    }
+    fn resume_send(client: &Client, saved: super::SavedRun) {
+        let mut observer = SendObservation(Cell::new(0));
+        needs_send(client.resume(saved).run_with(&mut observer));
+    }
+    let _checks = (execute_send, resume_send);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn observed_received_length_is_not_eof_and_drop_does_not_emit_a_terminal_event() {
+    struct PrefixObservation<'a> {
+        capture: Capture<'a>,
+        written: &'a tokio::sync::Notify,
+    }
+    impl super::Observer for PrefixObservation<'_> {
+        fn observe(&mut self, event: super::Event<'_>) {
+            if matches!(&event, super::Event::Progress { facts, .. }
+                if facts.written() == crate::transfer::ByteCount(3))
+            {
+                self.written.notify_one();
+            }
+            super::Observer::observe(&mut self.capture, event);
+        }
+    }
+    for abrupt in [false, true] {
+        let directory = Directory::new();
+        let mut endpoint = Endpoint::late().await;
+        let client = Client::new().expect("client");
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let written = tokio::sync::Notify::new();
+        let mut observer = PrefixObservation {
+            capture: Capture(&events),
+            written: &written,
+        };
+        let output = directory.path().join("payload");
+        let mut run = Box::pin(
+            client
+                .download(endpoint.reference.as_str())
+                .to_file(&output)
+                .run_with(&mut observer),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut run => panic!("clean EOF has not arrived: {result:?}"),
+                () = written.notified() => {}
+            }
+        })
+        .await
+        .expect("settled prefix event");
+        assert!(!events.borrow().iter().any(|event| matches!(
+            event,
+            Observed::Published { .. } | Observed::Completed(_) | Observed::Failed
+        )));
+        if abrupt {
+            drop(run);
+            let count = events.borrow().len();
+            endpoint.release();
+            endpoint.settle().await;
+            assert_eq!(events.borrow().len(), count);
+        } else {
+            endpoint.release();
+            let failure = run.await.expect_err("late body error");
+            assert!(matches!(failure.error, Error::Transfer(_)));
+            endpoint.settle().await;
+            assert_eq!(events.borrow().last(), Some(&Observed::Failed));
+        }
+        assert!(!output.exists());
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, Observed::Published { .. } | Observed::Completed(_)))
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn multiple_files_emit_distinct_frozen_keys_and_one_terminal_event() {
+    let directory = Directory::new();
+    let server = MockServer::start().await;
+    let first = exact(&server, "/one").await;
+    let second = exact(&server, "/two").await;
+    let client = Client::new().expect("client");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = Capture(&events);
+    let report = client
+        .download_all([first.as_str(), second.as_str()])
+        .to_directory(directory.path())
+        .run_with(&mut observer)
+        .await
+        .expect("two publications");
+    let keys: Vec<_> = report
+        .bound_completed()
+        .expect("saved context")
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert_ne!(keys[0], keys[1]);
+    let payload_gets = get_count(&server).await;
+    let events = events.borrow();
+    assert!(matches!(
+        events.first(),
+        Some(Observed::Started { files: 2, .. })
+    ));
+    let started: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Observed::File { key, .. } => Some(*key),
+            _ => None,
+        })
+        .collect();
+    let completed: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Observed::Published { key, .. } => Some(*key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, keys);
+    assert_eq!(completed, keys);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Observed::Completed(_) | Observed::Failed))
+            .count(),
+        1
+    );
+    assert_eq!(events.last(), Some(&Observed::Completed(2)));
+    assert_eq!(payload_gets, 2);
 }

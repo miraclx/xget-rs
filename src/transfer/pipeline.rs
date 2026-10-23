@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 
 use super::native::{Native, NativeError};
+use super::observation::{Observation, Observer};
 use super::{ByteCount, Failure, FailureKind, Length, Partial, Receipt, StateRef, WriteExtent};
 use crate::checks::Checks;
 
@@ -16,15 +17,38 @@ pub(super) struct Run {
 }
 
 impl Run {
+    // Native fault fixtures enter the same pipeline after installing physical-operation barriers.
+    #[cfg(all(test, unix))]
     pub(super) async fn execute<B, E, S>(self, body: B, stop: S) -> Result<Receipt, Box<Failure<E>>>
     where
         B: Stream<Item = Result<Bytes, E>>,
         S: Future<Output = ()>,
     {
+        let mut observer = ();
+        let mut observation = Observation::start(&mut observer, self.length);
+        let result = self.execute_observed(body, stop, &mut observation).await;
+        observation.emit();
+        result
+    }
+
+    pub(super) async fn execute_observed<B, E, S, O>(
+        self,
+        body: B,
+        stop: S,
+        observation: &mut Observation<'_, O>,
+    ) -> Result<Receipt, Box<Failure<E>>>
+    where
+        B: Stream<Item = Result<Bytes, E>>,
+        S: Future<Output = ()>,
+        O: Observer,
+    {
         let mut partial = Partial::default();
         let mut stop = pin!(stop);
         // The consuming helper drops the body before sealing/publication; no detached body pump exists.
-        let outcome = match self.receive(body, stop.as_mut(), &mut partial).await {
+        let outcome = match self
+            .receive(body, stop.as_mut(), &mut partial, observation)
+            .await
+        {
             Ok(checks) => match self.native.seal(partial.written).await {
                 Ok(()) => tokio::select! {
                     biased;
@@ -76,15 +100,17 @@ impl Run {
         Ok(Receipt::completed(partial, results, self.state))
     }
 
-    async fn receive<B, E, S>(
+    async fn receive<B, E, S, O>(
         &self,
         body: B,
         mut stop: Pin<&mut S>,
         partial: &mut Partial,
+        observation: &mut Observation<'_, O>,
     ) -> Result<Checks, FailureKind<E>>
     where
         B: Stream<Item = Result<Bytes, E>>,
         S: Future<Output = ()>,
+        O: Observer,
     {
         let mut body = pin!(body);
         let mut checks = self.native.policy().start();
@@ -107,6 +133,7 @@ impl Run {
                     .checked_add(chunk.len() as u64)
                     .ok_or(FailureKind::LengthOverflow)?,
             );
+            observation.update(partial, ByteCount(0));
             if let Length::Known(expected) = self.length
                 && partial.received > expected
             {
@@ -145,9 +172,11 @@ impl Run {
                         } else {
                             partial.write_extent = WriteExtent::Unconfirmed;
                         }
+                        observation.update(partial, ByteCount(0));
                         return Err(error.error.into_kind());
                     }
                 }
+                observation.update(partial, ByteCount(0));
                 offset = end;
             }
         }

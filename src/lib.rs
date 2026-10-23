@@ -8,6 +8,9 @@
 //! unique matching unfinished run before new discovery. Whole-response members open fresh bodies;
 //! eligible exact-HTTP range members revalidate a recorded strong prefix and fetch only the suffix.
 //! Restart and overwrite are not implemented by this Client.
+//! Borrow [`client::Observer`] through [`client::Download::run_with`], [`Client::execute_with`] or
+//! [`client::Resume::run_with`] for caller-task metadata, progress and outcome events without a
+//! reporting task or a static observer. Unobserved methods use the same coordinator with `()`.
 //!
 //! Use [`Transfer`] for an already-open application body, either checked native publication or
 //! [`transfer::live`] delivery to an application-owned consumer/writer. [`Transfer::from_reader`] accepts

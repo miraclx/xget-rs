@@ -1,11 +1,13 @@
 //! Authored source fixtures only. The source-author session does not execute these tests.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, oneshot};
@@ -13,6 +15,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{AttemptStatus, Fingerprint, Fresh, Owned, STORE, SavedError, SavedRun, codec, disk};
+use crate::client::tests::{Capture, Observed};
 use crate::client::{Client, Error};
 use crate::transfer::{Algorithm, FailureKind, Measurement, lease_directory};
 
@@ -168,13 +171,16 @@ async fn frozen_pattern_binding_rejects_changed_intent_and_reenters_without_chan
         .expect(1)
         .mount(&server)
         .await;
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = Capture(&events);
     let failure = client
         .resume(saved)
         .input(key, reference.as_str())
-        .run()
+        .run_with(&mut observer)
         .await
         .unwrap_err();
     assert!(matches!(failure.error, Error::Saved(SavedError::Binding)));
+    assert_eq!(*events.borrow(), [Observed::Failed]);
     let changed = crate::Input::parse(&reference)
         .unwrap()
         .include("**")
@@ -932,7 +938,22 @@ async fn reader_publication_receipt_and_statistics_survive_a_real_completion_che
         .await
         .unwrap();
     owned.before_completed_checkpoint = Some(exchange_state_role);
-    let failure = client.execute_owned(plan, owned).await.unwrap_err();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = Capture(&events);
+    let failure = client
+        .execute_owned(plan, owned, &mut observer)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(events.borrow().last(), Some(Observed::Published { written, .. })
+        if *written == crate::transfer::ByteCount(3))
+    );
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, Observed::Completed(_)))
+    );
     assert!(matches!(failure.error, Error::Saved(SavedError::Corrupt)));
     let published = failure.report.completed().next().unwrap();
     assert_eq!(
@@ -946,12 +967,38 @@ async fn reader_publication_receipt_and_statistics_survive_a_real_completion_che
     fs::rename(path.join("last-valid"), path.join("state")).unwrap();
     let saved = SavedRun::inspect(path).await.unwrap();
     let key = saved.members().next().unwrap().key();
+    let resumed_events = Rc::new(RefCell::new(Vec::new()));
+    let mut resumed_observer = Capture(&resumed_events);
     let report = client
         .resume(saved)
         .input(key, reference.as_str())
-        .run()
+        .run_with(&mut resumed_observer)
         .await
         .unwrap();
+    assert!(matches!(
+        resumed_events.borrow().first(),
+        Some(Observed::Started {
+            run: Some(_),
+            files: 1,
+            ..
+        })
+    ));
+    assert!(
+        matches!(resumed_events.borrow().get(1), Some(Observed::File { key: actual, .. }) if *actual == key)
+    );
+    assert!(
+        matches!(resumed_events.borrow().get(2), Some(Observed::Published { key: actual, .. }) if *actual == key)
+    );
+    assert_eq!(
+        resumed_events.borrow().last(),
+        Some(&Observed::Completed(1))
+    );
+    assert!(
+        !resumed_events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, Observed::Progress { .. } | Observed::Failed))
+    );
     let reconciled = report.completed().next().unwrap();
     assert_eq!(reconciled.receipt().state().path(), native_state);
     assert!(reconciled.range_stats().is_none());
@@ -980,7 +1027,22 @@ async fn a_real_checkpoint_role_failure_after_publication_retains_the_partial_re
         .await
         .unwrap();
     owned.before_completed_checkpoint = Some(exchange_state_role);
-    let failure = client.execute_owned(plan, owned).await.unwrap_err();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = Capture(&events);
+    let failure = client
+        .execute_owned(plan, owned, &mut observer)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(events.borrow().last(), Some(Observed::Published { written, .. })
+        if *written == crate::transfer::ByteCount(3))
+    );
+    assert!(
+        !events
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, Observed::Completed(_)))
+    );
     assert!(matches!(failure.error, Error::Saved(SavedError::Corrupt)));
     assert_eq!(failure.report.completed().len(), 1);
     assert_eq!(fs::read(&destination).unwrap(), b"abc");
@@ -1055,7 +1117,10 @@ async fn reconciled_publication_enters_the_partial_report_before_a_real_checkpoi
     // after ownership, without changing or mocking native revalidation or manufacturing an error.
     fs::rename(path.join("state"), path.join("last-valid")).unwrap();
     fs::create_dir(path.join("state")).unwrap();
-    let failure = client.execute_owned(plan, owned).await.unwrap_err();
+    let failure = client
+        .execute_owned(plan, owned, &mut ())
+        .await
+        .unwrap_err();
     assert!(matches!(failure.error, Error::Saved(SavedError::Corrupt)));
     assert_eq!(failure.report.completed().len(), 1);
     let acknowledged = failure.report.completed().next().unwrap();
@@ -1138,7 +1203,12 @@ async fn a_competing_unfinished_request_between_lookup_and_admission_refuses_the
         .unwrap_err();
     let actual_path = competitor.report.saved_run().unwrap();
     let failure = client
-        .execute_with_request(stale, Some(request), crate::client::Reentry::Continue)
+        .execute_with_request(
+            stale,
+            Some(request),
+            crate::client::Reentry::Continue,
+            &mut (),
+        )
         .await
         .unwrap_err();
     match failure.error {
@@ -1775,4 +1845,71 @@ fn native_owned_http_run_and_resume_futures_are_send() {
         send(client.resume(saved).run());
     }
     let _check = resume_send;
+}
+
+#[tokio::test]
+async fn public_observed_publication_then_checkpoint_role_failure_emits_one_terminal_failure() {
+    struct ExchangeOnPublication<'a> {
+        capture: Capture<'a>,
+        saved: Option<PathBuf>,
+    }
+    impl crate::client::Observer for ExchangeOnPublication<'_> {
+        fn observe(&mut self, event: crate::client::Event<'_>) {
+            match &event {
+                crate::client::Event::RunStarted {
+                    saved_run: Some(path),
+                    ..
+                } => {
+                    self.saved = Some(path.to_path_buf());
+                }
+                crate::client::Event::FileCompleted { published, .. } => {
+                    // Exercise the public callback after an actual publication, not a synthetic
+                    // failure result or an unreturned private-coordinator receipt.
+                    assert_eq!(fs::read(published.destination()).unwrap(), b"abc");
+                    let saved = self.saved.as_ref().unwrap();
+                    fs::rename(saved.join("state"), saved.join("last-valid")).unwrap();
+                    fs::create_dir(saved.join("state")).unwrap();
+                }
+                _ => {}
+            }
+            crate::client::Observer::observe(&mut self.capture, event);
+        }
+    }
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let reference = exact(&server, "/payload").await;
+    let client = Client::new().unwrap();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = ExchangeOnPublication {
+        capture: Capture(&events),
+        saved: None,
+    };
+    let failure = client
+        .download(reference.as_str())
+        .to_directory(root.path())
+        .run_with(&mut observer)
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::Saved(SavedError::Corrupt)));
+    assert_eq!(failure.report.completed().len(), 1);
+    assert_eq!(fs::read(root.path().join("payload")).unwrap(), b"abc");
+    assert_eq!(count(&server, "GET").await, 1);
+    let events = events.borrow();
+    assert!(
+        matches!(events.get(events.len() - 2), Some(Observed::Published { written, .. })
+        if *written == crate::transfer::ByteCount(3))
+    );
+    assert_eq!(events.last(), Some(&Observed::Failed));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Observed::Failed))
+            .count(),
+        1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Observed::Completed(_)))
+    );
 }

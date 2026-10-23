@@ -344,6 +344,25 @@ impl<'a> Resume<'a> {
     /// See [ownership and cancellation](Resume#ownership-and-cancellation) for Busy after drop,
     /// publication without a returned receipt, and how to retain the actual recovery path.
     pub async fn run(self) -> Result<Report, Box<RunFailure>> {
+        self.run_with(&mut ()).await
+    }
+
+    /// Continues frozen work with synchronous borrowed caller-task events.
+    /// Revalidated publications emit completion without inventing current-attempt progress.
+    /// Drop promises no terminal event, successful pause or rollback; see [`super::Observer`].
+    pub async fn run_with<O: super::Observer>(
+        self,
+        observer: &mut O,
+    ) -> Result<Report, Box<RunFailure>> {
+        let result = self.run_observed(observer).await;
+        observer.observe(super::Event::returned(&result));
+        result
+    }
+
+    pub(super) async fn run_observed<O: super::Observer>(
+        self,
+        observer: &mut O,
+    ) -> Result<Report, Box<RunFailure>> {
         let Self {
             client,
             saved,
@@ -379,7 +398,7 @@ impl<'a> Resume<'a> {
         }
         .await;
         match result {
-            Ok((owned, plan)) => client.execute_owned(plan, owned).await,
+            Ok((owned, plan)) => client.execute_owned(plan, owned, observer).await,
             Err(error) => Err(Box::new(RunFailure {
                 error: Error::Saved(error),
                 report: Report {

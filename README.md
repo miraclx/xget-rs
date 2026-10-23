@@ -172,6 +172,48 @@ a `-` output's payload stays on stdout.
 
 Depend on the root `xget` package; `xget-cli` is not needed for library use.
 
+### Borrowed Client observers
+
+`client::Download::run_with`, `Client::execute_with` and `client::Resume::run_with` accept a
+mutable, borrowed `client::Observer`. Callbacks run synchronously on the executing task, so an
+observer can borrow local state without `Send`, `Sync`, `Clone` or `'static` bounds:
+
+```rust
+use xget::{Client, client::{Event, Observer}};
+
+struct CountFiles<'a>(&'a mut usize);
+impl Observer for CountFiles<'_> {
+    fn observe(&mut self, event: Event<'_>) {
+        if let Event::FileCompleted { .. } = event {
+            *self.0 += 1;
+        }
+    }
+}
+
+# async fn example() -> Result<(), Box<dyn core::error::Error>> {
+let client = Client::new()?;
+let mut completed = 0;
+let mut observer = CountFiles(&mut completed);
+let report = client.download("https://example.org/file.bin")
+    .to_file("file.bin").run_with(&mut observer).await?;
+assert_eq!(completed, report.completed().len());
+# Ok(())
+# }
+```
+
+Events distinguish frozen run/file metadata, byte-work facts, individual acknowledged publications,
+and the returned run outcome. `ProgressFacts` separates logical received/written/hashed bytes from
+validated restored bytes and current-attempt source/write counts. Hash counts are zero when no
+checks are active; counts reaching a length do not prove clean EOF, matched checks or publication.
+Revalidated prior publications emit completion without invented attempt progress. A file completion
+can precede an aggregate checkpoint failure, so use the terminal result to judge the whole run.
+
+Callbacks must return promptly; slow callbacks delay execution. There is no reporting worker or event
+queue. Dropping the future promises neither a terminal callback nor rollback or a successful pause;
+submitted native work retains its ownership until settlement. Metadata paths and names need the
+caller's own escaping/redaction policy. Existing `run` and `execute` methods follow the same path
+with a no-op `()` observer. This library API does not change the legacy CLI reporter or live opening.
+
 ### Ordinary exact HTTP downloads
 
 A reusable `Client` resolves advisory metadata, freezes output assignments, then executes through the

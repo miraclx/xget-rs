@@ -430,6 +430,92 @@ async fn automatic_reentry_maps_one_share_to_many_frozen_members_without_manifes
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_completed_swiss_first_pin_resumes_as_local_revalidation_without_remote_requests() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let server = MockServer::start().await;
+    manifest(&server, SHARE, &[(FILE_A, "one", 3)]).await;
+    access(&server, SHARE, FILE_A, "a", 1).await;
+    object(&server, "a", b"abc", 1).await;
+    let root = Directory::new();
+    let client = client(&server);
+    let required = ABC.parse::<Digest>().unwrap();
+    let first = client
+        .download(reference(SHARE))
+        .expect(required)
+        .measurement(Measurement::None)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(first.completed().len(), 1);
+    let original = first.completed().next().unwrap();
+    assert_eq!(
+        original.version(),
+        VersionConsistency::StrongEtagEstablished
+    );
+    assert_eq!(
+        original.file().version(),
+        crate::inventory::VersionEvidence::StrongEtag
+    );
+    assert_eq!(fs::read(original.destination()).unwrap(), b"abc");
+    let identity = fs::metadata(original.destination()).unwrap();
+    let saved = SavedRun::inspect(first.saved_run().unwrap()).await.unwrap();
+    assert!(saved.is_complete());
+    let member = saved.members().next().unwrap();
+    assert_eq!(
+        member.version(),
+        crate::inventory::VersionEvidence::StrongEtag
+    );
+    assert_eq!(member.attempts().len(), 1);
+    let key = member.key();
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    server.verify().await;
+    server.reset().await;
+    access(&server, SHARE, FILE_A, "a", 0).await;
+    object(&server, "a", b"abc", 0).await;
+
+    let report = client
+        .resume(saved)
+        .input(key, reference(SHARE))
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(report.completed().len(), 1);
+    let reconciled = report.completed().next().unwrap();
+    assert_eq!(reconciled.version(), VersionConsistency::LocallyRevalidated);
+    assert_ne!(reconciled.version(), VersionConsistency::StrongEtagMatched);
+    assert_eq!(
+        reconciled.file().version(),
+        crate::inventory::VersionEvidence::StrongEtag
+    );
+    assert_eq!(
+        reconciled.receipt().state().path(),
+        original.receipt().state().path()
+    );
+    assert_eq!(
+        reconciled
+            .receipt()
+            .checks()
+            .matched_requirements()
+            .next()
+            .unwrap()
+            .digest,
+        required
+    );
+    assert!(reconciled.receipt().checks().measured().is_none());
+    assert!(reconciled.range_stats().is_none());
+    assert_eq!(fs::read(reconciled.destination()).unwrap(), b"abc");
+    let revalidated = fs::metadata(reconciled.destination()).unwrap();
+    assert_eq!(
+        (revalidated.dev(), revalidated.ino()),
+        (identity.dev(), identity.ino())
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn a_known_version_change_cannot_be_overridden_by_an_expected_digest_on_frozen_rebind() {
     let server = MockServer::start().await;
     manifest(&server, SHARE, &[(FILE_A, "one", 3)]).await;

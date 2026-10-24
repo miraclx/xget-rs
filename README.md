@@ -165,8 +165,46 @@ is milliseconds. `--bits` and `--raw-sizes` affect human output only and do not 
 
 ## Library usage
 
-Depend on the root `xget` package; `xget-cli` is not needed for library use. The existing
-`get(url)` / `from(source)` API remains available. Start with `get(url)` and finish with `.write(output)`:
+Depend on the root `xget` package; `xget-cli` is not needed for library use.
+
+### Ordinary exact HTTP downloads
+
+A reusable `Client` resolves advisory metadata, freezes output assignments, then executes through the
+checked native publication path:
+
+```rust
+use xget::Client;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn core::error::Error>> {
+    let client = Client::new()?;
+    let report = client.download("https://example.org/file.bin")
+        .to_file("file.bin")
+        .run().await?;
+    assert_eq!(report.completed().len(), 1);
+    Ok(())
+}
+```
+
+The destination must be absent in a suitable existing caller-owned parent directory. Supply a digest
+with `.expect(digest)` when the caller has a whole-file requirement; optional SHA-256 measurement alone
+is not an expected-content check. `download_all(inputs).to_directory(path)` plans multiple exact inputs,
+and `.plan().await` exposes frozen read-only assignments before `client.execute(plan).await`. Planning
+uses HEAD, never a preview payload GET, and creates no output directories.
+
+This first ordinary Client supports exact HTTP inputs and serial files, not provider collections,
+trees, parallel ranges, aggregate resume or overwrite. Unsupported inputs fail explicitly. Redirects,
+automatic retries, content decompression and ambient proxies are disabled. Clones share request/body
+admission and connection reuse. Each request has a fixed 15-second deadline for admission waiting,
+connection and headers together, but no payload/inactivity timeout. Retained open bodies can exhaust
+admission; drop or consume them to release capacity. Use a caller-owned Tokio runtime with I/O and
+time enabled. See the [`client` module](src/client.rs) for selection, version and failure contracts. The CLI still uses the
+legacy engine below; its feature flags do not enable new Client provider adapters.
+
+### Existing parallel/resumable API
+
+The existing `get(url)` / `from(source)` API remains available. Start with `get(url)` and finish with
+`.write(output)`:
 
 ```rust
 use std::path::Path;

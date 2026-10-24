@@ -1,0 +1,253 @@
+//! Complete bounded metadata and selected-file provenance, without transport or filesystem effects.
+
+use core::fmt;
+use std::sync::Arc;
+
+use zeroize::Zeroizing;
+
+use crate::checks::Requirements;
+use crate::input::{Input, Namespace};
+use crate::transfer::{Length, Requirement};
+
+#[cfg(test)]
+#[path = "inventory_tests.rs"]
+mod tests;
+
+pub(crate) const MAX_FILES: usize = 128;
+pub(crate) const MAX_METADATA_BYTES: usize = 1024 * 1024;
+
+/// A complete finite inventory. An incomplete discovery cannot construct this value.
+///
+/// The first HTTP adapter returns one exact file. Empty values remain distinct from invalid input;
+/// this type does not invent successful empty results for unsupported providers.
+pub struct Inventory {
+    files: Vec<File>,
+    metadata_bytes: usize,
+}
+
+impl Inventory {
+    pub(crate) fn complete(files: Vec<File>) -> Result<Self, InventoryError> {
+        let metadata_bytes = files.iter().fold(0_usize, |bytes, file| {
+            bytes.saturating_add(file.retained_bytes())
+        });
+        if files.len() > MAX_FILES || metadata_bytes > MAX_METADATA_BYTES {
+            return Err(InventoryError::Limit);
+        }
+        Ok(Self {
+            files,
+            metadata_bytes,
+        })
+    }
+
+    /// Inspects selected-file metadata without acquiring a payload body.
+    pub fn files(&self) -> impl ExactSizeIterator<Item = &File> {
+        self.files.iter()
+    }
+
+    /// Consumes the complete inventory, preserving each file's private origin/group context.
+    pub fn into_files(self) -> impl ExactSizeIterator<Item = File> {
+        self.files.into_iter()
+    }
+
+    /// Selects exactly one matching file; neither zero nor multiple matches picks an arbitrary row.
+    pub fn select_one(
+        self,
+        mut predicate: impl FnMut(&File) -> bool,
+    ) -> Result<File, SelectionError> {
+        let mut selected = None;
+        for file in self.files {
+            if !predicate(&file) {
+                continue;
+            }
+            if selected.is_some() {
+                return Err(SelectionError::MultipleMatches);
+            }
+            selected = Some(file);
+        }
+        selected.ok_or(SelectionError::NoMatch)
+    }
+
+    /// Accounted retained reference, path, hint and validator bytes, not total process RSS.
+    pub fn metadata_bytes(&self) -> usize {
+        self.metadata_bytes
+    }
+}
+
+impl fmt::Debug for Inventory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Inventory")
+            .field("files", &self.files.len())
+            .field("metadata_bytes", &self.metadata_bytes)
+            .finish()
+    }
+}
+
+/// A selected remote file with its original occurrence and advisory metadata intact.
+///
+/// A file is not Clone. Moving it back into Input preserves its frozen metadata rather than
+/// resolving a mutable reference again. No local output assignment is stored on the remote file.
+pub struct File {
+    pub(crate) input: Input,
+    pub(crate) selected: Selected,
+}
+
+impl File {
+    /// Occurrence-local correlation only, never a repeatable CLI selector or authorization token.
+    pub fn id(&self) -> &FileId {
+        &self.selected.id
+    }
+
+    /// Inventory source-relative path, independent of local naming or output grouping.
+    /// HTTP uses the URL parser's serialized path spelling, not the original full reference.
+    /// This explicit accessor can expose sensitive remote names; default formatting does not.
+    pub fn source_path(&self) -> &str {
+        &self.selected.description.source_path
+    }
+
+    /// Advisory URL-derived readable name, not a validated local filename.
+    pub fn name_hint(&self) -> Option<&str> {
+        self.selected
+            .description
+            .name
+            .as_deref()
+            .map(String::as_str)
+    }
+
+    /// Advisory HEAD length, not an independently pinned representation size.
+    ///
+    /// Execution checks the GET declaration when present. If GET omits it but repeats the enforced
+    /// strong HEAD ETag, the HEAD length remains the effective exact length. See
+    /// [`crate::client::OpenedFile::length`] for the consumed response's effective length.
+    pub fn length(&self) -> Length {
+        self.selected.description.length
+    }
+
+    /// States whether metadata supplied a strong ETag usable for a conditional GET.
+    /// The validator itself is intentionally not a diagnostic/public identity string.
+    pub fn version(&self) -> VersionEvidence {
+        if self.selected.description.etag.is_some() {
+            VersionEvidence::StrongEtag
+        } else {
+            VersionEvidence::Unpinned
+        }
+    }
+
+    /// Input-local grouping, distinct from the remote member path.
+    pub fn namespace(&self) -> Option<&Namespace> {
+        self.input.namespace()
+    }
+
+    /// Required whole-file checks, not optional measurement or version evidence.
+    pub fn requirements(&self) -> impl Iterator<Item = Requirement> {
+        self.selected.description.requirements.iter()
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.input
+            .retained_bytes()
+            .saturating_add(self.selected.description.retained_bytes())
+    }
+}
+
+impl fmt::Debug for File {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("File")
+            .field("reference_and_names", &"[redacted]")
+            .field("length", &self.length())
+            .field("version", &self.version())
+            .finish()
+    }
+}
+
+impl From<File> for Input {
+    fn from(file: File) -> Self {
+        let File {
+            mut input,
+            selected,
+        } = file;
+        input.selected = Some(Box::new(selected));
+        input
+    }
+}
+
+/// An opaque in-memory occurrence identity. Equality does not compare names, references or bytes.
+pub struct FileId(Arc<()>);
+
+impl FileId {
+    pub(crate) fn fresh() -> Self {
+        Self(Arc::new(()))
+    }
+}
+
+impl Clone for FileId {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl PartialEq for FileId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for FileId {}
+
+impl fmt::Debug for FileId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FileId([occurrence-local])")
+    }
+}
+
+/// Available version evidence, not a payload digest or authenticity statement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VersionEvidence {
+    /// A fresh ordered GET has no continuity claim with earlier metadata.
+    Unpinned,
+    /// A strong HEAD ETag must be enforced and repeated by the GET response.
+    StrongEtag,
+}
+
+/// Selection cardinality failures contain no source names or bearer references.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SelectionError {
+    /// No selected member matched the caller's predicate.
+    #[error("selection matched no files; inspect the inventory and choose a matching member")]
+    NoMatch,
+    /// Choosing the first match would silently change requested work.
+    #[error("selection matched multiple files; choose one unambiguous member")]
+    MultipleMatches,
+}
+
+/// A metadata limit produces no executable truncated inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum InventoryError {
+    /// Retained metadata is bounded by both file count and owned text bytes.
+    #[error("inventory exceeds its metadata limit; request a smaller supported scope")]
+    Limit,
+}
+
+pub(crate) struct Selected {
+    pub(crate) id: FileId,
+    pub(crate) description: Description,
+}
+
+// Paths and validators can contain bearer material too, so retained derivatives are also wiped.
+pub(crate) struct Description {
+    pub(crate) source_path: Zeroizing<String>,
+    pub(crate) name: Option<Zeroizing<String>>,
+    pub(crate) length: Length,
+    pub(crate) etag: Option<Zeroizing<String>>,
+    pub(crate) requirements: Requirements,
+}
+
+impl Description {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.source_path
+            .len()
+            .saturating_add(self.name.as_ref().map_or(0, |name| name.len()))
+            .saturating_add(self.etag.as_ref().map_or(0, |etag| etag.len()))
+    }
+}

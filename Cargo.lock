@@ -2883,10 +2883,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-width"
@@ -3237,6 +3252,7 @@ dependencies = [
  "hex",
  "libc",
  "md-5",
+ "percent-encoding",
  "reqwest",
  "sha1",
  "sha2",
@@ -3244,9 +3260,13 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "unicode-casefold",
+ "unicode-normalization",
+ "url",
  "windows-sys 0.59.0",
  "wiremock",
  "xbytes",
+ "zeroize",
 ]
 
 [[package]]

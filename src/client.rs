@@ -1,0 +1,791 @@
+//! Ordinary native HTTP acquisition through the common input, planning and checked publication path.
+//!
+//! Files run serially through the native Transfer implementation. Client clones share only reusable
+//! HTTP connections and bounded request/body admission. This is not the legacy parallel range engine,
+//! a recovery database, or a provider catalogue. Redirects and non-exact/non-HTTP inputs fail explicitly.
+//!
+//! ```no_run
+//! use xget::Client;
+//! use xget::transfer::{Digest, Measurement};
+//!
+//! # async fn example() -> Result<(), Box<dyn core::error::Error>> {
+//! let client = Client::new()?;
+//! let required: Digest =
+//!     "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".parse()?;
+//! let report = client.download("https://example.org/abc.bin")
+//!     .expect(required)
+//!     .measurement(Measurement::None)
+//!     .to_file("abc.bin")
+//!     .run().await?;
+//! assert_eq!(report.completed().len(), 1);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Run asynchronous calls on a caller-owned Tokio runtime with I/O and time drivers enabled.
+//! A missing runtime handle is a typed error; Tokio cannot expose disabled driver capabilities through
+//! Handle inspection, so configuring an active runtime correctly remains the caller's responsibility.
+//! Explicit file parents must already be
+//! suitable caller-owned directories; directory targets create their validated hierarchy at execution.
+//! No preview GET is used when resolving metadata or planning output assignments.
+
+use core::convert::Infallible;
+use core::fmt;
+use core::num::NonZeroUsize;
+use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use crate::checks::Requirements;
+use crate::input::{Input, InputError, InputKind, InputScope};
+use crate::inventory::{
+    File, FileId, Inventory, InventoryError, MAX_FILES, MAX_METADATA_BYTES, Selected,
+};
+pub use crate::transfer::live::{BodyError, BodyFailure, FinishError, Progress as LiveProgress};
+use crate::transfer::{Conflict, Digest, Measurement, Provenance, Receipt, Requirement, Transfer};
+
+mod http;
+mod layout;
+mod live;
+
+use http::Http;
+pub use http::{HttpError, HttpErrorKind, RequestStage};
+pub use live::{CheckedBody, LiveReceipt, OpenedFile};
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;
+
+/// Reusable native HTTP transport and a shared bound on active requests/response bodies.
+///
+/// Construction performs no network discovery and loads no `.env`, proxy or credential profile.
+/// A caller-owned Tokio runtime is required only when performing asynchronous HTTP/native work.
+///
+/// # Request deadlines
+///
+/// Each request has a fixed 15-second deadline covering shared-admission waiting, connection and
+/// response headers together. Retained open bodies can consume all admission slots; drop or finish
+/// consuming them before opening more work. Expiry can occur before any request is sent.
+/// Payload consumption has no total or inactivity timeout. A caller may bound its own consumption
+/// future; dropping it follows the documented body/directory/native-operation ownership rules.
+pub struct Client {
+    http: Arc<Http>,
+}
+
+impl Client {
+    /// Builds a client without issuing requests. The default admits at most four active requests/bodies.
+    pub fn new() -> Result<Self, Error> {
+        Self::builder().build()
+    }
+
+    /// Starts deliberate configuration without discovery or run ownership.
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::default()
+    }
+
+    /// Starts one pending input. Conversion failures remain sticky until plan/run is awaited.
+    pub fn download<T>(&self, input: T) -> Download<'_>
+    where
+        T: TryInto<Input>,
+        T::Error: Into<Error>,
+    {
+        self.download_all(core::iter::once(input))
+    }
+
+    /// Adds requested work, never inferring mirrors or silently merging duplicate occurrences.
+    ///
+    /// Empty input iterators are invalid requests, not manufactured complete empty inventories.
+    /// Input count and retained request metadata are bounded before any metadata request is sent.
+    pub fn download_all<I, T>(&self, inputs: I) -> Download<'_>
+    where
+        I: IntoIterator<Item = T>,
+        T: TryInto<Input>,
+        T::Error: Into<Error>,
+    {
+        let inputs = Self::collect_inputs(inputs);
+        Download {
+            client: self,
+            inputs,
+            target: Target::Default,
+            requirements: Ok(Requirements::default()),
+            measurement: Measurement::default(),
+        }
+    }
+
+    fn collect_inputs<I, T>(inputs: I) -> Result<Vec<Input>, Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: TryInto<Input>,
+        T::Error: Into<Error>,
+    {
+        let mut retained = 0_usize;
+        let mut collected = Vec::new();
+        for input in inputs {
+            if collected.len() == MAX_FILES {
+                return Err(Error::Inventory(InventoryError::Limit));
+            }
+            let input = input.try_into().map_err(Into::into)?;
+            retained = retained.saturating_add(input.retained_bytes());
+            if retained > MAX_METADATA_BYTES {
+                return Err(Error::Inventory(InventoryError::Limit));
+            }
+            collected.push(input);
+        }
+        if collected.is_empty() {
+            return Err(Error::NoInputs);
+        }
+        Ok(collected)
+    }
+
+    /// Resolves bounded advisory metadata with HEAD only, never a preview GET.
+    /// The [request deadline](Client#request-deadlines) includes admission waiting.
+    ///
+    /// Selected Files preserve their frozen metadata. Unsupported providers/trees return errors,
+    /// not fake inventories. HTTP 405/501 leaves a usable exact unpinned reference without probing GET.
+    pub async fn resolve<T>(&self, input: T) -> Result<Inventory, Error>
+    where
+        T: TryInto<Input>,
+        T::Error: Into<Error>,
+    {
+        let file = self
+            .resolve_input(input.try_into().map_err(Into::into)?)
+            .await?;
+        Inventory::complete(vec![file]).map_err(Error::Inventory)
+    }
+
+    async fn resolve_input(&self, mut input: Input) -> Result<File, Error> {
+        Self::supported(&input)?;
+        if input.retained_bytes() > MAX_METADATA_BYTES {
+            return Err(Error::Inventory(InventoryError::Limit));
+        }
+        if let Some(selected) = input.selected.take() {
+            return Ok(File {
+                input,
+                selected: *selected,
+            });
+        }
+        let description = self.http.describe(&input).await?;
+        let file = File {
+            input,
+            selected: Selected {
+                id: FileId::fresh(),
+                description,
+            },
+        };
+        if file.retained_bytes() > MAX_METADATA_BYTES {
+            return Err(Error::Inventory(InventoryError::Limit));
+        }
+        Ok(file)
+    }
+
+    fn supported(input: &Input) -> Result<(), Error> {
+        if input.kind() != InputKind::Http || input.scope() != InputScope::Exact {
+            return Err(Error::UnsupportedInput {
+                kind: input.kind(),
+                scope: input.scope(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Consumes one exact GET response. Opening does not publish or poll payload bytes.
+    /// The [request deadline](Client#request-deadlines) bounds admission/connect/headers, not payload.
+    ///
+    /// The owning body holds request admission until EOF, source failure or drop. A caller that stops
+    /// consuming must drop the opened file/body to release capacity. No hidden reopen occurs.
+    pub async fn open<T>(&self, input: T) -> Result<OpenedFile, Error>
+    where
+        T: TryInto<Input>,
+        T::Error: Into<Error>,
+    {
+        let file = self
+            .resolve_input(input.try_into().map_err(Into::into)?)
+            .await?;
+        let opened = self.http.open(&file).await?;
+        Ok(OpenedFile::new(file, opened))
+    }
+
+    /// Executes frozen assignments serially using actual checked native Transfer publication.
+    ///
+    /// All lexical layout/check conflicts are resolved before this call can issue its first GET.
+    /// Output directories may be created here, never during planning. Existing roots/components
+    /// must be nonsymlink directories owned by the effective user, with owner rwx and no group/other
+    /// write bits. New directories request mode 0700. The caller must control the hierarchy against
+    /// concurrent replacement; these static checks are not a same-user sandbox. Publication is absent-only;
+    /// no overwrite, automatic source reopening or SavedRun persistence is implemented by this client.
+    /// Dropping during directory preparation can leave empty directories and submitted Tokio filesystem
+    /// work settling after drop; there is no high-level pause or directory-settlement receipt.
+    pub async fn execute(&self, plan: Plan) -> Result<Report, Box<RunFailure>> {
+        let mut report = Report::default();
+        if let Err(error) = Http::runtime() {
+            return Err(Box::new(RunFailure {
+                error,
+                report,
+                failed: None,
+            }));
+        }
+        if cfg!(not(unix)) {
+            return Err(Box::new(RunFailure {
+                error: Error::NativeUnsupported,
+                report,
+                failed: None,
+            }));
+        }
+        if let Err(error) = Self::prepare_directories(&plan).await {
+            return Err(Box::new(RunFailure {
+                error,
+                report,
+                failed: None,
+            }));
+        }
+        for PlannedFile {
+            file,
+            destination,
+            requirements,
+            measurement,
+        } in plan.files
+        {
+            let opened = match self.http.open(&file).await {
+                Ok(opened) => opened,
+                Err(error) => {
+                    return Err(Box::new(RunFailure {
+                        error,
+                        report,
+                        failed: Some(PlannedFile {
+                            file,
+                            destination,
+                            requirements,
+                            measurement,
+                        }),
+                    }));
+                }
+            };
+            let version = opened.version;
+            let mut transfer =
+                Transfer::from_body(opened.body, opened.length).measurement(measurement);
+            for requirement in requirements.iter() {
+                for provenance in requirement.origins.iter() {
+                    transfer = transfer.require(requirement.digest, provenance);
+                }
+            }
+            let pending = match transfer.to_file(&destination) {
+                Ok(pending) => pending,
+                Err(cause) => {
+                    return Err(Box::new(RunFailure {
+                        error: Error::NativeRequest(cause),
+                        report,
+                        failed: Some(PlannedFile {
+                            file,
+                            destination,
+                            requirements,
+                            measurement,
+                        }),
+                    }));
+                }
+            };
+            match pending.run().await {
+                Ok(receipt) => report.completed.push(PublishedFile {
+                    file,
+                    destination,
+                    version,
+                    receipt,
+                }),
+                Err(failure) => {
+                    return Err(Box::new(RunFailure {
+                        error: Error::Transfer(failure),
+                        report,
+                        failed: Some(PlannedFile {
+                            file,
+                            destination,
+                            requirements,
+                            measurement,
+                        }),
+                    }));
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn prepare_directories(plan: &Plan) -> Result<(), Error> {
+        let Some(root) = &plan.directory_root else {
+            for file in &plan.files {
+                let parent = file
+                    .destination
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let metadata = tokio::fs::symlink_metadata(parent)
+                    .await
+                    .map_err(Error::Directory)?;
+                Self::directory_kind(&metadata)?;
+            }
+            return Ok(());
+        };
+        match tokio::fs::symlink_metadata(root).await {
+            Ok(metadata) => Self::directory_kind(&metadata)?,
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
+                // The explicit root is caller authority. Only namespace components below it are
+                // untrusted relative assignments, and those are created one checked component at a time.
+                let mut builder = tokio::fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)]
+                builder.mode(0o700);
+                builder.create(root).await.map_err(Error::Directory)?;
+                let metadata = tokio::fs::symlink_metadata(root)
+                    .await
+                    .map_err(Error::Directory)?;
+                Self::directory_kind(&metadata)?;
+            }
+            Err(cause) => return Err(Error::Directory(cause)),
+        }
+        for directory in &plan.directories {
+            let relative = directory
+                .strip_prefix(root)
+                .map_err(|_| Error::UnsafeDirectory)?;
+            let mut prefix = PathBuf::clone(root);
+            for component in relative.components() {
+                let Component::Normal(component) = component else {
+                    return Err(Error::UnsafeDirectory);
+                };
+                prefix.push(component);
+                match tokio::fs::symlink_metadata(&prefix).await {
+                    Ok(metadata) => Self::directory_kind(&metadata)?,
+                    Err(cause) if cause.kind() == io::ErrorKind::NotFound => {
+                        let mut builder = tokio::fs::DirBuilder::new();
+                        builder.recursive(false);
+                        #[cfg(unix)]
+                        builder.mode(0o700);
+                        match builder.create(&prefix).await {
+                            Ok(()) => {}
+                            Err(cause) if cause.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(cause) => return Err(Error::Directory(cause)),
+                        }
+                        let metadata = tokio::fs::symlink_metadata(&prefix)
+                            .await
+                            .map_err(Error::Directory)?;
+                        Self::directory_kind(&metadata)?;
+                    }
+                    Err(cause) => return Err(Error::Directory(cause)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn directory_kind(metadata: &std::fs::Metadata) -> Result<(), Error> {
+        if !metadata.file_type().is_dir() {
+            return Err(Error::UnsafeDirectory);
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: geteuid reads process identity and takes no pointers or resources.
+            let uid = unsafe { libc::geteuid() };
+            if metadata.uid() != uid
+                || metadata.mode() & 0o022 != 0
+                || metadata.mode() & 0o700 != 0o700
+            {
+                return Err(Error::UnsafeDirectory);
+            }
+        }
+        // These preflight checks refuse existing symlink roles. The caller must still control the
+        // hierarchy against concurrent replacement; this is not a descriptor-anchored sandbox.
+        Ok(())
+    }
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Self {
+            http: Arc::clone(&self.http),
+        }
+    }
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Client([shared http pool and admission])")
+    }
+}
+
+/// Deliberate shared request/body capacity configuration, not a process-global scheduler.
+#[must_use]
+pub struct ClientBuilder {
+    max_requests: NonZeroUsize,
+}
+
+impl Default for ClientBuilder {
+    fn default() -> Self {
+        Self {
+            max_requests: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
+        }
+    }
+}
+
+impl ClientBuilder {
+    /// Caps active metadata/control requests and open payload bodies together across clones.
+    /// Waiting for capacity uses the same 15-second deadline as connection and headers;
+    /// see [request deadlines](Client#request-deadlines). This does not add a payload timeout.
+    pub fn max_requests(mut self, maximum: NonZeroUsize) -> Self {
+        self.max_requests = maximum;
+        self
+    }
+
+    /// Builds reusable transports without network or filesystem effects.
+    pub fn build(self) -> Result<Client, Error> {
+        let http = Http::new(self.max_requests)?;
+        Ok(Client {
+            http: Arc::new(http),
+        })
+    }
+}
+
+/// Pending request configuration, separate from the legacy root Download engine.
+#[must_use]
+pub struct Download<'a> {
+    client: &'a Client,
+    inputs: Result<Vec<Input>, Error>,
+    target: Target,
+    requirements: Result<Requirements, Box<Conflict>>,
+    measurement: Measurement,
+}
+
+impl Download<'_> {
+    /// Asserts exactly one selected file and explicit native output name.
+    pub fn to_file(mut self, destination: impl AsRef<Path>) -> Self {
+        self.target = Target::File(destination.as_ref().to_path_buf());
+        self
+    }
+
+    /// Assigns selected files beneath a caller-chosen native directory root.
+    pub fn to_directory(mut self, directory: impl AsRef<Path>) -> Self {
+        self.target = Target::Directory(directory.as_ref().to_path_buf());
+        self
+    }
+
+    /// Requires a caller digest for exactly one selected file; conflicts stay sticky.
+    pub fn expect(mut self, digest: impl Into<Digest>) -> Self {
+        self.requirements = self.requirements.and_then(|mut requirements| {
+            requirements.insert(digest.into(), Provenance::Caller)?;
+            Ok(requirements)
+        });
+        self
+    }
+
+    /// Optional measurement never cancels required checks.
+    pub fn measurement(mut self, measurement: Measurement) -> Self {
+        self.measurement = measurement;
+        self
+    }
+
+    /// Resolves HEAD metadata and freezes all selections, requirements and output assignments.
+    /// No GET, output creation or lasting ownership is acquired.
+    pub async fn plan(self) -> Result<Plan, Error> {
+        let Self {
+            client,
+            inputs,
+            target,
+            requirements,
+            measurement,
+        } = self;
+        let inputs = inputs?;
+        let requirements = requirements.map_err(Error::ConflictingRequirements)?;
+        let mut retained = inputs.iter().fold(0_usize, |bytes, input| {
+            bytes.saturating_add(input.retained_bytes())
+        });
+        let mut files = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let original_bytes = input.retained_bytes();
+            let file = client.resolve_input(input).await?;
+            retained = retained
+                .checked_sub(original_bytes)
+                .and_then(|bytes| bytes.checked_add(file.retained_bytes()))
+                .filter(|bytes| *bytes <= MAX_METADATA_BYTES)
+                .ok_or(Error::Inventory(InventoryError::Limit))?;
+            // Stop before admitting another HEAD when newly retained metadata exhausts the budget.
+            files.push(file);
+        }
+        let inventory = Inventory::complete(files).map_err(Error::Inventory)?;
+        let files: Vec<_> = inventory.into_files().collect();
+        if requirements.iter().next().is_some() && files.len() != 1 {
+            return Err(Error::GlobalRequirementCardinality);
+        }
+        layout::Layout::freeze(files, target, requirements, measurement)
+    }
+
+    /// Executes this request through its frozen plan and the common native Transfer pipeline.
+    pub async fn run(self) -> Result<Report, Box<RunFailure>> {
+        let client = self.client;
+        let plan = self.plan().await.map_err(|error| {
+            Box::new(RunFailure {
+                error,
+                report: Report::default(),
+                failed: None,
+            })
+        })?;
+        client.execute(plan).await
+    }
+}
+
+impl fmt::Debug for Download<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Download([pending redacted request])")
+    }
+}
+
+enum Target {
+    Default,
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
+/// Frozen read-only assignments. Consuming execution is the only mutation path.
+/// A plan grants neither filesystem permission nor exactly-once execution authority.
+#[must_use]
+pub struct Plan {
+    files: Vec<PlannedFile>,
+    directory_root: Option<PathBuf>,
+    directories: Vec<PathBuf>,
+}
+
+impl Plan {
+    /// Inspects final assignments without mutating selected scope or paths.
+    pub fn files(&self) -> impl ExactSizeIterator<Item = &PlannedFile> {
+        self.files.iter()
+    }
+}
+
+impl fmt::Debug for Plan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Plan")
+            .field("files", &self.files.len())
+            .finish()
+    }
+}
+
+/// One frozen local assignment, separate from its remote path, hint and version.
+pub struct PlannedFile {
+    file: File,
+    destination: PathBuf,
+    requirements: Requirements,
+    measurement: Measurement,
+}
+
+impl PlannedFile {
+    /// The selected remote member and original occurrence context.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Explicit inspection of the approved local assignment, not a remote identity.
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Frozen requirements, separately from optional reporting work.
+    pub fn requirements(&self) -> impl Iterator<Item = Requirement> {
+        self.requirements.iter()
+    }
+
+    /// Frozen optional measurement.
+    pub fn measurement(&self) -> Measurement {
+        self.measurement
+    }
+}
+
+impl fmt::Debug for PlannedFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PlannedFile([reference and assignment redacted])")
+    }
+}
+
+/// Observed consistency of the GET with the advisory HEAD, not authenticity or a content hash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VersionConsistency {
+    /// No strong version was available; this is a fresh unpinned ordered response.
+    Unpinned,
+    /// Conditional GET and its returned strong ETag agreed with the frozen HEAD validator.
+    StrongEtagMatched,
+}
+
+/// Completed files only. A run failure retains this report plus the failing file's native state.
+#[derive(Default)]
+pub struct Report {
+    completed: Vec<PublishedFile>,
+}
+
+impl Report {
+    /// Actual native publications, with checks, version consistency and state kept separate.
+    pub fn completed(&self) -> impl ExactSizeIterator<Item = &PublishedFile> {
+        self.completed.iter()
+    }
+}
+
+impl fmt::Debug for Report {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Report")
+            .field("published_files", &self.completed.len())
+            .finish()
+    }
+}
+
+/// One absent-only native publication, not an assertion about other files in a run.
+pub struct PublishedFile {
+    file: File,
+    destination: PathBuf,
+    version: VersionConsistency,
+    receipt: Receipt,
+}
+
+impl PublishedFile {
+    /// Selected original source context.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Local assignment, accessible explicitly rather than emitted in default diagnostics.
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// The actual native publication/check receipt, including its retained state locator.
+    pub fn receipt(&self) -> &Receipt {
+        &self.receipt
+    }
+
+    /// GET consistency, independent of matched requirements and measured hashes.
+    pub fn version(&self) -> VersionConsistency {
+        self.version
+    }
+}
+
+impl fmt::Debug for PublishedFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedFile")
+            .field("version", &self.version)
+            .finish()
+    }
+}
+
+/// Failure retains completed native publications and, for native transfer errors, partial/state facts.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct RunFailure {
+    /// Typed terminal reason, not a successful empty or truncated run.
+    #[source]
+    pub error: Error,
+    /// Files published before the terminal failure.
+    pub report: Report,
+    /// Frozen failing member/assignment when execution had reached one, without automatic retry.
+    /// Its native partial/state facts remain in the typed transfer error.
+    pub failed: Option<PlannedFile>,
+}
+
+/// Built-in errors expose only safe typed context, never a bearer reference or unsafe remote name.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Input conversion failed before transport effects.
+    #[error("invalid input; inspect the typed input error")]
+    Input(#[from] InputError),
+    /// Unsupported scopes never produce fake successful inventories.
+    #[error("unsupported input scope; use an exact http or https reference with this client")]
+    UnsupportedInput {
+        /// Safe recognized family.
+        kind: InputKind,
+        /// Requested scope, not inferred from lookup failure.
+        scope: InputScope,
+    },
+    /// Empty requests differ from genuine complete empty inventories.
+    #[error("no inputs; supply at least one reference or selected file")]
+    NoInputs,
+    /// Bounded metadata failure does not expose a truncated inventory.
+    #[error("metadata limit exceeded; request a smaller scope")]
+    Inventory(#[from] InventoryError),
+    /// The requested semaphore capacity must fit Tokio's supported bound.
+    #[error("invalid request capacity; choose a smaller nonzero request limit")]
+    AdmissionLimit,
+    /// No implicit Tokio runtime is created.
+    #[error("runtime unavailable; perform http and native file work inside a tokio runtime")]
+    RuntimeUnavailable,
+    /// Transport causes are retained inside a redacted audited wrapper.
+    #[error("http operation failed; inspect the safe transport category")]
+    Http(#[from] HttpError),
+    /// The combined 15-second admission, connection and response-header deadline expired.
+    /// This can happen while waiting for a retained body's admission slot, before sending a request.
+    #[error(
+        "http request admission or headers timed out; release retained bodies or check the endpoint"
+    )]
+    HeaderTimeout,
+    /// Redirect targets can change origin/credential authority and are not followed in this slice.
+    #[error("http redirects are unsupported; supply the authorized final reference explicitly")]
+    Redirect,
+    /// A response failed without embedding its URL or untrusted status text.
+    #[error("http {stage} returned status {status}; check access and the reference")]
+    Status {
+        /// Metadata or payload opening, without reference text.
+        stage: RequestStage,
+        /// Numeric status only, not a server-provided reason phrase.
+        status: u16,
+    },
+    /// Malformed/conflicting header declarations cannot establish payload length/version.
+    #[error("invalid http metadata; check the endpoint's response headers")]
+    InvalidMetadata,
+    /// Identity content encoding is required; no silent representation transformation.
+    #[error("unsupported content encoding; use an identity representation")]
+    ContentEncoding,
+    /// A frozen strong ETag disagreed, disappeared or was refused by the conditional request.
+    #[error("remote version changed; discover a fresh request rather than reusing this plan")]
+    VersionChanged,
+    /// Caller expectations bind exactly one actual selected file.
+    #[error("global expectation needs exactly one selected file; select one member first")]
+    GlobalRequirementCardinality,
+    /// All conflicting proposals fail before output/body effects.
+    #[error("conflicting required checks; resolve the expected digests")]
+    ConflictingRequirements(#[source] Box<Conflict>),
+    /// An exact native file target cannot silently discard an input namespace.
+    #[error("namespace conflicts with an exact file target; choose a directory target")]
+    NamespaceWithFile,
+    /// Actual selected count controls exact-file cardinality.
+    #[error("file target needs exactly one selected file; choose one member or a directory target")]
+    FileCardinality,
+    /// Unsafe names are not normalized, flattened or silently replaced.
+    #[error("unsafe output name; choose an explicit safe name or namespace")]
+    InvalidName,
+    /// Safe readable fallback is not guessed from a bearer query or arbitrary response body.
+    #[error("no usable output name; choose an explicit file target")]
+    MissingName,
+    /// Local assignment/key bytes and hierarchy depth are bounded before prefix retention.
+    #[error("output layout exceeds its limit; choose a shorter or shallower namespace and root")]
+    LayoutLimit,
+    /// File/directory, canonical Unicode and case-equivalent assignments all conflict.
+    #[error("output assignments conflict; give inputs distinct explicit namespaces or names")]
+    LayoutConflict,
+    /// Existing output roots/components must be nonsymlink caller-owned writable directories.
+    #[error(
+        "unsafe output directory role or permissions; choose a caller-owned non-shared directory"
+    )]
+    UnsafeDirectory,
+    /// Directory inspection/creation is execution-only and does not grant overwrite authority.
+    #[error("output directory preparation failed; choose a suitable caller-owned directory")]
+    Directory(#[source] std::io::Error),
+    /// Native checked publication is not implemented on this host.
+    #[error("native publication is unsupported on this host; use the checked live body instead")]
+    NativeUnsupported,
+    /// Native request validation remains typed and precedes native effects.
+    #[error("invalid native file request; inspect the request error")]
+    NativeRequest(#[source] crate::transfer::RequestError),
+    /// Actual native partial counts, settled extents and retained state survive failure.
+    #[error("native transfer failed; inspect its partial report and retained state")]
+    Transfer(#[source] Box<crate::transfer::Failure<HttpError>>),
+}
+
+impl From<Infallible> for Error {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
+}

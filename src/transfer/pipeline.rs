@@ -139,6 +139,10 @@ impl Run {
             {
                 return Err(FailureKind::LengthMismatch);
             }
+            // Empty ready chunks perform no physical await; give the stop producer a turn.
+            if chunk.is_empty() {
+                tokio::task::yield_now().await;
+            }
             let mut offset = 0;
             while offset < chunk.len() {
                 // No source polling occurs while a physical write is pending. Once submitted it must
@@ -192,3 +196,7 @@ impl Run {
         Failure::native(error, partial, Some(StateRef::clone(&self.state)))
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "pipeline_tests.rs"]
+mod tests;

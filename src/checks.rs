@@ -546,8 +546,8 @@ impl CheckPolicy {
     }
 }
 
-// Inline ownership keeps the maximum five states allocation-free and conditionally
-// Send without changing the legacy boxed hasher's bounds. BLAKE3's state is larger.
+// Inline ownership keeps the maximum five states allocation-free and conditionally Send.
+// BLAKE3's state is larger.
 #[allow(clippy::large_enum_variant)]
 enum Hasher {
     Md5(md5::Md5),

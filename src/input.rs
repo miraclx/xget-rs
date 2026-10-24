@@ -116,8 +116,10 @@ impl Input {
 
     /// Requests a namespace/tree explicitly, never as fallback after a missing exact object.
     ///
-    /// HTTP(S) means WebDAV listing intent, not website crawling. S3 means literal bucket/prefix
-    /// listing intent. IPFS trees and tree scope for provider catalogues/shares are unsupported.
+    /// HTTP(S) means WebDAV listing intent, not website crawling. With `webdav` enabled, use a
+    /// slash-ending root without a query or fragment, such as `https://host.example/dav/files/`.
+    /// S3 means literal bucket/prefix listing intent. IPFS trees and tree scope for provider
+    /// catalogues/shares are unsupported.
     pub fn tree(reference: &str) -> Result<Self, InputError> {
         let mut input = Self::parse(reference)?;
         match input.kind {

@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Miraculous Owonubi <omiraculous@gmail.com>"]
 edition = "2024"
 rust-version = "1.97.1"
-description = "A chunked, parallel, resumable, verified fetch engine over a pluggable byte source"
+description = "Checked fetches, bounded discovery and owned continuation through a common client"
 repository = "https://github.com/miraclx/xget-rs"
 license = "MIT OR Apache-2.0"
 keywords = ["download", "http", "range", "resume", "parallel"]
@@ -12,10 +12,29 @@ categories = ["network-programming", "asynchronous"]
 # cli/Cargo.toml owns binary targets. Preserved provisional files under src/bin must not reappear as a
 # second executable through Cargo's automatic discovery.
 autobins = false
-# The review record is tracked in ../craft and reached through a symlink. It is not part of the library.
-# `harness/` cannot run from an unpacked tarball: scenarios.sh builds from `..`, so shipping it would be
-# a promise the tarball cannot keep. Neither CLI sources nor provisional bin files belong in the library.
-exclude = ["notes", "harness", "AGENTS.md", ".claude", "src/bin", "cli"]
+# Old integration sources remain intact but are not compiled as product test targets.
+autotests = false
+# Private review/harness material and the separately packaged CLI do not belong in the library.
+# Retired engine sources stay physically intact pending cleanup, not compiled or packaged as a mode.
+exclude = [
+    "notes",
+    "harness",
+    "AGENTS.md",
+    ".claude",
+    "src/bin",
+    "cli",
+    "src/builder.rs",
+    "src/control.rs",
+    "src/control_tests.rs",
+    "src/engine.rs",
+    "src/engine_tests.rs",
+    "src/plan.rs",
+    "src/plan_tests.rs",
+    "src/source.rs",
+    "src/source/**",
+    "tests/engine.rs",
+    "tests/http_source.rs",
+]
 
 [workspace]
 # The root package is the reusable library; `cli` is the consumer that owns the `xget` executable.
@@ -89,10 +108,8 @@ xbytes = { git = "https://github.com/miraclx/xbytes-rs" }
 # Wipe retained access-reference and validator allocations when their owners are dropped.
 zeroize = "1"
 
-# Only for the startup sweep of orphaned temp scratches: a process-liveness check so a partial left by a
-# since-dead process is cleaned up while a live download's scratch is never touched. Unix uses
-# `kill(pid, 0)`; Windows uses `OpenProcess`. These target sections must come after all [dependencies]
-# entries above, or a following key would be parsed into the target table instead of [dependencies].
+# Unix native ownership, leases and descriptor-relative publication use libc directly. Keep target
+# sections after all shared dependencies so following entries do not inherit the target table.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -102,11 +119,24 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 # Cancellation and bounded loopback HTTP fixtures choose their own runtime and sockets.
 tokio = { version = "1", features = ["net", "rt-multi-thread"] }
-# An in-process mock HTTP server for the HttpSource integration tests: it lets a test answer a range
-# request with a real 206 and Content-Range (or deliberately ignore the range) so the source's own
-# validation is exercised over a real loopback socket, with no live network. The engine's own paths
-# are covered by a fake Source and need no server.
+# Exercise common Client discovery, checked payloads and frozen continuation over real loopback HTTP.
 wiremock = "0.6"
+
+[[test]]
+name = "client_saved"
+path = "tests/client_saved.rs"
+
+[[test]]
+name = "transfer"
+path = "tests/transfer.rs"
+
+[[test]]
+name = "transfer_live"
+path = "tests/transfer_live.rs"
+
+[[test]]
+name = "transfer_reader"
+path = "tests/transfer_reader.rs"
 
 [lints.rust]
 unused_must_use = "deny"

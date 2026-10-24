@@ -46,19 +46,39 @@ const MAX_RECORD: usize = 1024 * 1024;
 /// there is no fallback after refusal. Other members open fresh full ordered bodies. V1/V2 retain
 /// their original whole-body meaning. No transport session capability or credential is persisted.
 ///
+/// Usually, repeat the original [`Client::download`] request with the same target and check policy;
+/// automatic matching finds unique unfinished work before fresh discovery. To choose a particular
+/// run, retain its actual path from [`Report::saved_run`], including `failure.report.saved_run()` on a
+/// [`RunFailure`], and inspect it. Inspection alone does not revalidate payloads.
+///
+/// This explicit recipe requires a run originally created from exactly one member and the exact
+/// original reference shown below. Replace both placeholders with your own run path and reference.
+/// [`SavedMember::binding_input`] reconstructs supported frozen scope, namespace and selection intent,
+/// not credentials. Reattach any transient access headers yourself. For a multi-member run, supply
+/// every inspected key exactly once with its corresponding original input; do not bind just the first
+/// member. Older complex intent may require the caller's complete original [`Input`] instead of
+/// `binding_input`.
+///
 /// ```no_run
 /// use xget::Client;
 /// use xget::client::SavedRun;
-/// # async fn example() -> Result<(), Box<dyn core::error::Error>> {
-/// let saved = SavedRun::inspect("downloads/.xget-runs/run-123").await?;
-/// let key = saved.members().next().ok_or("empty saved run")?.key();
-/// let client = Client::new()?;
-/// let report = client.resume(saved)
-///     .input(key, "https://example.org/abc.bin")
-///     .run().await?;
-/// assert_eq!(report.completed().len(), 1);
-/// # Ok(())
-/// # }
+///
+/// #[tokio::main(flavor = "current_thread")]
+/// async fn main() -> Result<(), Box<dyn core::error::Error>> {
+///     let saved = SavedRun::inspect("downloads/.xget-runs/run-123").await?;
+///     let (key, input) = {
+///         let mut members = saved.members();
+///         if members.len() != 1 {
+///             return Err("choose a saved run with exactly one member".into());
+///         }
+///         let member = members.next().ok_or("choose a nonempty saved run")?;
+///         (member.key(), member.binding_input("https://example.org/abc.bin")?)
+///     };
+///     let client = Client::new()?;
+///     let report = client.resume(saved).input(key, input).run().await?;
+///     assert_eq!(report.completed().len(), 1);
+///     Ok(())
+/// }
 /// ```
 #[must_use]
 pub struct SavedRun {

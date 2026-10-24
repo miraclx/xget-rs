@@ -1,4 +1,4 @@
-//! The legacy API still builds on other hosts. This new backend makes no weaker publication promise.
+//! Non-Unix native publication returns a typed unsupported result, not a weaker filesystem promise.
 
 use bytes::Bytes;
 

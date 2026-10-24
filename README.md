@@ -14,9 +14,12 @@ callers use the same Client coordinator for discovery, selection, checks, public
 Files execute serially; eligible exact HTTP uses up to four pinned ranges within one file. Live output
 uses a checked stream without native publication.
 
-This README describes the current working tree, not a tagged release. The redesign has no legacy CLI
-command or compatibility-product requirement. Earlier root library APIs remain available in this prefix;
-new callers should use the Client and Transfer entrances documented below. Root API retirement is separate.
+This README describes the current working tree, not a tagged release. The compiled product uses the
+Client and Transfer entrances documented below, with no legacy CLI command or compatibility mode.
+Retired engine sources remain physically intact but are excluded from compilation and packaging,
+pending cleanup. Modern native V1/V2/V3/V4 state readers remain supported; old XGETCTL1 partials are
+not imported. Native publication requires Unix support; whole portable-engine Wasm support has not
+been established.
 
 ## Install
 
@@ -309,7 +312,7 @@ support and fails unsupported inputs rather than falling back to HTTP.
 | none | exact `http(s)://` | fixed metadata deadline; no automatic redirect, retry, decompression or ambient proxy |
 | `s3` | `s3://bucket/key`, `--tree s3://bucket/prefix` | ordered whole objects; no partial-byte range resume |
 | `swisstransfer` | SwissTransfer share reference | bounded collection; ordered whole member responses |
-| `webdav` | `--tree https://host/path` | explicit DAV tree only, never website crawling |
+| `webdav` | `--tree https://host/path/` | slash-ending DAV root without query or fragment; never website crawling |
 | `github` | GitHub release catalogue | explicit `--all`, member or path selection |
 | `ipfs` | exact `ipfs://CID[/path]` | ordered whole gateway responses; raw-block CID checks, no UnixFS DAG verification |
 
@@ -352,6 +355,12 @@ Depend on the root `xget` package; `xget-cli` is not needed for library use.
 
 ### Common Client
 
+Start with the [crate-level guide](src/lib.rs) for the authoritative rustdoc recipe combining a
+required digest, optional measurement, input-scoped headers, metadata inspection, zero-file handling,
+exactly-one selection and consuming the selected `File`. It also links the deeper contracts and shows
+how an application supplies its configured S3 SDK client. The guide uses `no_run` examples so doctests
+compile them without contacting example URLs; the convenience call below omits required checks deliberately.
+
 ```rust
 use xget::Client;
 
@@ -380,7 +389,9 @@ context. When inspecting first, handle an inventory with zero files before const
 `download_all` request: an empty original-input iterator is invalid, whereas a genuine empty scope
 resolved from an original input is a successful no-op. Directory metadata does not become a file job.
 `Input::parse(reference)` recognizes supported references; `Input::tree(reference)` is the explicit
-tree form. `Input::include`, `Input::exclude`, `Input::select_id` and `Input::all` are the
+tree form. With `webdav` enabled, use a slash-ending HTTP(S) root without query or fragment, such as
+`Input::tree("https://host.example/dav/files/")?`. This is DAV listing, not website crawling.
+`Input::include`, `Input::exclude`, `Input::select_id` and `Input::all` are the
 library selection entrances. `Download::all()` explicitly accepts a complete catalogue of alternatives.
 
 The Client clones share request and body admission and connection reuse. Use a caller-owned Tokio
@@ -453,9 +464,12 @@ a credential or proof that remote bytes are immutable.
 Ordinary whole-body failures now use `client::SourceError` around the concrete built-in transport
 causes. Code explicitly naming `Failure<HttpError>` or the corresponding live-body failure must use
 the ordinary source-error family instead. Exact-HTTP range-reader errors retain their separate HTTP
-family. Earlier root `Source`, `get`, `from`, `Download`, `Output` and `Report` APIs remain available
-with their separate contracts; the modern CLI does not use that pipeline. Use `Client` for remote references and `Transfer` for application-owned bodies or
-repeatable readers; plans and reports belong to those operations.
+family. Earlier root `Source`, `get`, `from`, `Download`, `Output`, `Report`, `Probe`, `Progress`,
+`ByteRange`, `ByteStream`, `Error` and control-inspection APIs are no longer compiled or exported.
+Use `Client` for remote references and `Transfer` for application-owned bodies or repeatable readers;
+plans and reports belong to those operations. `Checksum` parsing remains available for CLI and caller
+measurement selection. The old engine and test sources remain physically unchanged, excluded from the
+package and automatic test discovery rather than deleted or exposed as a compatibility feature.
 
 Textual `BindingKey` and `RunId` values are versioned workspace correlation, not execution authority.
 A parsed key still needs an inspected matching run and original input binding. Moving a workspace does
@@ -497,6 +511,13 @@ then publishes. Publication is absent-only unless guarded replacement is explici
 A required-check failure therefore
 leaves no newly published file. The destination's parent must already satisfy the ownership and mode
 rules, except for missing directory roots created during execution.
+
+## Historical harness and media
+
+The retained [fault harness](harness/README.md), GIFs and [`media/download.tape`](media/download.tape)
+describe the retired command surface. They are historical artifacts, not runnable modern CLI examples,
+a current reproducibility recipe or evidence for the current Client path. Do not run the old scenario
+suite or regenerate the recording against the modern executable; no flag-compatibility mode exists.
 
 ## License
 

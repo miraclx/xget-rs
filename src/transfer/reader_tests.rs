@@ -485,6 +485,74 @@ fn windows_reject_empty_inverted_and_out_of_object_requests() {
 }
 
 #[test]
+fn partitioning_an_empty_or_inverted_suffix_opens_no_windows() {
+    for (start, end) in [(0, 0), (7, 7), (9, 3), (u64::MAX, u64::MAX), (u64::MAX, 0)] {
+        assert!(Window::partition(ByteCount(start), ByteCount(end)).is_empty());
+    }
+}
+
+#[test]
+fn partitioning_one_remaining_byte_keeps_its_exact_offset() {
+    for start in [0, 7, u64::MAX - 1] {
+        let windows = Window::partition(ByteCount(start), ByteCount(start + 1));
+        assert_eq!(
+            windows,
+            [Window::new(ByteCount(start), ByteCount(start + 1), ByteCount(start + 1)).unwrap()]
+        );
+    }
+}
+
+#[test]
+fn partitioning_many_bytes_tiles_the_suffix_with_at_most_four_balanced_windows() {
+    for start in [0, 7, u64::MAX - 32] {
+        for length in 2..=32 {
+            let end = start + length;
+            let windows = Window::partition(ByteCount(start), ByteCount(end));
+            assert_eq!(windows.len(), length.min(4) as usize);
+            let mut next = start;
+            let mut previous_size = u64::MAX;
+            for window in windows {
+                assert_eq!(window.start(), ByteCount(next));
+                assert!(Window::new(window.start(), window.end(), ByteCount(end)).is_some());
+                let size = window.end().0 - window.start().0;
+                assert!(size <= previous_size);
+                assert!(size == length / length.min(4) || size == length / length.min(4) + 1);
+                previous_size = size;
+                next = window.end().0;
+            }
+            assert_eq!(next, end);
+        }
+    }
+    let windows = Window::partition(ByteCount(5), ByteCount(16));
+    let bounds: Vec<_> = windows
+        .iter()
+        .map(|window| (window.start().0, window.end().0))
+        .collect();
+    assert_eq!(bounds, [(5, 8), (8, 11), (11, 14), (14, 16)]);
+}
+
+#[test]
+fn partitioning_u64_edge_suffixes_never_wraps_or_leaves_a_gap() {
+    for start in [0, 1, 2, 3, 4, u64::MAX / 2, u64::MAX - 5] {
+        let windows = Window::partition(ByteCount(start), ByteCount(u64::MAX));
+        assert_eq!(windows.len(), 4);
+        let mut next = start;
+        let mut total = 0_u128;
+        let first_size = windows[0].end().0 - windows[0].start().0;
+        for window in windows {
+            assert_eq!(window.start(), ByteCount(next));
+            assert!(Window::new(window.start(), window.end(), ByteCount(u64::MAX)).is_some());
+            let size = window.end().0 - window.start().0;
+            assert!(size == first_size || size == first_size - 1);
+            total += u128::from(size);
+            next = window.end().0;
+        }
+        assert_eq!(next, u64::MAX);
+        assert_eq!(total, u128::from(u64::MAX - start));
+    }
+}
+
+#[test]
 fn optional_measurement_and_weak_requirements_never_pin_a_candidate() {
     let directory = Directory::create();
     let calls = Rc::new(Cell::new(0));

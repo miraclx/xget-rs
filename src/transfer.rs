@@ -1,4 +1,4 @@
-//! One-shot native publication with required checks and optional measurement, separate from the legacy engine.
+//! Checked native publication with required checks and optional measurement.
 //!
 //! Clean body EOF, settled writes and every required digest precede atomic no-replace publication.
 //! Optional measurement defaults to SHA-256; explicit none never creates a hidden recovery hash.
@@ -7,7 +7,7 @@
 //! private stage's mode 0600. Other hosts return a typed unsupported capability before filesystem work.
 //! The retained private stage is an identity witness, not a resumable source. State is flushed to the
 //! operating system without fsync: recovery covers process interruption, not power loss. Leases
-//! exclude cooperating new writers only, not the legacy CLI or arbitrary same-user filesystem edits.
+//! exclude cooperating writers only, not arbitrary same-user filesystem edits.
 //!
 //! Required checks are independent of optional measurement. Run native operations on a caller-owned
 //! Tokio runtime, with an absent destination in a suitable existing parent:
@@ -644,7 +644,9 @@ pub enum Phase {
     Seal,
     /// Atomic state replacement, without fsync.
     Checkpoint,
-    /// Atomic no-replace link publication.
+    /// Atomic no-replace link publication or separately authorized guarded replacement.
+    /// See [`crate::client::Overwrite`] for the cooperating-writer replacement contract;
+    /// replacement is not an inode compare-and-swap against arbitrary filesystem writers.
     Publish,
     /// Offline ownership reacquisition and revalidation.
     Reconcile,

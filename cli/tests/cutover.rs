@@ -142,16 +142,20 @@ impl Drop for Directory {
 enum Behavior {
     Complete,
     ShortBody,
+    #[cfg(unix)]
     ShortBodyAfterHeaders,
+    #[cfg(unix)]
     FailSecondOnce,
     GatedBody,
+    #[cfg(unix)]
     ShortFirstWhole,
+    #[cfg(unix)]
     GatedIncumbent,
-    #[cfg(feature = "ipfs")]
+    #[cfg(all(feature = "ipfs", unix))]
     WrongContent,
     #[cfg(feature = "s3")]
     S3Empty,
-    #[cfg(feature = "s3")]
+    #[cfg(all(feature = "s3", unix))]
     S3One,
     #[cfg(feature = "s3")]
     S3Many,
@@ -163,6 +167,7 @@ struct Server {
     url: String,
     stopping: Arc<AtomicBool>,
     release_tail: Arc<AtomicBool>,
+    #[cfg(unix)]
     release_prefix: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<String>>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -177,12 +182,16 @@ impl Server {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let release_tail = Arc::new(AtomicBool::new(false));
         let release = Arc::clone(&release_tail);
+        #[cfg(unix)]
         let release_prefix = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
         let prefix = Arc::clone(&release_prefix);
         let stop = Arc::clone(&stopping);
         let log = Arc::clone(&requests);
         let worker = thread::spawn(move || {
+            #[cfg(unix)]
             let mut denied = false;
+            #[cfg(unix)]
             let mut shortened = false;
             while !stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -204,6 +213,7 @@ impl Server {
                             if request.contains("list-type=2") {
                                 let keys: &[&str] = match behavior {
                                     Behavior::S3Empty => &[],
+                                    #[cfg(unix)]
                                     Behavior::S3One => &["a.bin"],
                                     Behavior::S3Many => &["a.bin", "b.bin"],
                                     Behavior::S3Directory => &["a.bin", "folder/"],
@@ -220,6 +230,7 @@ impl Server {
                                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/xml\r\nConnection: close\r\n\r\n{xml}", xml.len()).unwrap();
                                 continue;
                             }
+                            #[cfg(unix)]
                             if matches!(behavior, Behavior::FailSecondOnce)
                                 && request.starts_with("GET /b.bin ")
                                 && !denied
@@ -229,16 +240,19 @@ impl Server {
                                 continue;
                             }
                             let length = match behavior {
-                                Behavior::ShortBody | Behavior::ShortBodyAfterHeaders => 4,
-                                Behavior::GatedBody
-                                | Behavior::ShortFirstWhole
-                                | Behavior::GatedIncumbent => 6,
+                                Behavior::ShortBody => 4,
+                                #[cfg(unix)]
+                                Behavior::ShortBodyAfterHeaders => 4,
+                                Behavior::GatedBody => 6,
+                                #[cfg(unix)]
+                                Behavior::ShortFirstWhole | Behavior::GatedIncumbent => 6,
                                 #[cfg(feature = "s3")]
                                 Behavior::S3Directory if head && request.contains("/folder/") => 0,
                                 _ => 3,
                             };
                             write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n").unwrap();
                             if !head {
+                                #[cfg(unix)]
                                 if matches!(
                                     behavior,
                                     Behavior::GatedIncumbent | Behavior::ShortBodyAfterHeaders
@@ -253,25 +267,27 @@ impl Server {
                                         thread::sleep(Duration::from_millis(2));
                                     }
                                 }
-                                #[cfg(feature = "ipfs")]
+                                #[cfg(all(feature = "ipfs", unix))]
                                 let bytes = if matches!(behavior, Behavior::WrongContent) {
                                     b"abd"
                                 } else {
                                     b"abc"
                                 };
-                                #[cfg(not(feature = "ipfs"))]
+                                #[cfg(not(all(feature = "ipfs", unix)))]
                                 let bytes = b"abc";
                                 stream.write_all(bytes).unwrap();
+                                #[cfg(unix)]
                                 if matches!(behavior, Behavior::ShortFirstWhole) {
                                     if shortened {
                                         stream.write_all(b"def").unwrap();
                                     }
                                     shortened = true;
                                 }
-                                if matches!(
-                                    behavior,
-                                    Behavior::GatedBody | Behavior::GatedIncumbent
-                                ) {
+                                let gated_tail = matches!(behavior, Behavior::GatedBody);
+                                #[cfg(unix)]
+                                let gated_tail =
+                                    gated_tail || matches!(behavior, Behavior::GatedIncumbent);
+                                if gated_tail {
                                     stream.flush().unwrap();
                                     let deadline =
                                         std::time::Instant::now() + Duration::from_secs(5);
@@ -299,6 +315,7 @@ impl Server {
             url,
             stopping,
             release_tail,
+            #[cfg(unix)]
             release_prefix,
             requests,
             worker: Some(worker),

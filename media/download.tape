@@ -1,4 +1,6 @@
-# Record media/download.gif   ->   vhs media/download.tape
+# Historical recording source for media/download.gif, retained without modern CLI compatibility.
+# The positional output command below is retired syntax, not a runnable current demo.
+# Do not regenerate this recording against the modern CLI.
 Output media/download.gif
 Set FontSize 16
 Set Width 1200

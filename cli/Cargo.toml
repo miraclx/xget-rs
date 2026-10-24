@@ -9,38 +9,45 @@ rust-version = "1.97.1"
 description = "Command-line interface for the xget fetch engine"
 repository = "https://github.com/miraclx/xget-rs"
 license = "MIT OR Apache-2.0"
+# Archived sources stay physically intact but are neither compiled nor shipped in the CLI package.
+exclude = ["src/legacy.rs", "src/expect.rs", "src/main_tests.rs", "src/progress.rs", "src/progress/**"]
 
-# Keep the established executable name. This single-command binary uses the CLI module-tree rule's
-# single-file exception; new command groups must own their modules.
+# Keep the established executable name; command modules own execution and main composes dispatch.
 [[bin]]
 name = "xget"
 path = "src/main.rs"
 
 [features]
+github = ["xget/github"]
 ipfs = ["xget/ipfs"]
-# The S3 sidecar reader streams an object through the xget source, so it needs futures under this feature.
-s3 = ["dep:futures", "xget/s3"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "xget/s3"]
+swisstransfer = ["xget/swisstransfer"]
+webdav = ["xget/webdav"]
 
 [dependencies]
 anstyle = "1"
+# The CLI composition root supplies configured SDK transports to the common library client.
+aws-config = { version = "1.8", optional = true }
+aws-sdk-s3 = { version = "1.96", optional = true }
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15.7"
 eyre = "0.6"
-futures = { version = "0.3", optional = true }
+# Drain the common checked live body without a second transport or spool.
+futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", features = ["fs", "io-std", "macros", "rt-multi-thread", "signal"] }
+# Encode versioned CLI records and independently parse captured reporter events in tests.
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread", "signal"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 xbytes = { git = "https://github.com/miraclx/xbytes-rs" }
 xget = { path = ".." }
 xprogress = { git = "https://github.com/miraclx/xprogress-rs" }
+# Wipe parser-owned references; foreign argv/clap temporary wiping is not promised.
+zeroize = "1"
 
-# Free-space checks for the sequential-stream automatic switch. Unix only; elsewhere the check is absent.
+# Refuse symlink/FIFO sidecars at bounded local opening; integration tests also send Unix interrupts.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-# Validate machine output with an independent JSON parser, not the encoder's own assumptions.
-serde_json = "1"
 
 [lints.rust]
 unused_must_use = "deny"

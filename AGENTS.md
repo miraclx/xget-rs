@@ -10,15 +10,19 @@
   S3 exact objects/explicit prefix inventories. Shared bounded resolution, literal/original-path selection,
   inspection-only directory metadata, frozen layout, serial checked publication/live opening and owned
   continuation use the same coordinator. Eligible exact HTTP uses anchored-prefix range recovery;
-  S3, Swiss and explicit optional WebDAV trees stay whole mode. Release catalogues,
-  restart/overwrite and the redesigned CLI remain unimplemented in this prefix.
+  S3, Swiss, optional WebDAV trees, GitHub release catalogues and exact IPFS stay whole mode.
+  The modern CLI consumes this coordinator, including scoped access headers, catalogue choice and
+  separate guarded Restart/Overwrite authority; it has no legacy command or alternate engine.
 
 ## Workspace boundary
 
 - Root package `xget`: `src/`, library integration tests in `tests/`, transport sources and the advanced
   native `transfer` module. No argument parser, progress renderer or dotenv setup belongs here.
-- Package `xget-cli`: `cli/src/`, executable `xget`. Its single-command `main.rs` retains the documented
-  module-tree exception. That is not permission to add provider orchestration to main.
+- Package `xget-cli`: `cli/src/`, executable `xget`. `main.rs` parses, composes transports and dispatches;
+  download/list/info/resume modules own commands. No provider orchestration or scheduler belongs in main.
+  Archived `cli/src/expect.rs`, `main_tests.rs`, `progress.rs` and `progress/` remain physically intact
+  but are uncompiled and excluded from the CLI package, as is any archived `legacy.rs`. Do not add a
+  legacy command, compatibility feature or second engine.
 - The old working files under `src/bin/xget/` are preserved provisional work, excluded from root binary
   discovery and packaging. They are not the compiled CLI. Do not accidentally add their SwissTransfer
   feature, synthetic file locators or provider-owned scheduler through a move or broad staging operation.
@@ -26,8 +30,9 @@
   widen production visibility or move their declarations to the crate root just for access.
 
 The existing `Source`, `get`, `from`, `Download`, `Output` and `Report` library APIs remain available.
-`Source` uses native async trait methods and is not object-safe. The CLI's concrete enum dispatch is
-intentional; source futures need not be Send.
+`Source` uses native async trait methods and is not object-safe; source futures need not be Send.
+The modern CLI uses the common Client, not those earlier engine APIs. Their retirement is a separate
+prefix; do not delete, move or empty protected old files.
 
 ## Two dependency graphs
 
@@ -61,7 +66,10 @@ and provisional provider tree from the library package.
 Rust 1.97.1 is the exercised support baseline. The previous advertised 1.85 was not proven. Do not
 claim a lower MSRV without the corresponding toolchain/dependency/feature validation.
 
-## Legacy engine invariants
+## Earlier root engine invariants
+
+These still-compiled library APIs and their archived CLI sources are separate from the modern CLI.
+The old CLI spellings below describe only that archived interface, not current commands.
 
 **Verify as bytes arrive.** The in-order verifier runs alongside fetchers on one task, chasing a
 contiguous frontier. Received progress is not verified progress. The Barrier/Notify regression in
@@ -86,7 +94,7 @@ Persistent file partials must never be swept. Test actual CLI runs with their ow
 
 ## Advanced native-file invariants
 
-Body-based `Transfer` is separate from the ordinary Client and legacy CLI. Same-algorithm requirement
+Body-based `Transfer` is the native layer used by the ordinary Client and modern CLI. Same-algorithm requirement
 conflicts are sticky before effects; agreeing values merge bounded provenance. All configured checks
 share one traversal, independently of optional measurement. SHA-256 measurement is the default; None
 cannot disable requirements, and no requirements plus None performs no hashing.
@@ -133,7 +141,7 @@ Persist closed/sealing intent before sealing can take effect. Stops settle submi
 observed again after sealing, before publication; a closed stage never reopens writable. Queued/running
 physical operations retain registrations after waiter drop. V1/V2 one-shot records remain decodable,
 not writable reader authority. Eligible ordinary exact HTTP reuses this coordinator; custom readers
-remain a distinct caller-owned entrance, and the legacy CLI is unchanged.
+remain a distinct caller-owned entrance. The modern CLI uses the ordinary Client entrance.
 
 ## Owned aggregate continuation
 
@@ -159,13 +167,13 @@ bound select ranges. Longer legitimate pins retain whole mode. Every conditional
 its full window/total, identity encoding, length and frozen strong ETag. No new scheduler or payload
 probe exists; live opening and Swiss remain whole mode. Range stats separate restored/current source/
 physical writes from logical native partials; reconciled completions do not invent attempt statistics.
-Fresh bypasses continuation, not overwrite or cleanup. No restart/legacy import or successful pause is
-claimed. Atomic normalized metadata checksums are not hidden payload fingerprints or authenticated state.
+Fresh bypasses continuation, not overwrite or cleanup. Restart is separate explicit receiving-attempt
+authority; no legacy import or successful pause is claimed. Atomic normalized metadata checksums are not hidden payload fingerprints or authenticated state.
 
 ## Common collection adapter
 
-The optional library-only `swisstransfer` adapter feeds the ordinary Client coordinator. No CLI feature,
-synthetic member URL, provider scheduler, singleton flattening or opaque final root is implemented.
+The optional `swisstransfer` adapter feeds the ordinary Client coordinator and is forwarded by the CLI
+feature. No synthetic member URL, provider scheduler, singleton flattening or opaque final root exists.
 Members carry share-scoped repeatable tokens separately from occurrence-local FileId and renewable
 access. Original occurrences map to zero/one/many frozen members; V2 saved records persist that mapping
 and source paths, while V1 exact records keep V1 checkpoint semantics. Match unfinished intent before
@@ -209,7 +217,7 @@ Saved key correlation and declared requirement provenance APIs from the parent r
 
 ## WebDAV tree adapter
 
-The optional library-only `webdav` adapter uses explicit HTTP(S) tree intent, complete Depth-1 PROPFIND
+The optional `webdav` adapter uses explicit HTTP(S) tree intent, complete Depth-1 PROPFIND
 and scoped same-origin/root hrefs. No crawling or exact-to-tree fallback. Directory facts are inspection
 metadata, not filesystem jobs. Shared complete accounting and positive/literal selection apply before
 execution. Whole responses repeat known length and any strong pin; an absent pin remains Unpinned,
@@ -223,7 +231,8 @@ are capped at 256 KiB each and 1 MiB per traversal, XML at 16384 nodes with DTD 
 128 and source depth at 64, within shared discovery/admission bounds. No hard parser CPU/RSS promise.
 V4 remote tag 3 stores scoped href/source-path evidence and frozen intent, not an access root or
 credentials. Reentry opens the recorded member without new listing/HEAD/selection or a partial fallback.
-The parent S3/Swiss formats, advanced native APIs and compiled legacy CLI remain separate.
+The parent S3/Swiss formats and advanced native APIs retain their separate contracts; the CLI forwards
+WebDAV support through the same common coordinator.
 
 ## Original-path selection
 
@@ -248,8 +257,8 @@ Frame ordered include/exclude spellings in intent/bindings without changing no-p
 Match frozen work before discovery or selector reevaluation. Explicit bindings reconstruct original
 reference, namespace and pattern intent; V4 can retain a bounded nonsecret recipe, while older complex
 bindings need their original explicit intent. Literal member tokens,
-version/requirements and stored range mode retain their separate authority. The legacy CLI has not
-adopted pattern flags.
+version/requirements and stored range mode retain their separate authority. The CLI applies the same
+selection through input-local intent, with its selection conveniences restricted to one original input.
 
 ## Transport scope
 
@@ -261,27 +270,36 @@ AWS configuration or metadata discovery. Do not substitute a handwritten respons
 
 `s3` and `ipfs` gate library sources; the CLI forwards those capabilities. The root's vestigial
 aws-credential-types/aws-smithy-types feature aliases do not independently enable S3 code. SwissTransfer is a separate optional library
-adapter; the compiled legacy CLI does not yet use it.
+adapter; the modern CLI forwards it along with WebDAV and GitHub. Exact IPFS uses the common
+gateway adapter, not the older IPFS Source.
 
 ## CLI contract and known carries
 
-- `-s` means checksum, not curl's silent flag. Quiet output uses `--progress none`.
-- Human sizes and default rates use bytes. `--bits` changes human speed only; raw byte counts win.
-  `DisplayFormat` owns that policy. JSON counts/rates remain bytes/bytes-per-second, ETA seconds and
-  end elapsed milliseconds, independent of human flags.
-- JSON events are progress, retry, end and verified; verified is emitted only when hashing occurs.
-  Start is a reporter callback, not a JSON event. Do not call this a versioned machine schema yet.
-- Bars explicitly select stderr, ignoring the library demo Dump override. Captured non-TTY stderr
-  makes the bar Hidden, never stdout Dump. Isolated child tests and actual CLI payload tests cover both
-  empty and `1` inherited override values.
-- The current CLI compares `--expect` after the old engine returns. A mismatch can leave a published
-  file; it is not rollback or check-before-publication. The separate native entrance has the stronger
-  required-check ordering but has not replaced this flow.
-- Retry JSON quotes and escapes all U+0000..U+001F control characters; the child callback regression
-  parses one complete event with an independent JSON parser. This does not version the schema.
-- Plain updates in place only on terminal stderr. Captured stderr uses complete newline-delimited
-  snapshots, no cursor-control prefix or diagnostic styling, and escaped retry-cause controls.
-  The JSON-control and non-TTY Plain carries have separate callback and executable evidence.
+- Default acquisition, `list` (`ls`), offline `info` and explicit `resume` share the common Client.
+  There is no legacy command, positional output, remote checksum sidecar or alternate engine.
+- `-o FILE` asserts one selected file, `-D DIR` assigns a directory root, and `-o -` releases checked
+  irreversible stdout prefixes. Live output rejects Fresh/Restart/Overwrite authority even in previews.
+- `--expect algorithm:hex` adds a requirement checked before native publication. `-s` is independent optional
+  measurement, not curl's silent flag; None cannot disable requirements. Quiet progress uses
+  `--progress none`, which retains final results and failures.
+- Local sidecars require one selected file and bounded regular non-symlink Unix opening: 65536 bytes,
+  256 records and 4096-byte paths. Native sidecars also require Fresh and one original input.
+  Stdin/remote sidecars are unsupported; labels match exact original source paths, not renamed outputs.
+- Human sizes and default rates use bytes. `--bits` changes human speed only; `--raw-sizes` wins.
+  JSON counts/rates remain bytes/bytes-per-second and elapsed times remain milliseconds.
+- JSON uses `schema_version: 1` and PascalCase kinds with structured facts. Do not claim a separate
+  schema compatibility policy. Metadata goes to stdout; acquisition/resume diagnostics go to stderr.
+  JSON escaping also protects plain newline-delimited facts from remote controls.
+- Bars explicitly target terminal stderr, ignoring the library demo Dump override. Captured bar/auto
+  output becomes complete plain snapshots without cursor control; payload stdout stays separate.
+- `--header` applies only to one original HTTP/WebDAV input. Explicit resume renews headers only when
+  every binding resupplies the same original reference spelling. Access is not persisted in state/events.
+- `--ipfs-gateway` supplies access, never identity; exact IPFS still uses frozen CID/path requirements.
+  Disabled features fail explicitly. S3 SDK composition belongs only in main and runs only for S3 input.
+- Repeating an original request matches unfinished frozen work before discovery. Explicit `resume`
+  reconstructs every member binding without new discovery; duplicate, missing and unknown keys fail.
+- Ctrl-C exits 130 after runtime shutdown; it is not a successful pause or rollback receipt. Submitted
+  physical work may settle after command cancellation. Reporter failure is nonzero, not publication undo.
 
 ## Harness and protected work
 

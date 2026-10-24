@@ -3652,6 +3652,8 @@ name = "xget-cli"
 version = "0.1.0"
 dependencies = [
  "anstyle",
+ "aws-config",
+ "aws-sdk-s3",
  "clap",
  "dotenvy",
  "eyre",
@@ -3664,6 +3666,7 @@ dependencies = [
  "xbytes",
  "xget",
  "xprogress",
+ "zeroize",
 ]
 
 [[package]]

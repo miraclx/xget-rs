@@ -34,6 +34,7 @@ use crate::transfer::{
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum PhysicalOperation {
     Acquire,
+    ReaderAcquire,
     Reconcile,
 }
 
@@ -93,7 +94,9 @@ fn dropped_registered_work(operation: PhysicalOperation, stage: SubmissionStage)
         symlink(&store, &alias).unwrap();
         let plan = Plan::new(&fixture.output(), requirement(b"abc")).unwrap();
         let state = match operation {
-            PhysicalOperation::Acquire => StateRef::clone(plan.state()),
+            PhysicalOperation::Acquire | PhysicalOperation::ReaderAcquire => {
+                StateRef::clone(plan.state())
+            }
             PhysicalOperation::Reconcile => StateRef::clone(
                 Transfer::from_body(body(), Length::Unknown)
                     .to_file(fixture.output())
@@ -124,10 +127,16 @@ fn dropped_registered_work(operation: PhysicalOperation, stage: SubmissionStage)
             SubmissionStage::Running => {
                 let gate = Arc::new(super::Gate::default());
                 let held = gate.install();
-                REGISTERED_WORK
-                    .lock()
-                    .unwrap()
-                    .insert((state.path().to_path_buf(), operation), gate);
+                REGISTERED_WORK.lock().unwrap().insert(
+                    (
+                        state.path().to_path_buf(),
+                        match operation {
+                            PhysicalOperation::ReaderAcquire => PhysicalOperation::Acquire,
+                            operation => operation,
+                        },
+                    ),
+                    gate,
+                );
                 HeldSubmission::Running(held)
             }
         };
@@ -136,6 +145,20 @@ fn dropped_registered_work(operation: PhysicalOperation, stage: SubmissionStage)
             match operation {
                 PhysicalOperation::Acquire => {
                     let _native = Native::acquire_registered(plan, Some(owner)).await.unwrap();
+                }
+                PhysicalOperation::ReaderAcquire => {
+                    let _native = Native::acquire_reader(
+                        plan,
+                        super::Session {
+                            size: ByteCount(3),
+                            representation: "bytes".to_owned(),
+                            version: Some(b"one".to_vec()),
+                        },
+                        None,
+                        Some(owner),
+                    )
+                    .await
+                    .unwrap();
                 }
                 PhysicalOperation::Reconcile => {
                     let _result = Native::reconcile_registered(operation_state, Some(owner), None)
@@ -155,7 +178,10 @@ fn dropped_registered_work(operation: PhysicalOperation, stage: SubmissionStage)
         // A separately executed child opens the stable lock through an alias. This is an actual
         // primitive proof, not a second high-level Busy result or an inspection of Arc counts.
         probe(&alias, "owned-busy");
-        if matches!(operation, PhysicalOperation::Acquire) {
+        if matches!(
+            operation,
+            PhysicalOperation::Acquire | PhysicalOperation::ReaderAcquire
+        ) {
             assert!(!state.path().exists());
         }
         match held {
@@ -170,7 +196,9 @@ fn dropped_registered_work(operation: PhysicalOperation, stage: SubmissionStage)
         probe(fixture.path(), "free");
         assert!(state.path().join("state").is_file());
         match operation {
-            PhysicalOperation::Acquire => assert!(!fixture.output().exists()),
+            PhysicalOperation::Acquire | PhysicalOperation::ReaderAcquire => {
+                assert!(!fixture.output().exists())
+            }
             PhysicalOperation::Reconcile => assert_eq!(fs::read(fixture.output()).unwrap(), b"abc"),
         }
     });
@@ -185,12 +213,180 @@ fn running_acquisition_retains_the_outer_lease_before_a_native_owner_is_returned
     dropped_registered_work(PhysicalOperation::Acquire, SubmissionStage::Running);
 }
 #[test]
+fn queued_reader_acquisition_retains_the_outer_lease_after_waiter_drop() {
+    dropped_registered_work(PhysicalOperation::ReaderAcquire, SubmissionStage::Queued);
+}
+#[test]
+fn running_reader_acquisition_retains_the_outer_lease_after_waiter_drop() {
+    dropped_registered_work(PhysicalOperation::ReaderAcquire, SubmissionStage::Running);
+}
+#[test]
 fn queued_reconciliation_retains_the_outer_lease_after_waiter_drop() {
     dropped_registered_work(PhysicalOperation::Reconcile, SubmissionStage::Queued);
 }
 #[test]
 fn running_reconciliation_retains_the_outer_lease_after_waiter_drop() {
     dropped_registered_work(PhysicalOperation::Reconcile, SubmissionStage::Running);
+}
+
+#[tokio::test]
+async fn old_one_shot_receiving_records_never_acquire_reader_write_authority() {
+    let fixture = Fixture::new();
+    let plan = Plan::new(&fixture.output(), requirement(b"abc")).unwrap();
+    let state = StateRef::clone(plan.state());
+    let native = Native::acquire(plan).await.unwrap();
+    native
+        .write(ByteCount(0), Bytes::from_static(b"a"))
+        .await
+        .unwrap();
+    drop(native);
+    let before = fs::read(state.path().join("state")).unwrap();
+    assert_eq!(&before[..8], b"XGETNF02");
+    let session = super::Session {
+        size: ByteCount(3),
+        representation: "bytes".to_owned(),
+        version: Some(b"one".to_vec()),
+    };
+    let result = Native::acquire_reader(
+        Plan::new(&fixture.output(), requirement(b"abc")).unwrap(),
+        session,
+        Some(StateRef::clone(&state)),
+        None,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(crate::transfer::AcquisitionFailure {
+            error: NativeError::InvalidState,
+            ..
+        })
+    ));
+    assert_eq!(fs::read(state.path().join("state")).unwrap(), before);
+    assert_eq!(fs::read(state.path().join("data")).unwrap(), b"a");
+}
+
+#[tokio::test]
+async fn reader_sealing_is_persisted_before_checks_and_cannot_be_reset_by_failed_checkpoint() {
+    let fixture = Fixture::new();
+    let session = super::Session {
+        size: ByteCount(3),
+        representation: "bytes".to_owned(),
+        version: Some(b"one".to_vec()),
+    };
+    let plan = Plan::new(&fixture.output(), requirement(b"abc")).unwrap();
+    let state = StateRef::clone(plan.state());
+    let native = Native::acquire_reader(plan, super::Session::clone(&session), None, None)
+        .await
+        .unwrap();
+    native
+        .write(ByteCount(0), Bytes::from_static(b"abc"))
+        .await
+        .unwrap();
+    let mut checks = native.policy().start();
+    checks.update(b"ab");
+    let partial = Partial {
+        received: ByteCount(3),
+        written: ByteCount(3),
+        hashed: ByteCount(2),
+        ..Partial::default()
+    };
+    native
+        .checkpoint_prefix(partial, ByteCount(2), checks.prefix_anchor().unwrap())
+        .await
+        .unwrap();
+    native.seal(ByteCount(3)).await.unwrap();
+    native
+        .hooks()
+        .fail_checkpoint
+        .store(true, Ordering::Release);
+    assert!(native.checkpoint(partial).await.is_err());
+    drop(native);
+    let record = super::Record::decode(&fs::read(state.path().join("state")).unwrap()).unwrap();
+    assert!(record.reader.unwrap().closed);
+    let result = Native::acquire_reader(
+        Plan::new(&fixture.output(), requirement(b"abc")).unwrap(),
+        session,
+        Some(state),
+        None,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(crate::transfer::AcquisitionFailure {
+            error: NativeError::InvalidState,
+            ..
+        })
+    ));
+    assert!(!fixture.output().exists());
+}
+
+#[tokio::test]
+async fn dropped_prefix_revalidation_retains_both_leases_and_the_aggregate_owner() {
+    let fixture = Fixture::new();
+    let session = super::Session {
+        size: ByteCount(3),
+        representation: "bytes".to_owned(),
+        version: Some(b"one".to_vec()),
+    };
+    let plan = Plan::new(&fixture.output(), requirement(b"abc")).unwrap();
+    let state = StateRef::clone(plan.state());
+    let native = Native::acquire_reader(plan, super::Session::clone(&session), None, None)
+        .await
+        .unwrap();
+    native
+        .write(ByteCount(0), Bytes::from_static(b"a"))
+        .await
+        .unwrap();
+    let mut checks = native.policy().start();
+    checks.update(b"a");
+    native
+        .checkpoint_prefix(
+            Partial {
+                received: ByteCount(1),
+                written: ByteCount(1),
+                hashed: ByteCount(1),
+                ..Partial::default()
+            },
+            ByteCount(1),
+            checks.prefix_anchor().unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(native);
+    let store = fixture.path().join("owned-store");
+    fs::create_dir(&store).unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+    let owner = Native::lease_directory(PathBuf::clone(&store))
+        .await
+        .unwrap();
+    let (released, settled) = tokio::sync::oneshot::channel();
+    let owner: crate::transfer::OperationOwner = Arc::new(ObservedRegistration {
+        lease: Some(owner),
+        released: Some(released),
+    });
+    let native = Native::acquire_reader(
+        Plan::new(&fixture.output(), requirement(b"abc")).unwrap(),
+        session,
+        Some(StateRef::clone(&state)),
+        Some(owner),
+    )
+    .await
+    .unwrap();
+    let barrier = native.hooks().read.install();
+    let mut restore = Box::pin(native.restore_reader());
+    tokio::select! {
+        result = &mut restore => panic!("revalidation escaped its barrier: {}", result.is_ok()),
+        () = barrier.entered.notified() => {}
+    }
+    drop(restore);
+    drop(native);
+    probe(&store, "owned-busy");
+    probe(fixture.path(), "busy");
+    barrier.release();
+    settled.await.unwrap();
+    probe(&store, "owned-free");
+    probe(fixture.path(), "free");
+    assert!(state.path().join("state").is_file());
 }
 
 #[tokio::test]

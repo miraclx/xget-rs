@@ -276,7 +276,6 @@ impl Requirements {
         self.entries.into_iter().flatten()
     }
 
-    #[cfg(any(unix, test))]
     /// A supported algorithm needs no dynamic registry lookup.
     pub(crate) fn get(self, algorithm: Algorithm) -> Option<Requirement> {
         self.entries[algorithm.index()]
@@ -357,6 +356,26 @@ impl Checks {
     /// Byte accounting distinguishes actual requested hash work from received/written bytes.
     pub(crate) fn active(&self) -> bool {
         self.hashers.iter().any(Option::is_some)
+    }
+
+    /// Finalize a copy of an already-requested strong state, without traversing payload again.
+    /// Absence is intentional: recovery must never introduce hash work of its own.
+    pub(crate) fn prefix_anchor(&self) -> Option<Digest> {
+        self.hashers
+            .iter()
+            .flatten()
+            .find_map(|check| match &check.hasher {
+                Hasher::Sha256(hasher) => Some(Digest::sha256(OwnedSha256::clone(hasher).finish())),
+                Hasher::Sha512(hasher) => Some(Digest::from_bytes(
+                    Algorithm::Sha512,
+                    &sha2::Sha512::clone(hasher).finalize(),
+                )),
+                Hasher::Blake3(hasher) => Some(Digest::from_bytes(
+                    Algorithm::Blake3,
+                    hasher.finalize().as_bytes(),
+                )),
+                Hasher::Md5(_) | Hasher::Sha1(_) => None,
+            })
     }
 
     /// Feeds every active algorithm from this same borrowed payload slice.
@@ -483,6 +502,16 @@ pub(crate) struct CheckPolicy {
 }
 
 impl CheckPolicy {
+    /// Select a strong algorithm already requested by this policy, without creating any hash state.
+    pub(crate) fn prefix_algorithm(self) -> Option<Algorithm> {
+        [Algorithm::Sha256, Algorithm::Sha512, Algorithm::Blake3]
+            .into_iter()
+            .find(|&algorithm| {
+                self.measurement == Measurement::Algorithm(algorithm)
+                    || self.requirements.get(algorithm).is_some()
+            })
+    }
+
     /// Freeze the requested work; required and optional uses share each concrete state.
     pub(crate) fn start(self) -> Checks {
         self.requirements.start(self.measurement)

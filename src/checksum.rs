@@ -59,7 +59,7 @@ pub(crate) trait Hasher {
 
 /// A concrete incremental owner for checked native transfers, preserving conditional Send without
 /// changing the legacy boxed hasher's bounds. No hasher internals are persisted.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct OwnedSha256(sha2::Sha256);
 
 impl OwnedSha256 {

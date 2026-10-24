@@ -304,9 +304,22 @@ enforced-version contract throughout each body. This is not source authenticity.
 Up to four ranges write bounded prefixes into the native stage. The shared in-order checker follows
 the contiguous settled-write frontier while other bodies are still running, not only after the slowest
 range finishes. Clean range EOF, exact length, settled writes and all requirements precede absent-only
-publication. Failures retain typed causes and partial facts. Retained state does not persist a source
-session pin or resume/reopen ranges automatically. This advanced entrance has not enabled parallel
-ranges in the ordinary HTTP Client or replaced the legacy CLI engine.
+publication. Failures retain typed causes and partial facts.
+
+Retain a clone of the pending operation's `state()` before starting. A later
+`Transfer::from_reader(&reader).resume_from(state)` can continue a receiving stage with a recorded
+strong proper-prefix witness. It reacquires both native leases, checks the frozen size, representation,
+version, destination, policy and file identity, and rehashes the prefix before fetching only the suffix.
+The witness uses already-configured SHA-256/SHA-512/BLAKE3 work; weak-only or no-hash policy does not
+silently gain a recovery hash. Even a previously received full payload must establish actual suffix
+EOF. Sealed, mismatched and published stages never reopen writable. Older one-shot records remain
+inspectable through reconciliation, not reader continuation.
+
+`run_until(signal)` stops source admission and settles submitted work. A stop during sealing settles
+the seal without starting publication; its closed state is not reader-resumable. Once publication is
+submitted, stopping cannot undo it. `receipt.stats()` separates restored bytes from this attempt's
+source bytes and acknowledged payload writes. These are advanced caller-supplied reader capabilities,
+not ordinary HTTP Client parallelism/partial-byte reuse or a replacement for the legacy CLI engine.
 
 ### Checked live output
 

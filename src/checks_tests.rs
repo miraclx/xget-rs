@@ -73,6 +73,41 @@ impl Fixture {
 }
 
 #[test]
+fn prefix_anchors_finalize_requested_strong_state_copies_without_consuming_whole_checks() {
+    for (algorithm, empty, abc) in VECTORS {
+        let mut checks = Requirements::default().start(Measurement::Algorithm(algorithm));
+        let strong = matches!(
+            algorithm,
+            Algorithm::Sha256 | Algorithm::Sha512 | Algorithm::Blake3
+        );
+        assert_eq!(
+            checks.prefix_anchor(),
+            strong.then(|| Digest::parse(algorithm, empty).unwrap())
+        );
+        checks.update(b"abc");
+        assert_eq!(
+            checks.prefix_anchor(),
+            strong.then(|| Digest::parse(algorithm, abc).unwrap())
+        );
+        assert_eq!(
+            checks.finish().unwrap().measured(),
+            Some(Digest::parse(algorithm, abc).unwrap())
+        );
+    }
+    assert!(
+        Requirements::default()
+            .start(Measurement::None)
+            .prefix_anchor()
+            .is_none()
+    );
+    let mut checks = Fixture::abc().start();
+    checks.update(b"a");
+    assert!(checks.prefix_anchor().is_some());
+    checks.update(b"bc");
+    assert_eq!(checks.finish().unwrap().matched_requirements().count(), 5);
+}
+
+#[test]
 fn all_supported_algorithms_match_real_empty_vectors_with_no_chunks_or_empty_chunks() {
     for count in [0, 1, 8] {
         let mut checks = Fixture::empty().start();

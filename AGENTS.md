@@ -102,7 +102,7 @@ are never unlinked. Release notification follows guard cleanup.
 Reconciliation requires recorded strong content and inode/device evidence; equal foreign bytes are
 not adopted, and absent destinations are not republished. Matching identities without a strong recorded
 anchor return NotRevalidatable, with no hidden fingerprint. MD5/SHA-1 are compatibility checks, not
-strong guards. V2 state writes remain bounded and preserve the V1 reader; legacy XGETCTL1 is unchanged.
+strong guards. Bounded V2 one-shot and V3 reader records preserve the V1 reader; legacy XGETCTL1 is unchanged.
 Keep publication uncertainty and unconfirmed write extents
 explicit. No one-shot source reopening, automatic cleanup, fsync or universal filesystem promise exists.
 Unix hardlink support, a caller-owned Tokio runtime and a suitable existing caller-owned parent are
@@ -119,8 +119,17 @@ physical-operation registration and leases as writes, including after waiter dro
 
 Reader/check/body/error families remain concrete and conditionally Send. Generic Send helpers name one
 borrow's F/B/E families with equality bounds; do not replace that with an HRTB or static requirement.
-No reader-session pin or resumable range map is persisted by this entrance, and it does not enable
-ordinary Client parallel ranges, retries, source reopening or cooperative pause.
+V3 reader records freeze session size/representation/version, destination, check policy and data
+identity. `resume_from` reacquires both leases and rehashes a recorded strong proper prefix before
+suffix admission. Prefix witnesses finalize copies of already-active SHA-256/SHA-512/BLAKE3 states;
+weak/no-hash policy cannot invent a fingerprint. Proper-prefix evidence never proves EOF. Completed
+records must cover the frozen size. Reader statistics separate restored bytes from current-attempt
+source bytes and physical writes; native partials remain logical assembled facts.
+
+Persist closed/sealing intent before sealing can take effect. Stops settle submitted work and are
+observed again after sealing, before publication; a closed stage never reopens writable. Queued/running
+physical operations retain registrations after waiter drop. V1/V2 one-shot records remain decodable,
+not writable reader authority. This does not enable ordinary Client parallel ranges or partial-byte reuse.
 
 ## Owned aggregate continuation
 

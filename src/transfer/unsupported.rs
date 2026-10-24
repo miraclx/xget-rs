@@ -4,8 +4,8 @@ use bytes::Bytes;
 
 use super::plan::Plan;
 use super::{
-    AcquisitionFailure, ByteCount, FailureKind, OperationOwner, Partial, Reconciliation,
-    RecoveryBinding, StateRef,
+    AcquisitionFailure, ByteCount, FailureKind, OperationOwner, Partial, ReaderSession as Session,
+    Reconciliation, RecoveryBinding, StateRef,
 };
 use crate::checks::CheckPolicy;
 
@@ -14,9 +14,6 @@ pub(super) struct Native {
 }
 
 impl Native {
-    pub(super) async fn acquire(plan: Plan) -> Result<Self, AcquisitionFailure> {
-        Self::acquire_registered(plan, None).await
-    }
     pub(super) async fn acquire_registered(
         plan: Plan,
         _registration: Option<OperationOwner>,
@@ -33,6 +30,27 @@ impl Native {
             error: NativeError,
             state: None,
         })
+    }
+    pub(super) async fn acquire_reader(
+        plan: Plan,
+        _session: Session,
+        _resume: Option<StateRef>,
+        registration: Option<OperationOwner>,
+    ) -> Result<Self, AcquisitionFailure> {
+        Self::acquire_registered(plan, registration).await
+    }
+    pub(super) async fn restore_reader(
+        &self,
+    ) -> Result<(crate::checks::Checks, ByteCount), NativeError> {
+        Err(NativeError)
+    }
+    pub(super) async fn checkpoint_prefix(
+        &self,
+        _partial: Partial,
+        _length: ByteCount,
+        _digest: super::Digest,
+    ) -> Result<(), NativeError> {
+        Err(NativeError)
     }
     pub(super) async fn write(
         &self,

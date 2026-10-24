@@ -1,6 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
 use core::cell::Cell;
+#[cfg(unix)]
+use core::cell::RefCell;
 use core::future::{Ready, ready};
 use std::fs;
 use std::path::PathBuf;
@@ -54,6 +56,57 @@ impl Drop for Directory {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).unwrap();
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reader_stop_during_seal_settles_without_publication_or_writable_reentry() {
+    let directory = Directory::create();
+    let output = directory.0.join("output");
+    let reader = Memory {
+        bytes: b"abc",
+        behavior: Behavior::Exact,
+        calls: Rc::new(Cell::new(0)),
+    };
+    let pending = ReaderTransfer::from_reader(&reader)
+        .to_file(&output)
+        .unwrap();
+    let state = crate::transfer::StateRef::clone(pending.state());
+    let (installed, barrier) = tokio::sync::oneshot::channel();
+    super::SEAL_TEST.with(|hook| *hook.borrow_mut() = Some(installed));
+    let (stop, signal) = tokio::sync::oneshot::channel();
+    let mut future = Box::pin(pending.run_until(async {
+        let _ = signal.await;
+    }));
+    let held = tokio::select! {
+        result = &mut future => panic!("seal fixture was not installed: {result:?}"),
+        result = barrier => result.unwrap(),
+    };
+    tokio::select! {
+        result = &mut future => panic!("physical seal must be held: {result:?}"),
+        () = held.entered.notified() => {}
+    }
+    let _ = stop.send(());
+    held.release();
+    let failure = future.await.unwrap_err();
+    assert!(matches!(failure.kind, FailureKind::Stopped));
+    assert!(!output.exists());
+    let record =
+        super::super::record::Record::decode(&fs::read(state.path().join("state")).unwrap())
+            .unwrap();
+    assert!(record.reader.unwrap().closed);
+    drop(failure);
+    let calls = reader.calls.get();
+    let failure = ReaderTransfer::from_reader(&reader)
+        .resume_from(state)
+        .to_file(&output)
+        .unwrap()
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.kind, FailureKind::InvalidState));
+    assert_eq!(reader.calls.get(), calls);
+    assert!(!output.exists());
 }
 
 #[test]
@@ -312,6 +365,8 @@ async fn ready_empty_chunks_return_control_with_a_bounded_source_poll_count() {
         reader.evidence(),
         &native,
         &mut partial,
+        native.policy().start(),
+        core::future::pending(),
     ));
     let mut cx = Context::from_waker(noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -570,10 +625,14 @@ async fn failed_physical_steps_keep_accepted_prefixes_and_mark_lost_extents_unco
             size,
             evidence,
             plan,
+            session,
+            resume,
         } = ReaderTransfer::from_reader(&reader)
             .to_file(directory.0.join("output"))
             .unwrap();
-        let native = Native::acquire(plan).await.unwrap();
+        let native = Native::acquire_reader(plan, session, resume, None)
+            .await
+            .unwrap();
         if lose_result {
             native
                 .hooks()
@@ -586,7 +645,16 @@ async fn failed_physical_steps_keep_accepted_prefixes_and_mark_lost_extents_unco
                 .store(true, Ordering::Release);
         }
         let mut partial = crate::transfer::Partial::default();
-        let result = super::receive(reader, size, evidence, &native, &mut partial).await;
+        let result = super::receive(
+            reader,
+            size,
+            evidence,
+            &native,
+            &mut partial,
+            native.policy().start(),
+            core::future::pending(),
+        )
+        .await;
         assert!(matches!(
             result,
             Err(FailureKind::Io {
@@ -716,4 +784,396 @@ async fn unsupported_hosts_do_not_open_borrowed_local_readers() {
     assert!(matches!(failure.kind, FailureKind::Unsupported));
     assert_eq!(reader.calls.get(), 0);
     assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+struct Resumable<'data> {
+    bytes: &'data [u8],
+    version: &'data [u8],
+    representation: &'data str,
+    pause: bool,
+    calls: RefCell<Vec<Window>>,
+    paused: tokio::sync::Notify,
+}
+
+#[cfg(unix)]
+impl<'read, 'data: 'read> RangeReader<'read> for Resumable<'data> {
+    type Error = BorrowedCause<'read>;
+    type Body = core::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, Self::Error>> + 'read>>;
+    type Read = Ready<Result<ReadResponse<'read, Self::Body>, Self::Error>>;
+
+    fn size(&self) -> ByteCount {
+        ByteCount(self.bytes.len() as u64)
+    }
+    fn evidence(&'read self) -> Evidence<'read> {
+        Evidence::Enforced {
+            representation: self.representation,
+            version: self.version,
+        }
+    }
+    fn read(&'read self, window: Window) -> Self::Read {
+        self.calls.borrow_mut().push(window);
+        let start = window.start.0 as usize;
+        let end = window.end.0 as usize;
+        let body: Self::Body = if self.pause && start == 0 {
+            let bytes = Bytes::copy_from_slice(&self.bytes[start..end.min(4)]);
+            Box::pin(stream::unfold(Some(bytes), move |next| async move {
+                if let Some(bytes) = next {
+                    return Some((Ok(bytes), None));
+                }
+                // Polling resumes only after the previous write, check and checkpoint settled.
+                self.paused.notify_one();
+                core::future::pending().await
+            }))
+        } else {
+            Box::pin(stream::iter([Ok(Bytes::copy_from_slice(
+                &self.bytes[start..end],
+            ))]))
+        };
+        ready(Ok(ReadResponse {
+            window,
+            evidence: self.evidence(),
+            body,
+        }))
+    }
+}
+
+#[cfg(unix)]
+impl<'data> Resumable<'data> {
+    fn fixture(bytes: &'data [u8]) -> Self {
+        Self {
+            bytes,
+            version: b"one",
+            representation: "bytes",
+            pause: false,
+            calls: RefCell::new(Vec::new()),
+            paused: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix() {
+    use crate::transfer::Algorithm;
+    for (abrupt, algorithm) in [
+        (false, Algorithm::Sha256),
+        (true, Algorithm::Sha256),
+        (false, Algorithm::Sha512),
+        (false, Algorithm::Blake3),
+    ] {
+        let directory = Directory::create();
+        let data: Vec<u8> = (0..32).collect();
+        let reader = Resumable {
+            pause: true,
+            ..Resumable::fixture(&data)
+        };
+        let output = directory.0.join("output");
+        let pending = ReaderTransfer::from_reader(&reader)
+            .measurement(Measurement::Algorithm(algorithm))
+            .to_file(&output)
+            .unwrap();
+        let state = crate::transfer::StateRef::clone(pending.state());
+        if abrupt {
+            let mut running = Box::pin(pending.run());
+            tokio::select! {
+                result = &mut running => panic!("paused source completed: {result:?}"),
+                () = reader.paused.notified() => {}
+            }
+            drop(running);
+        } else {
+            let failure = pending
+                .run_until(reader.paused.notified())
+                .await
+                .unwrap_err();
+            assert!(matches!(failure.kind, FailureKind::Stopped));
+        }
+        assert!(!output.exists());
+        let checkpoint =
+            super::super::record::Record::decode(&fs::read(state.path().join("state")).unwrap())
+                .unwrap();
+        let (length, _) = checkpoint.reader.unwrap().prefix.unwrap();
+        assert_eq!(length, ByteCount(4));
+        assert_eq!(
+            &fs::read(state.path().join("data")).unwrap()[..4],
+            &data[..4]
+        );
+        let reader = Resumable::fixture(&data);
+        let receipt = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+            loop {
+                let result = ReaderTransfer::from_reader(&reader)
+                    .measurement(Measurement::Algorithm(algorithm))
+                    .resume_from(crate::transfer::StateRef::clone(&state))
+                    .to_file(&output)
+                    .unwrap()
+                    .run()
+                    .await;
+                match result {
+                    Err(failure) if matches!(failure.kind, FailureKind::Busy) => {
+                        tokio::task::yield_now().await
+                    }
+                    result => break result.unwrap(),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt.stats(),
+            super::ReaderStats {
+                restored: ByteCount(4),
+                source: ByteCount(28),
+                written: ByteCount(28)
+            }
+        );
+        assert_eq!(receipt.native().partial().hashed, ByteCount(32));
+        assert!(
+            reader
+                .calls
+                .borrow()
+                .iter()
+                .all(|window| window.start >= ByteCount(4))
+        );
+        assert_eq!(fs::read(output).unwrap(), data);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn corrupt_prefix_foreign_inode_changed_pin_and_changed_checks_are_refused_before_reads() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for mutation in 0..8 {
+        let directory = Directory::create();
+        let data: Vec<u8> = (0..32).collect();
+        let paused = Resumable {
+            pause: true,
+            ..Resumable::fixture(&data)
+        };
+        let output = directory.0.join("output");
+        let mut hash = crate::checks::Requirements::default().start(Measurement::default());
+        hash.update(&data);
+        let expected = hash.finish().unwrap().measured().unwrap();
+        let pending = ReaderTransfer::from_reader(&paused)
+            .expect(expected)
+            .to_file(&output)
+            .unwrap();
+        let state = crate::transfer::StateRef::clone(pending.state());
+        pending
+            .run_until(paused.paused.notified())
+            .await
+            .unwrap_err();
+        let before = fs::read(state.path().join("state")).unwrap();
+        let path = state.path().join("data");
+        let mut reader = Resumable::fixture(&data);
+        match mutation {
+            0 => {
+                let mut bytes = fs::read(&path).unwrap();
+                bytes[0] ^= 1;
+                fs::write(&path, bytes).unwrap();
+            }
+            1 => {
+                fs::rename(&path, state.path().join("foreign-original")).unwrap();
+                fs::write(&path, &data).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            2 => reader.version = b"two",
+            3 => fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap(),
+            5 => reader.bytes = &data[..31],
+            6 => reader.representation = "decoded bytes",
+            _ => {}
+        }
+        let mut request = ReaderTransfer::from_reader(&reader)
+            .expect(expected)
+            .resume_from(crate::transfer::StateRef::clone(&state));
+        if mutation == 4 {
+            request =
+                request.measurement(Measurement::Algorithm(crate::transfer::Algorithm::Sha512));
+        }
+        let destination = if mutation == 7 {
+            directory.0.join("changed-output")
+        } else {
+            PathBuf::clone(&output)
+        };
+        let failure = request
+            .to_file(destination)
+            .unwrap()
+            .run()
+            .await
+            .unwrap_err();
+        assert!(matches!(failure.kind, FailureKind::InvalidState));
+        assert!(reader.calls.borrow().is_empty());
+        assert_eq!(fs::read(state.path().join("state")).unwrap(), before);
+        assert!(!output.exists());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn full_received_late_errors_restore_a_proper_prefix_but_never_cached_eof() {
+    struct Late<'data> {
+        bytes: &'data [u8],
+        bodies: tokio::sync::Barrier,
+    }
+    impl<'read, 'data: 'read> RangeReader<'read> for Late<'data> {
+        type Error = BorrowedCause<'read>;
+        type Body =
+            core::pin::Pin<Box<dyn futures::Stream<Item = Result<Bytes, Self::Error>> + 'read>>;
+        type Read = Ready<Result<ReadResponse<'read, Self::Body>, Self::Error>>;
+        fn size(&self) -> ByteCount {
+            ByteCount(self.bytes.len() as u64)
+        }
+        fn evidence(&'read self) -> Evidence<'read> {
+            Evidence::Enforced {
+                representation: "bytes",
+                version: b"one",
+            }
+        }
+        fn read(&'read self, window: Window) -> Self::Read {
+            use futures::StreamExt as _;
+            let bytes =
+                Bytes::copy_from_slice(&self.bytes[window.start.0 as usize..window.end.0 as usize]);
+            let body = stream::iter([Ok(bytes)]).chain(stream::once(async move {
+                self.bodies.wait().await;
+                Err(BorrowedCause(self.bytes))
+            }));
+            ready(Ok(ReadResponse {
+                window,
+                evidence: self.evidence(),
+                body: Box::pin(body) as Self::Body,
+            }))
+        }
+    }
+    for length in [1, 32] {
+        let directory = Directory::create();
+        let data = vec![7; length];
+        let late = Late {
+            bytes: &data,
+            bodies: tokio::sync::Barrier::new(length.min(4)),
+        };
+        let output = directory.0.join("output");
+        let failure = ReaderTransfer::from_reader(&late)
+            .to_file(&output)
+            .unwrap()
+            .run()
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure.kind,
+            FailureKind::Body(ReaderError::Source(_))
+        ));
+        assert_eq!(failure.partial.received, ByteCount(length as u64));
+        assert!(!output.exists());
+        let state = failure.state.unwrap();
+        let reader = Resumable::fixture(&data);
+        let resumed = ReaderTransfer::from_reader(&reader)
+            .resume_from(state)
+            .to_file(&output)
+            .unwrap()
+            .run()
+            .await;
+        if length == 1 {
+            assert!(
+                matches!(resumed, Err(failure) if matches!(failure.kind, FailureKind::InvalidState))
+            );
+            assert!(reader.calls.borrow().is_empty());
+        } else {
+            let receipt = resumed.unwrap();
+            assert!(receipt.stats().restored > ByteCount(0));
+            assert!(receipt.stats().restored < ByteCount(length as u64));
+            assert!(receipt.stats().source > ByteCount(0));
+            assert_eq!(fs::read(output).unwrap(), data);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mismatched_and_published_reader_inodes_never_reopen_writable() {
+    for mismatch in [false, true] {
+        let directory = Directory::create();
+        let data = vec![7; 32];
+        let reader = Resumable::fixture(&data);
+        let output = directory.0.join("output");
+        let build = || {
+            let request = ReaderTransfer::from_reader(&reader);
+            if mismatch {
+                request.expect(
+                    Digest::parse(crate::transfer::Algorithm::Sha256, &"0".repeat(64)).unwrap(),
+                )
+            } else {
+                request
+            }
+        };
+        let pending = build().to_file(&output).unwrap();
+        let state = crate::transfer::StateRef::clone(pending.state());
+        match pending.run().await {
+            Ok(_) => assert!(!mismatch),
+            Err(failure) => {
+                assert!(mismatch && matches!(failure.kind, FailureKind::DigestMismatch(_)))
+            }
+        }
+        reader.calls.borrow_mut().clear();
+        let before = fs::read(state.path().join("data")).unwrap();
+        let failure = build()
+            .resume_from(state)
+            .to_file(&output)
+            .unwrap()
+            .run()
+            .await
+            .unwrap_err();
+        assert!(matches!(failure.kind, FailureKind::InvalidState));
+        assert!(reader.calls.borrow().is_empty());
+        assert_eq!(
+            fs::read(failure.state.unwrap().path().join("data")).unwrap(),
+            before
+        );
+        assert_eq!(output.exists(), !mismatch);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn no_hash_and_weak_only_continuation_refuse_without_creating_prefix_evidence() {
+    for weak in [false, true] {
+        let directory = Directory::create();
+        let data: Vec<u8> = (0..32).collect();
+        let reader = Resumable {
+            pause: true,
+            ..Resumable::fixture(&data)
+        };
+        let output = directory.0.join("output");
+        let build = || {
+            let request = ReaderTransfer::from_reader(&reader).measurement(Measurement::None);
+            if weak {
+                request.expect(
+                    Digest::parse(
+                        crate::transfer::Algorithm::Md5,
+                        "00000000000000000000000000000000",
+                    )
+                    .unwrap(),
+                )
+            } else {
+                request
+            }
+        };
+        let pending = build().to_file(&output).unwrap();
+        let state = crate::transfer::StateRef::clone(pending.state());
+        let failure = pending
+            .run_until(reader.paused.notified())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.partial.hashed,
+            if weak { ByteCount(4) } else { ByteCount(0) }
+        );
+        let record =
+            super::super::record::Record::decode(&fs::read(state.path().join("state")).unwrap())
+                .unwrap();
+        assert!(record.reader.unwrap().prefix.is_none());
+        assert!(record.partial.actual.is_none());
+        assert!(matches!(
+            build().resume_from(state).to_file(&output),
+            Err(ReaderRequestError::NoResumeAnchor)
+        ));
+    }
 }

@@ -32,6 +32,7 @@ mod control;
 mod engine;
 mod plan;
 mod source;
+pub mod transfer;
 
 #[cfg(test)]
 mod control_tests;
@@ -41,6 +42,7 @@ mod plan_tests;
 pub use crate::builder::{Download, from, get};
 pub use crate::checksum::{Checksum, UnknownChecksum};
 pub use crate::engine::{Report, sweep_orphans};
+pub use crate::transfer::Transfer;
 
 /// Whether an interrupted download left a resumable partial beside `output`: its `.xget` file with a
 /// valid control trailer. A caller can use this to resume automatically without an explicit request. The

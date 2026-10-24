@@ -383,8 +383,19 @@ fn provider_queries_and_userinfo_are_not_stripped_to_manufacture_an_identity() {
         ),
         Err(InputError::UnsupportedProviderReference)
     ));
+    // The public release adapter refuses unsupported access-bearing references outright, without
+    // stripping credentials/query to silently discover a different public release identity.
     for reference in [
         "https://user:password@github.com/owner/project/releases/tag/v1?token=secret",
+        "https://user:password@github.com/owner/project/releases/latest",
+        "https://github.com/owner/project/releases/latest?token=secret",
+    ] {
+        assert!(matches!(
+            Input::parse(reference),
+            Err(InputError::UnsupportedProviderReference)
+        ));
+    }
+    for reference in [
         "s3://user:password@bucket/key?versionId=secret",
         "ipfs://user:password@bafyexample/path?token=secret",
     ] {

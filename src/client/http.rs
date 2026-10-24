@@ -27,6 +27,18 @@ const HEADERS_DEADLINE: Duration = Duration::from_secs(15);
 const MAX_HEADERS: usize = 64 * 1024;
 const MAX_PATH: usize = 4096;
 
+#[cfg(feature = "github")]
+pub(super) struct GithubControl {
+    pub(super) bytes: Zeroizing<Vec<u8>>,
+    pub(super) link: Option<Zeroizing<String>>,
+}
+
+#[cfg(feature = "github")]
+pub(super) enum GithubAsset {
+    Redirect(Zeroizing<String>),
+    Body(Opened),
+}
+
 pub(super) struct Http {
     client: reqwest::Client,
     admission: Arc<Semaphore>,
@@ -66,7 +78,7 @@ impl Http {
         })
     }
 
-    #[cfg(all(test, feature = "swisstransfer"))]
+    #[cfg(all(test, any(feature = "swisstransfer", feature = "github")))]
     pub(super) fn fixture(uri: &str, maximum: NonZeroUsize) -> Self {
         let mut http = Self::new(maximum).unwrap_or_else(|_| panic!("fixture http configuration"));
         http.fixture = Some(url::Url::parse(uri).unwrap_or_else(|_| panic!("fixture uri")));
@@ -371,6 +383,130 @@ impl Http {
                 bytes.extend_from_slice(&chunk);
             }
             Ok(bytes)
+        };
+        tokio::time::timeout(HEADERS_DEADLINE, operation)
+            .await
+            .map_err(|_| Error::HeaderTimeout)?
+    }
+
+    #[cfg(feature = "github")]
+    pub(super) async fn github_control(
+        &self,
+        url: &url::Url,
+        maximum: usize,
+    ) -> Result<GithubControl, Error> {
+        let operation = async {
+            let mut admitted = self
+                .github_headers(url, "application/vnd.github+json")
+                .await?;
+            Self::status(&admitted.response, RequestStage::Metadata)?;
+            Self::validate_headers(&admitted.response)?;
+            if admitted.response.headers().contains_key(CONTENT_RANGE) {
+                return Err(Error::InvalidMetadata);
+            }
+            if matches!(Self::length(&admitted.response)?, Length::Known(ByteCount(size)) if size > maximum as u64)
+            {
+                return Err(Error::Inventory(crate::inventory::InventoryError::Limit));
+            }
+            let mut links = admitted.response.headers().get_all("link").iter();
+            let link = links
+                .next()
+                .map(|value| value.to_str().map(|value| Zeroizing::new(value.to_owned())))
+                .transpose()
+                .map_err(|_| Error::InvalidMetadata)?;
+            if links.next().is_some() {
+                return Err(Error::InvalidMetadata);
+            }
+            let mut bytes = Zeroizing::new(Vec::new());
+            while let Some(chunk) = admitted.response.chunk().await.map_err(HttpError::new)? {
+                if chunk.len() > maximum.saturating_sub(bytes.len()) {
+                    return Err(Error::Inventory(crate::inventory::InventoryError::Limit));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(GithubControl { bytes, link })
+        };
+        tokio::time::timeout(HEADERS_DEADLINE, operation)
+            .await
+            .map_err(|_| Error::HeaderTimeout)?
+    }
+
+    #[cfg(feature = "github")]
+    pub(super) async fn github_asset(
+        &self,
+        url: &url::Url,
+        expected: ByteCount,
+    ) -> Result<GithubAsset, Error> {
+        let admitted = self.github_headers(url, "application/octet-stream").await?;
+        let response = &admitted.response;
+        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            let mut locations = response.headers().get_all("location").iter();
+            let location = locations
+                .next()
+                .ok_or(Error::InvalidMetadata)?
+                .to_str()
+                .map_err(|_| Error::InvalidMetadata)?;
+            if locations.next().is_some() || location.len() > 8192 {
+                return Err(Error::InvalidMetadata);
+            }
+            return Ok(GithubAsset::Redirect(Zeroizing::new(location.to_owned())));
+        }
+        Self::status(response, RequestStage::Payload)?;
+        Self::validate_headers(response)?;
+        if response.headers().contains_key(CONTENT_RANGE) {
+            return Err(Error::InvalidMetadata);
+        }
+        if matches!(Self::length(response)?, Length::Known(actual) if actual != expected) {
+            return Err(Error::VersionChanged);
+        }
+        let AdmittedResponse { response, permit } = admitted;
+        Ok(GithubAsset::Body(Opened {
+            body: HttpBody {
+                stream: Some(Box::pin(response.bytes_stream())),
+                permit: Some(permit),
+            },
+            length: Length::Known(expected),
+            // An asset ID/API revision and even a required source digest are not an HTTP validator.
+            version: VersionConsistency::Unpinned,
+        }))
+    }
+
+    #[cfg(feature = "github")]
+    async fn github_headers(
+        &self,
+        url: &url::Url,
+        accept: &'static str,
+    ) -> Result<AdmittedResponse, Error> {
+        Self::runtime()?;
+        let operation = async {
+            let permit = Arc::clone(&self.admission)
+                .acquire_owned()
+                .await
+                .map_err(|_| Error::AdmissionLimit)?;
+            let reference = url::Url::clone(url);
+            #[cfg(test)]
+            let reference = if let Some(fixture) = &self.fixture {
+                let mut target = url::Url::clone(fixture);
+                target.set_path(reference.path());
+                target.set_query(reference.query());
+                target
+            } else {
+                reference
+            };
+            // No ambient credentials, cookies or referrer. Each redirect is a new unauthenticated
+            // request only after the provider validates its authority; reqwest never follows it.
+            let response = self
+                .client
+                .get(reference)
+                .header(ACCEPT_ENCODING, "identity")
+                .header("Accept", accept)
+                .header("User-Agent", "xget")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .send()
+                .await
+                .map_err(HttpError::new)?;
+            Self::header_budget(&response)?;
+            Ok(AdmittedResponse { response, permit })
         };
         tokio::time::timeout(HEADERS_DEADLINE, operation)
             .await

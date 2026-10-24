@@ -7,7 +7,7 @@
 //! objects and explicit literal bucket/prefix trees use ordered whole bodies and the same coordinator.
 //! Client clones share reusable transports and bounded control/body admission, not a provider-owned
 //! scheduler or the legacy range engine. Owned run metadata stays in the destination's `.xget-runs`
-//! store. Redirects, catalogues and unsupported trees fail explicitly. S3 listing is not a snapshot:
+//! store. Unsupported redirects, catalogues and trees fail explicitly. S3 listing is not a snapshot:
 //! each object's conditional HEAD/GET continuity is independent of other listed objects. Tree scopes
 //! retain zero-byte slash-ending objects as inspection-only directory metadata. Nonempty slash-key
 //! payloads fail explicitly rather than being dropped as folder markers. No empty directories are
@@ -64,6 +64,8 @@ pub use crate::transfer::live::{BodyError, BodyFailure, FinishError, Progress as
 use crate::transfer::{Conflict, Digest, Measurement, Provenance, Receipt, Requirement, Transfer};
 
 mod builtin;
+#[cfg(feature = "github")]
+mod github;
 mod http;
 mod layout;
 mod live;
@@ -78,6 +80,10 @@ mod swiss;
 mod webdav;
 
 pub use builtin::SourceError;
+#[cfg(feature = "github")]
+use github::Github;
+#[cfg(feature = "github")]
+pub use github::GithubError;
 use http::Http;
 pub use http::{HttpError, HttpErrorKind, RequestStage};
 pub use live::{CheckedBody, LiveReceipt, OpenedFile};
@@ -142,7 +148,8 @@ impl Client {
 
     /// Starts one pending input. Conversion failures remain sticky until plan/run is awaited.
     /// Materialization collections select all members by default, unless a literal member token is
-    /// requested. Alternative catalogues remain unsupported; there is no implicit first-asset choice.
+    /// requested. The optional `github` capability resolves public release alternatives without an
+    /// implicit first-asset choice. Acquisition requires member/path selection or explicit all.
     pub fn download<T>(&self, input: T) -> Download<'_>
     where
         T: TryInto<Input>,
@@ -406,6 +413,10 @@ impl Client {
             budget.reserve(&file)?;
             return Ok(vec![file].into());
         }
+        #[cfg(feature = "github")]
+        if input.kind() == InputKind::GithubRelease {
+            return Github::resolve(&self.http, input, budget).await;
+        }
         #[cfg(feature = "swisstransfer")]
         if input.kind() == InputKind::SwissTransfer {
             return Swiss::resolve(&self.http, input, budget)
@@ -449,6 +460,10 @@ impl Client {
     }
 
     fn supported(input: &Input) -> Result<(), Error> {
+        #[cfg(feature = "github")]
+        if input.kind() == InputKind::GithubRelease && input.scope() == InputScope::Catalogue {
+            return Ok(());
+        }
         if input.kind() == InputKind::S3 {
             return Ok(());
         }
@@ -479,11 +494,9 @@ impl Client {
         T: TryInto<Input>,
         T::Error: Into<Error>,
     {
-        let mut files: Vec<_> = self
-            .resolve_input(input.try_into().map_err(Into::into)?)
-            .await?
-            .into_files()
-            .collect();
+        let input = input.try_into().map_err(Into::into)?;
+        layout::Layout::alternatives(&input)?;
+        let mut files: Vec<_> = self.resolve_input(input).await?.into_files().collect();
         if files.len() != 1 {
             return Err(Error::FileCardinality);
         }
@@ -493,6 +506,10 @@ impl Client {
     }
 
     async fn open_file(&self, file: &mut File) -> Result<builtin::Opened, Error> {
+        #[cfg(feature = "github")]
+        if file.input.kind() == InputKind::GithubRelease {
+            return Github::open(&self.http, file).await.map(Into::into);
+        }
         if file.input.kind() == InputKind::S3 {
             #[cfg(feature = "s3")]
             {
@@ -1125,6 +1142,19 @@ impl Download<'_> {
         self
     }
 
+    /// Explicitly chooses all alternatives for one original input. Mixed requests attach
+    /// [`Input::all`] to their catalogue occurrence instead; there is no global platform guess.
+    pub fn all(mut self) -> Self {
+        self.inputs = self.inputs.and_then(|mut inputs| {
+            if inputs.len() != 1 {
+                return Err(Error::SelectionScope);
+            }
+            let input = inputs.pop().ok_or(Error::NoInputs)?;
+            Ok(vec![input.all()])
+        });
+        self
+    }
+
     /// Adds an original-path include for one original input; see [`Input::include`] for the fixed
     /// grammar and budgets. Parse/scope failures remain sticky until plan/run is awaited.
     /// For mixed inputs, attach intent to each Input in Rust instead of applying a global pattern.
@@ -1699,6 +1729,15 @@ pub enum Error {
     /// A frozen strong ETag disagreed, disappeared or was refused by the conditional request.
     #[error("remote version changed; discover a fresh request rather than reusing this plan")]
     VersionChanged,
+    /// Optional public release discovery/opening retains sanitized provider failure categories.
+    #[cfg(feature = "github")]
+    #[error("github release failed; inspect the safe provider category")]
+    Github(#[from] GithubError),
+    /// Catalogues never infer the first asset or a native-platform match.
+    #[error(
+        "release alternatives require selection; choose a member, include path or explicit all"
+    )]
+    CatalogueChoice,
     /// Caller expectations bind exactly one actual selected file.
     #[error("global expectation needs exactly one selected file; select one member first")]
     GlobalRequirementCardinality,

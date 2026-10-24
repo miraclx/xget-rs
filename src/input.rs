@@ -48,6 +48,8 @@ pub struct Input {
     pub(crate) ranges: RangeSupport,
     // S3 evidence is separate from reference intent and the provider-scoped member selector.
     pub(crate) s3_version: Option<Zeroizing<String>>,
+    pub(crate) github: Option<Arc<GithubEvidence>>,
+    pub(crate) alternatives: Alternatives,
     // Consumed Files from one resolved inventory retain grouping, while separately parsed identical
     // references remain distinct requested occurrences. This is not a persistent member identifier.
     pub(crate) group: Arc<()>,
@@ -103,6 +105,8 @@ impl Input {
             occurrence: InputOccurrence(0),
             ranges: RangeSupport::Unknown,
             s3_version: None,
+            github: None,
+            alternatives: Alternatives::Select,
             group: Arc::new(()),
         })
     }
@@ -185,7 +189,8 @@ impl Input {
     /// Requests one repeatable provider-scoped member token within this input occurrence.
     /// SwissTransfer uses canonical file UUIDs; S3 trees use literal full object keys, not paths
     /// relative to the prefix and not percent-encoded URLs. WebDAV trees use the inventory's literal
-    /// origin-scoped absolute URI path, without credentials, query or fragment. It is not an input URL.
+    /// origin-scoped absolute URI path, without credentials, query or fragment. GitHub releases use
+    /// the API's positive numeric asset ID in canonical decimal, never a row or name. None is an input URL.
     ///
     /// This is not authorization or an occurrence-local FileId. Fresh discovery must contain exactly
     /// this member; a stale token fails without a path, position or filename fallback. A selected File
@@ -198,10 +203,23 @@ impl Input {
             (InputKind::SwissTransfer, InputScope::Collection) => MemberToken::parse(token),
             (InputKind::S3, InputScope::Tree) => MemberToken::s3(token),
             (InputKind::Http, InputScope::Tree) => MemberToken::webdav(token),
+            (InputKind::GithubRelease, InputScope::Catalogue) => MemberToken::github(token),
             _ => return Err(InputError::UnsupportedMemberSelection),
         };
         self.member = Some(member.ok_or(InputError::InvalidMemberToken)?);
+        if self.kind == InputKind::GithubRelease {
+            self.alternatives = Alternatives::Chosen;
+        }
         Ok(self)
+    }
+
+    /// Explicitly requests all release alternatives, subject to literal/path criteria and budgets.
+    /// This grants neither overwrite permission nor a native-platform choice. Other inputs retain
+    /// their materialization semantics. Repeated calls have the same effect.
+    #[must_use]
+    pub fn all(mut self) -> Self {
+        self.alternatives = Alternatives::All;
+        self
     }
 
     /// Adds an include glob over ORIGINAL source-relative member paths, not output namespaces.
@@ -293,6 +311,8 @@ impl Input {
             occurrence: self.occurrence,
             ranges: self.ranges,
             s3_version: Option::clone(&self.s3_version),
+            github: self.github.as_ref().map(Arc::clone),
+            alternatives: self.alternatives,
             group: Arc::clone(&self.group),
         })
     }
@@ -313,18 +333,19 @@ impl Input {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.s3_version
+        self.github
             .as_ref()
-            .map_or(0, |version| version.len())
-            .saturating_add(
-                self.member
-                    .as_ref()
-                    .map_or(0, |member| member.as_str().len()),
-            )
+            .map_or(0, |_| core::mem::size_of::<GithubEvidence>())
             .saturating_add(
                 self.headers
                     .as_ref()
                     .map_or(0, |headers| headers.text_bytes()),
+            )
+            .saturating_add(self.s3_version.as_ref().map_or(0, |version| version.len()))
+            .saturating_add(
+                self.member
+                    .as_ref()
+                    .map_or(0, |member| member.as_str().len()),
             )
             .saturating_add(self.original_reference().len())
             .saturating_add(self.reference.parsed().as_str().len())
@@ -465,7 +486,12 @@ impl InputKind {
             return Ok((Self::SwissTransfer, InputScope::Collection));
         }
         if host == Some("github.com") && Self::is_release_catalogue(reference.path()) {
-            if reference.scheme() != "https" || reference.port().is_some() {
+            if reference.scheme() != "https"
+                || reference.port().is_some()
+                || !reference.username().is_empty()
+                || reference.password().is_some()
+                || reference.query().is_some()
+            {
                 return Err(InputError::UnsupportedProviderReference);
             }
             return Ok((Self::GithubRelease, InputScope::Catalogue));
@@ -515,7 +541,9 @@ impl InputKind {
 /// scoped by their original bucket/prefix input. Key spelling is not hashed or URL-normalized.
 /// WebDAV selectors are actual absolute URI paths scoped by their original HTTP tree origin/root,
 /// without access queries or credentials; their percent spelling is preserved, not a synthetic URL.
-/// Swiss UUIDs stay inline; S3/WebDAV text has shared zeroizing ownership. Clone is explicit and cheap,
+/// GitHub selectors are actual positive numeric asset IDs in canonical decimal, scoped by the
+/// original repository/release input. They do not prove immutable content or a release-wide snapshot.
+/// Swiss UUIDs and GitHub IDs stay inline; S3/WebDAV text has shared zeroizing ownership. Clone is explicit and cheap,
 /// not an implicit copy of the maximum key size. Only explicit `as_str` access reveals names.
 pub struct MemberToken(MemberSelector);
 
@@ -523,6 +551,8 @@ enum MemberSelector {
     Swiss([u8; 36]),
     S3(Arc<Zeroizing<String>>),
     WebDav(Arc<Zeroizing<String>>),
+    // Canonical decimal u64 spelling inline, never a bearer URL or catalogue row position.
+    Github { text: [u8; 20], length: u8 },
 }
 
 impl MemberToken {
@@ -590,6 +620,27 @@ impl MemberToken {
         )))))
     }
 
+    pub(crate) fn github(value: &str) -> Option<Self> {
+        if value.is_empty()
+            || value.len() > 20
+            || value.starts_with('0')
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || value.parse::<u64>().is_err()
+        {
+            return None;
+        }
+        let mut text = [0; 20];
+        text[..value.len()].copy_from_slice(value.as_bytes());
+        Some(Self(MemberSelector::Github {
+            text,
+            length: value.len() as u8,
+        }))
+    }
+
+    pub(crate) fn is_github(&self) -> bool {
+        matches!(&self.0, MemberSelector::Github { .. })
+    }
+
     pub(crate) fn is_webdav(&self) -> bool {
         matches!(&self.0, MemberSelector::WebDav(_))
     }
@@ -599,6 +650,7 @@ impl MemberToken {
             MemberSelector::Swiss(_) => 0,
             MemberSelector::S3(_) => 1,
             MemberSelector::WebDav(_) => 2,
+            MemberSelector::Github { .. } => 3,
         }
     }
 
@@ -613,6 +665,7 @@ impl MemberToken {
             MemberSelector::Swiss(_) => InputKind::SwissTransfer,
             MemberSelector::S3(_) => InputKind::S3,
             MemberSelector::WebDav(_) => InputKind::Http,
+            MemberSelector::Github { .. } => InputKind::GithubRelease,
         }
     }
 
@@ -624,6 +677,12 @@ impl MemberToken {
                 Err(_) => unreachable!("swiss member selectors contain validated ASCII"),
             },
             MemberSelector::S3(key) | MemberSelector::WebDav(key) => key.as_str(),
+            MemberSelector::Github { text, length } => {
+                match core::str::from_utf8(&text[..usize::from(*length)]) {
+                    Ok(value) => value,
+                    Err(_) => unreachable!("github selectors contain validated ASCII"),
+                }
+            }
         }
     }
 }
@@ -634,6 +693,10 @@ impl Clone for MemberToken {
             MemberSelector::Swiss(bytes) => MemberSelector::Swiss(*bytes),
             MemberSelector::S3(key) => MemberSelector::S3(Arc::clone(key)),
             MemberSelector::WebDav(key) => MemberSelector::WebDav(Arc::clone(key)),
+            MemberSelector::Github { text, length } => MemberSelector::Github {
+                text: *text,
+                length: *length,
+            },
         })
     }
 }
@@ -663,6 +726,66 @@ impl Ord for MemberToken {
 impl fmt::Debug for MemberToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("MemberToken([provider-scoped])")
+    }
+}
+
+/// Private alternative intent, deliberately not a caller-controlled boolean.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum Alternatives {
+    Select,
+    All,
+    Chosen,
+}
+
+/// Non-access-bearing release revision facts, distinct from the stable asset selector.
+/// The timestamp identifies the observed API revision, not immutable payload-byte evidence.
+#[derive(Eq, PartialEq)]
+pub(crate) struct GithubEvidence {
+    pub(crate) release: GithubReleaseId,
+    pub(crate) updated: [u8; 20],
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct GithubReleaseId(pub(crate) u64);
+
+impl GithubEvidence {
+    pub(crate) fn parse(release: u64, updated: &str) -> Option<Self> {
+        let bytes: [u8; 20] = updated.as_bytes().try_into().ok()?;
+        if release == 0
+            || !bytes.iter().enumerate().all(|(index, byte)| match index {
+                4 | 7 => *byte == b'-',
+                10 => *byte == b'T',
+                13 | 16 => *byte == b':',
+                19 => *byte == b'Z',
+                _ => byte.is_ascii_digit(),
+            })
+        {
+            return None;
+        }
+        let number =
+            |start: usize| u16::from(bytes[start] - b'0') * 10 + u16::from(bytes[start + 1] - b'0');
+        let year = number(0) * 100 + number(2);
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days = match number(5) {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return None,
+        };
+        if year == 0
+            || number(8) == 0
+            || number(8) > days
+            || number(11) > 23
+            || number(14) > 59
+            || number(17) > 59
+        {
+            return None;
+        }
+        Some(Self {
+            release: GithubReleaseId(release),
+            updated: bytes,
+        })
     }
 }
 

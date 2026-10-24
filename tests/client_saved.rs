@@ -7,10 +7,10 @@ use std::fs;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
-use wiremock::matchers::{header, method};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use xget::Client;
-use xget::client::{Error, Fresh, SavedError, SavedRun};
+use xget::client::{BindingKey, Error, Fresh, RunId, SavedError, SavedRun};
 use xget::transfer::{Digest, Measurement};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -87,9 +87,25 @@ async fn ordinary_failure_offline_inspection_and_consumed_explicit_rebinding_sha
         .await
         .unwrap();
     let member = saved.members().next().unwrap();
-    let binding = member.key();
+    let binding = member.key().to_string().parse::<BindingKey>().unwrap();
+    let run = saved.id();
+    assert_eq!(run.to_string().parse::<RunId>().unwrap(), run);
+    assert_eq!(binding.run_id(), run);
+    assert_eq!(failure.report.run_id(), Some(run));
     assert_eq!(member.destination().file_name().unwrap(), "chosen.bin");
     assert_eq!(member.attempts().len(), 0); // Opening failed before native submission.
+    let mut foreign = binding.to_string();
+    foreign.truncate(foreign.len() - 8);
+    foreign.push_str("00000001");
+    let before = server.received_requests().await.unwrap().len();
+    let rejected = client
+        .resume(SavedRun::inspect(saved.path()).await.unwrap())
+        .input(foreign.parse::<BindingKey>().unwrap(), reference.as_str())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(rejected.error, Error::Saved(SavedError::Binding)));
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
     server.reset().await;
     Mock::given(method("HEAD"))
         .respond_with(ResponseTemplate::new(500))
@@ -113,6 +129,12 @@ async fn ordinary_failure_offline_inspection_and_consumed_explicit_rebinding_sha
         .await
         .unwrap();
     let completed = report.completed().next().unwrap();
+    let mut bound = report.bound_completed().unwrap();
+    let (completed_key, bound_file) = bound.next().unwrap();
+    assert_eq!(completed_key, binding);
+    assert_eq!(bound_file.destination(), completed.destination());
+    assert_eq!(report.run_id(), Some(run));
+    assert_eq!(bound.len(), 0);
     assert_eq!(completed.receipt().checks().measured(), None);
     assert_eq!(
         completed.receipt().checks().matched_requirements().count(),
@@ -125,6 +147,106 @@ async fn ordinary_failure_offline_inspection_and_consumed_explicit_rebinding_sha
             .is_complete()
     );
     assert_eq!(fs::read(output.path().join("chosen.bin")).unwrap(), b"abc");
+}
+
+#[tokio::test]
+async fn saved_keys_follow_partial_and_revalidated_publication_order() {
+    let output = Directory::new();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"revision-1\""),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/one"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"revision-1\"")
+                .set_body_bytes(b"abc"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/two"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let references = [
+        format!("{}/one", server.uri()),
+        format!("{}/two", server.uri()),
+    ];
+    let client = Client::new().unwrap();
+    let failure = client
+        .download_all(references.iter().map(String::as_str))
+        .to_directory(output.path())
+        .run()
+        .await
+        .unwrap_err();
+    let saved = SavedRun::inspect(failure.report.saved_run().unwrap())
+        .await
+        .unwrap();
+    let keys = saved
+        .members()
+        .map(|member| member.key())
+        .collect::<Vec<_>>();
+    let partial = failure
+        .report
+        .bound_completed()
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].0, keys[0]);
+    assert_eq!(partial[0].1.destination().file_name().unwrap(), "one");
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/one"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/two"))
+        .and(header("if-match", "\"revision-1\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"revision-1\"")
+                .set_body_bytes(b"xyz"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let report = client
+        .resume(saved)
+        .input(keys[0], references[0].as_str())
+        .input(keys[1], references[1].as_str())
+        .run()
+        .await
+        .unwrap();
+    let completed = report.bound_completed().unwrap().collect::<Vec<_>>();
+    assert_eq!(completed.len(), 2);
+    for (index, (key, published)) in completed.into_iter().enumerate() {
+        assert_eq!(key, keys[index]);
+        assert_eq!(key.run_id(), report.run_id().unwrap());
+        assert_eq!(
+            published.destination(),
+            report.completed().nth(index).unwrap().destination()
+        );
+    }
+    assert_eq!(fs::read(output.path().join("one")).unwrap(), b"abc");
+    assert_eq!(fs::read(output.path().join("two")).unwrap(), b"xyz");
 }
 
 async fn failed_exact(

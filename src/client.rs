@@ -1,9 +1,11 @@
-//! Ordinary native HTTP acquisition through the common input, planning and checked publication path.
+//! Ordinary acquisition through the common inventory, planning and checked publication path.
 //!
-//! Files run serially through the native Transfer implementation. Client clones share only reusable
-//! HTTP connections and bounded request/body admission. This is not the legacy parallel range engine,
-//! a global recovery database, or a provider catalogue. Owned run metadata stays in the designated
-//! destination's `.xget-runs` store. Redirects and non-exact/non-HTTP inputs fail explicitly.
+//! Exact HTTP inputs and, with `swisstransfer`, bounded SwissTransfer collections use the same serial
+//! native Transfer implementation. Client clones share reusable HTTP connections and bounded
+//! control/body admission. This is not the legacy parallel range engine or a provider-owned scheduler.
+//! Owned run metadata stays in the designated destination's `.xget-runs` store. Redirects, catalogues
+//! and unsupported tree/provider inputs fail explicitly. SwissTransfer members currently open whole
+//! ordered responses, not parallel ranges or byte-resume sessions.
 //!
 //! ```no_run
 //! use xget::Client;
@@ -51,11 +53,15 @@ mod http;
 mod layout;
 mod live;
 mod saved;
+#[cfg(feature = "swisstransfer")]
+mod swiss;
 
 use http::Http;
 pub use http::{HttpError, HttpErrorKind, RequestStage};
 pub use live::{CheckedBody, LiveReceipt, OpenedFile};
 pub use saved::{BindingKey, Fresh, Resume, SavedError, SavedMember, SavedRun, SavedStatus};
+#[cfg(feature = "swisstransfer")]
+use swiss::Swiss;
 
 #[cfg(test)]
 #[path = "client_tests.rs"]
@@ -95,6 +101,8 @@ impl Client {
     }
 
     /// Starts one pending input. Conversion failures remain sticky until plan/run is awaited.
+    /// Materialization collections select all members by default, unless a literal member token is
+    /// requested. Alternative catalogues remain unsupported; there is no implicit first-asset choice.
     pub fn download<T>(&self, input: T) -> Download<'_>
     where
         T: TryInto<Input>,
@@ -149,32 +157,50 @@ impl Client {
         Ok(collected)
     }
 
-    /// Resolves bounded advisory metadata with HEAD only, never a preview GET.
+    /// Resolves bounded advisory metadata, never a preview payload GET.
     /// The [request deadline](Client#request-deadlines) includes admission waiting.
     ///
-    /// Selected Files preserve their frozen metadata. Unsupported providers/trees return errors,
-    /// not fake inventories. HTTP 405/501 leaves a usable exact unpinned reference without probing GET.
+    /// Selected Files preserve their frozen metadata. Exact HTTP uses HEAD; the optional SwissTransfer
+    /// adapter uses a bounded share-page metadata GET and preserves Collection at every cardinality.
+    /// Unsupported providers/trees return errors, not fake inventories. HTTP 405/501 leaves a usable
+    /// exact unpinned reference without probing GET. Limits are 128 discovered files and 1 MiB retained
+    /// inventory text; exceeding either fails the entire discovery, never returning a truncated value.
     pub async fn resolve<T>(&self, input: T) -> Result<Inventory, Error>
     where
         T: TryInto<Input>,
         T::Error: Into<Error>,
     {
-        let file = self
+        let files = self
             .resolve_input(input.try_into().map_err(Into::into)?)
             .await?;
-        Inventory::complete(vec![file]).map_err(Error::Inventory)
+        Inventory::complete(files).map_err(Error::Inventory)
     }
 
-    async fn resolve_input(&self, mut input: Input) -> Result<File, Error> {
+    async fn resolve_input(&self, input: Input) -> Result<Vec<File>, Error> {
+        self.resolve_bounded(input, &mut DiscoveryBudget::default())
+            .await
+    }
+
+    async fn resolve_bounded(
+        &self,
+        mut input: Input,
+        budget: &mut DiscoveryBudget,
+    ) -> Result<Vec<File>, Error> {
         Self::supported(&input)?;
         if input.retained_bytes() > MAX_METADATA_BYTES {
             return Err(Error::Inventory(InventoryError::Limit));
         }
         if let Some(selected) = input.selected.take() {
-            return Ok(File {
+            let file = File {
                 input,
                 selected: *selected,
-            });
+            };
+            budget.reserve(&file)?;
+            return Ok(vec![file]);
+        }
+        #[cfg(feature = "swisstransfer")]
+        if input.kind() == InputKind::SwissTransfer {
+            return Swiss::resolve(&self.http, input, budget).await;
         }
         let description = self.http.describe(&input).await?;
         let file = File {
@@ -184,13 +210,15 @@ impl Client {
                 description,
             },
         };
-        if file.retained_bytes() > MAX_METADATA_BYTES {
-            return Err(Error::Inventory(InventoryError::Limit));
-        }
-        Ok(file)
+        budget.reserve(&file)?;
+        Ok(vec![file])
     }
 
     fn supported(input: &Input) -> Result<(), Error> {
+        #[cfg(feature = "swisstransfer")]
+        if input.kind() == InputKind::SwissTransfer && input.scope() == InputScope::Collection {
+            return Ok(());
+        }
         if input.kind() != InputKind::Http || input.scope() != InputScope::Exact {
             return Err(Error::UnsupportedInput {
                 kind: input.kind(),
@@ -210,11 +238,23 @@ impl Client {
         T: TryInto<Input>,
         T::Error: Into<Error>,
     {
-        let file = self
+        let mut files = self
             .resolve_input(input.try_into().map_err(Into::into)?)
             .await?;
-        let opened = self.http.open(&file).await?;
+        if files.len() != 1 {
+            return Err(Error::FileCardinality);
+        }
+        let mut file = files.pop().ok_or(Error::FileCardinality)?;
+        let opened = self.open_file(&mut file).await?;
         Ok(OpenedFile::new(file, opened))
+    }
+
+    async fn open_file(&self, file: &mut File) -> Result<http::Opened, Error> {
+        #[cfg(feature = "swisstransfer")]
+        if file.input.kind() == InputKind::SwissTransfer {
+            return Swiss::open(&self.http, file).await;
+        }
+        self.http.open(file).await
     }
 
     /// Executes frozen assignments serially using actual checked native Transfer publication.
@@ -256,6 +296,9 @@ impl Client {
                 failed: None,
             }));
         }
+        if plan.files.is_empty() {
+            return Ok(report);
+        }
         if let Err(error) = Self::prepare_directories(&plan).await {
             return Err(Box::new(RunFailure {
                 error,
@@ -296,7 +339,7 @@ impl Client {
         for (
             index,
             PlannedFile {
-                file,
+                mut file,
                 destination,
                 requirements,
                 measurement,
@@ -339,7 +382,7 @@ impl Client {
                     }));
                 }
             }
-            let opened = match self.http.open(&file).await {
+            let opened = match self.open_file(&mut file).await {
                 Ok(opened) => opened,
                 Err(error) => {
                     return Err(Box::new(RunFailure {
@@ -354,6 +397,20 @@ impl Client {
                     }));
                 }
             };
+            // The first actual provider response establishes the frozen pin. Checkpoint it before
+            // any native request can create state, so a later lease renewal cannot choose latest.
+            if let Err(error) = owned.opened(index, &file).await {
+                return Err(Box::new(RunFailure {
+                    error: Error::Saved(error),
+                    report,
+                    failed: Some(PlannedFile {
+                        file,
+                        destination,
+                        requirements,
+                        measurement,
+                    }),
+                }));
+            }
             let version = opened.version;
             let mut transfer =
                 Transfer::from_body(opened.body, opened.length).measurement(measurement);
@@ -595,6 +652,22 @@ enum Reentry {
 }
 
 impl Download<'_> {
+    /// Selects one literal repeatable adapter token for a single original input.
+    ///
+    /// Intent is retained before automatic unfinished-run matching, so continuation never evaluates
+    /// a mutable manifest again. This initial API supports ID selection only; path globs and exclusions
+    /// are not accepted here. Use Inventory iteration for one-shot in-memory path selection.
+    pub fn select_id(mut self, token: &str) -> Self {
+        self.inputs = self.inputs.and_then(|mut inputs| {
+            if inputs.len() != 1 {
+                return Err(Error::SelectionScope);
+            }
+            let input = inputs.pop().ok_or(Error::NoInputs)?;
+            Ok(vec![input.select_id(token)?])
+        });
+        self
+    }
+
     /// Intentionally discovers new work instead of matching unfinished owned runs. Old run artifacts
     /// remain untouched; Fresh does not grant overwrite or restart any existing attempt.
     pub fn fresh(mut self, _policy: Fresh) -> Self {
@@ -631,8 +704,11 @@ impl Download<'_> {
         self
     }
 
-    /// Resolves HEAD metadata and freezes all selections, requirements and output assignments.
-    /// No GET, output creation or lasting ownership is acquired.
+    /// Resolves bounded metadata and freezes selections, requirements and output assignments.
+    /// Discovery has a shared 15-second deadline, count and text budget across all input occurrences.
+    /// There is no payload GET, output creation or lasting ownership. SwissTransfer uses readable
+    /// `SwissTransfer` grouping where a group is needed because no real title field is established.
+    /// Equal groups conflict; use explicit Input namespaces rather than relying on suffixes.
     pub async fn plan(self) -> Result<Plan, Error> {
         let Self {
             client,
@@ -643,28 +719,54 @@ impl Download<'_> {
             reentry: _,
         } = self;
         let inputs = inputs?;
+        let input_count = inputs
+            .iter()
+            .enumerate()
+            .filter(|(index, input)| {
+                !inputs[..*index]
+                    .iter()
+                    .any(|previous| Arc::ptr_eq(&previous.group, &input.group))
+            })
+            .count();
         let requirements = requirements.map_err(Error::ConflictingRequirements)?;
-        let mut retained = inputs.iter().fold(0_usize, |bytes, input| {
+        let retained = inputs.iter().fold(0_usize, |bytes, input| {
             bytes.saturating_add(input.retained_bytes())
         });
-        let mut files = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let original_bytes = input.retained_bytes();
-            let file = client.resolve_input(input).await?;
-            retained = retained
-                .checked_sub(original_bytes)
-                .and_then(|bytes| bytes.checked_add(file.retained_bytes()))
-                .filter(|bytes| *bytes <= MAX_METADATA_BYTES)
-                .ok_or(Error::Inventory(InventoryError::Limit))?;
-            // Stop before admitting another HEAD when newly retained metadata exhausts the budget.
-            files.push(file);
+        let mut budget = DiscoveryBudget {
+            files: MAX_FILES,
+            bytes: MAX_METADATA_BYTES
+                .checked_sub(retained)
+                .ok_or(Error::Inventory(InventoryError::Limit))?,
+        };
+        for input in &inputs {
+            Client::supported(input)?;
         }
+        let needs_metadata = inputs.iter().any(|input| input.selected.is_none());
+        if needs_metadata {
+            Http::runtime()?;
+        }
+        let discovery = async {
+            let mut files = Vec::new();
+            for (index, mut input) in inputs.into_iter().enumerate() {
+                input.occurrence = crate::input::InputOccurrence(index as u32);
+                budget.bytes += input.retained_bytes();
+                files.extend(client.resolve_bounded(input, &mut budget).await?);
+            }
+            Ok::<_, Error>(files)
+        };
+        let files = if needs_metadata {
+            tokio::time::timeout(core::time::Duration::from_secs(15), discovery)
+                .await
+                .map_err(|_| Error::HeaderTimeout)??
+        } else {
+            discovery.await?
+        };
         let inventory = Inventory::complete(files).map_err(Error::Inventory)?;
         let files: Vec<_> = inventory.into_files().collect();
         if requirements.iter().next().is_some() && files.len() != 1 {
             return Err(Error::GlobalRequirementCardinality);
         }
-        layout::Layout::freeze(files, target, requirements, measurement)
+        layout::Layout::freeze(files, target, requirements, measurement, input_count)
     }
 
     /// Continues uniquely matching unfinished owned work before mutable HEAD/discovery. No match
@@ -712,19 +814,11 @@ impl Download<'_> {
                 .await
                 .map_err(|error| RunFailure::before_execution(Error::Saved(error)))?
         {
-            let keys: Vec<_> = saved.members().map(|member| member.key()).collect();
-            if keys.len() != inputs.len() {
-                return Err(RunFailure::before_execution(Error::Saved(
-                    SavedError::Binding,
-                )));
-            }
-            let mut resume = client.resume(saved);
-            // Exact HTTP inventory has one member per input occurrence. Binding compares the
-            // original intent, including namespace/query, without making a metadata request.
-            for (key, input) in keys.into_iter().zip(inputs) {
-                resume = resume.input(key, input);
-            }
-            return resume.run().await;
+            return saved
+                .bind_request(client, inputs)
+                .map_err(|error| RunFailure::before_execution(Error::Saved(error)))?
+                .run()
+                .await;
         }
         let plan = Download {
             client,
@@ -747,6 +841,34 @@ impl Download<'_> {
 impl fmt::Debug for Download<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Download([pending redacted request])")
+    }
+}
+
+// One request-wide retained inventory budget, debited before selection. A selector cannot hide a
+// larger discovery, and later inputs cannot independently each retain the entire common allowance.
+struct DiscoveryBudget {
+    files: usize,
+    bytes: usize,
+}
+impl Default for DiscoveryBudget {
+    fn default() -> Self {
+        Self {
+            files: MAX_FILES,
+            bytes: MAX_METADATA_BYTES,
+        }
+    }
+}
+impl DiscoveryBudget {
+    fn reserve(&mut self, file: &File) -> Result<(), Error> {
+        self.files = self
+            .files
+            .checked_sub(1)
+            .ok_or(Error::Inventory(InventoryError::Limit))?;
+        self.bytes = self
+            .bytes
+            .checked_sub(file.retained_bytes())
+            .ok_or(Error::Inventory(InventoryError::Limit))?;
+        Ok(())
     }
 }
 
@@ -817,12 +939,15 @@ impl fmt::Debug for PlannedFile {
     }
 }
 
-/// Observed consistency of the GET with the advisory HEAD, not authenticity or a content hash.
+/// Observed response version consistency, not authenticity or a content hash.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VersionConsistency {
+    /// The first actual provider response established a strong pin before body/native effects.
+    StrongEtagEstablished,
     /// No strong version was available; this is a fresh unpinned ordered response.
     Unpinned,
-    /// Conditional GET and its returned strong ETag agreed with the frozen HEAD validator.
+    /// Conditional GET and its returned strong ETag agreed with the frozen pin, whether that pin
+    /// came from HEAD metadata or an earlier actual provider response.
     StrongEtagMatched,
 }
 
@@ -937,7 +1062,7 @@ pub enum Error {
     #[error("invalid input; inspect the typed input error")]
     Input(#[from] InputError),
     /// Unsupported scopes never produce fake successful inventories.
-    #[error("unsupported input scope; use an exact http or https reference with this client")]
+    #[error("unsupported input scope; use exact http or enable a supported collection adapter")]
     UnsupportedInput {
         /// Safe recognized family.
         kind: InputKind,
@@ -947,6 +1072,18 @@ pub enum Error {
     /// Empty requests differ from genuine complete empty inventories.
     #[error("no inputs; supply at least one reference or selected file")]
     NoInputs,
+    /// Provider protocol/gate failures contain no remote text, identifiers or bearer values.
+    #[cfg(feature = "swisstransfer")]
+    #[error(
+        "swisstransfer metadata or access is invalid or unsupported; check the share and access"
+    )]
+    SwissProtocol,
+    /// A request-level literal selector cannot accidentally apply to several independent inputs.
+    #[error("member selector needs one original input; use input-local selection for mixed inputs")]
+    SelectionScope,
+    /// Literal selector intent never falls back to the first file or a matching path.
+    #[error("member selection matched no files; list the share and choose a current member token")]
+    Selection,
     /// Bounded metadata failure does not expose a truncated inventory.
     #[error("metadata limit exceeded; request a smaller scope")]
     Inventory(#[from] InventoryError),

@@ -177,8 +177,13 @@ fn owned_reference_preserves_original_spelling_credentials_and_queries() {
 
 #[test]
 fn provider_queries_and_userinfo_are_not_stripped_to_manufacture_an_identity() {
+    assert!(matches!(
+        Input::parse(
+            "https://user:password@swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444?token=secret"
+        ),
+        Err(InputError::UnsupportedProviderReference)
+    ));
     for reference in [
-        "https://user:password@swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444?token=secret",
         "https://user:password@github.com/owner/project/releases/tag/v1?token=secret",
         "s3://user:password@bucket/key?versionId=secret",
         "ipfs://user:password@bafyexample/path?token=secret",

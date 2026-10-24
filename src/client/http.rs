@@ -29,6 +29,10 @@ const MAX_PATH: usize = 4096;
 pub(super) struct Http {
     client: reqwest::Client,
     admission: Arc<Semaphore>,
+    // Tests map already-validated service/object authorities onto one owned loopback listener.
+    // There is deliberately no production endpoint override or credential-origin bypass.
+    #[cfg(test)]
+    fixture: Option<url::Url>,
 }
 
 impl Http {
@@ -51,7 +55,16 @@ impl Http {
         Ok(Self {
             client,
             admission: Arc::new(Semaphore::new(maximum.get())),
+            #[cfg(test)]
+            fixture: None,
         })
+    }
+
+    #[cfg(all(test, feature = "swisstransfer"))]
+    pub(super) fn fixture(uri: &str, maximum: NonZeroUsize) -> Self {
+        let mut http = Self::new(maximum).unwrap_or_else(|_| panic!("fixture http configuration"));
+        http.fixture = Some(url::Url::parse(uri).unwrap_or_else(|_| panic!("fixture uri")));
+        http
     }
 
     pub(super) fn runtime() -> Result<(), Error> {
@@ -105,10 +118,20 @@ impl Http {
     }
 
     pub(super) async fn open(&self, file: &File) -> Result<Opened, Error> {
+        self.open_reference(file, &file.input)
+            .await
+            .map(|(opened, _)| opened)
+    }
+
+    pub(super) async fn open_reference(
+        &self,
+        file: &File,
+        reference: &Input,
+    ) -> Result<(Opened, Option<Zeroizing<String>>), Error> {
         let description = &file.selected.description;
         let admitted = self
             .headers(
-                &file.input,
+                reference,
                 Method::GET,
                 description.etag.as_deref().map(String::as_str),
             )
@@ -123,8 +146,23 @@ impl Http {
             return Err(Error::InvalidMetadata);
         }
         let mut length = Self::length(response)?;
+        let actual = Self::strong_etag(response)?;
+        if file.input.kind() == crate::input::InputKind::SwissTransfer {
+            if actual.is_none() {
+                return Err(Error::InvalidMetadata);
+            }
+            // Whole provider responses must establish the entire frozen representation. Absence of
+            // a declaration is handled by the common EOF checker against manifest length.
+            match (description.length, length) {
+                (Length::Known(expected), Length::Known(found)) if expected != found => {
+                    return Err(Error::VersionChanged);
+                }
+                (Length::Known(expected), Length::Unknown) => length = Length::Known(expected),
+                (Length::Unknown, _) => return Err(Error::InvalidMetadata),
+                _ => {}
+            }
+        }
         let version = if let Some(expected) = &description.etag {
-            let actual = Self::strong_etag(response)?;
             if actual.as_ref().map(|value| value.as_str()) != Some(expected.as_str()) {
                 return Err(Error::VersionChanged);
             }
@@ -145,14 +183,51 @@ impl Http {
         // while callers need a nameable body that can retain the shared admission permit.
         let AdmittedResponse { response, permit } = admitted;
         let stream = Box::pin(response.bytes_stream());
-        Ok(Opened {
-            body: HttpBody {
-                stream: Some(stream),
-                permit: Some(permit),
+        Ok((
+            Opened {
+                body: HttpBody {
+                    stream: Some(stream),
+                    permit: Some(permit),
+                },
+                length,
+                version,
             },
-            length,
-            version,
-        })
+            actual,
+        ))
+    }
+
+    #[cfg(feature = "swisstransfer")]
+    pub(super) async fn metadata(
+        &self,
+        input: &Input,
+        maximum: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        Self::runtime()?;
+        let operation = async {
+            let mut admitted = self.headers(input, Method::GET, None).await?;
+            Self::status(&admitted.response, RequestStage::Metadata)?;
+            Self::validate_headers(&admitted.response)?;
+            if admitted.response.headers().contains_key(CONTENT_RANGE) {
+                return Err(Error::InvalidMetadata);
+            }
+            if matches!(Self::length(&admitted.response)?, Length::Known(ByteCount(count)) if count > maximum as u64)
+            {
+                return Err(Error::Inventory(crate::inventory::InventoryError::Limit));
+            }
+            let mut bytes = Zeroizing::new(Vec::new());
+            while let Some(chunk) = admitted.response.chunk().await.map_err(HttpError::new)? {
+                if chunk.len() > maximum.saturating_sub(bytes.len()) {
+                    return Err(Error::Inventory(crate::inventory::InventoryError::Limit));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
+        };
+        // Metadata's deadline covers its body as well as admission and headers. No retained control
+        // permit survives this call, including malformed, oversized and never-ready response paths.
+        tokio::time::timeout(HEADERS_DEADLINE, operation)
+            .await
+            .map_err(|_| Error::HeaderTimeout)?
     }
 
     async fn headers(
@@ -167,9 +242,19 @@ impl Http {
                 .acquire_owned()
                 .await
                 .map_err(|_| Error::AdmissionLimit)?;
+            let reference = url::Url::clone(input.parsed_reference());
+            #[cfg(test)]
+            let reference = if let Some(fixture) = &self.fixture {
+                let mut target = url::Url::clone(fixture);
+                target.set_path(reference.path());
+                target.set_query(reference.query());
+                target
+            } else {
+                reference
+            };
             let mut request = self
                 .client
-                .request(method, url::Url::clone(input.parsed_reference()))
+                .request(method, reference)
                 .header(ACCEPT_ENCODING, "identity");
             if let Some(etag) = etag {
                 request = request.header(IF_MATCH, etag);

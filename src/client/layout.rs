@@ -2,6 +2,7 @@ use core::borrow::Borrow;
 use core::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use unicode_casefold::UnicodeCaseFold as _;
 use unicode_normalization::UnicodeNormalization as _;
@@ -18,6 +19,30 @@ pub(super) struct Layout {
 }
 
 impl Layout {
+    pub(super) fn source_path(path: &str) -> Result<(), Error> {
+        if path.len() > 4096 || path.split('/').count() > 64 {
+            return Err(Error::LayoutLimit);
+        }
+        for component in path.split('/') {
+            Self::component(component)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "swisstransfer")]
+    pub(super) fn source_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<(), Error> {
+        let mut layout = Self {
+            files: BTreeSet::new(),
+            directories: BTreeMap::new(),
+        };
+        for path in paths {
+            Self::source_path(path)?;
+            let components: Vec<_> = path.split('/').collect();
+            layout.claim(&components)?;
+        }
+        Ok(())
+    }
+
     // Recovery validates stored assignments using exactly the same managed-role/collision policy,
     // without deriving names again or changing frozen assignments.
     #[cfg(unix)]
@@ -52,6 +77,7 @@ impl Layout {
         target: Target,
         global: Requirements,
         measurement: Measurement,
+        input_count: usize,
     ) -> Result<Plan, Error> {
         if let Target::File(destination) = target {
             if files.len() != 1 {
@@ -77,6 +103,8 @@ impl Layout {
                 directories: Vec::new(),
             });
         }
+        let explicit_directory = matches!(target, Target::Directory(_));
+        let multiple_inputs = input_count > 1;
         let root = match target {
             Target::Default => PathBuf::from("."),
             Target::Directory(root) => root,
@@ -97,6 +125,7 @@ impl Layout {
         };
         let mut output_directories = BTreeSet::new();
         let mut planned = Vec::with_capacity(files.len());
+        let mut groups = BTreeMap::new();
         for file in files {
             let namespace = file.namespace().map(|namespace| namespace.as_str());
             // Bound prefix-key retention before collecting or copying any namespace prefixes.
@@ -105,10 +134,41 @@ impl Layout {
             }) {
                 return Err(Error::LayoutLimit);
             }
-            let mut components: Vec<_> = namespace
-                .map(|namespace| namespace.split('/').collect())
+            let collection = file.input.scope() == crate::input::InputScope::Collection;
+            // No title field is evidenced by the service protocol. This is an honest readable
+            // fallback, never a share UUID or a silently suffixed namespace.
+            let group = namespace.or_else(|| {
+                (collection && (!explicit_directory || multiple_inputs)).then_some("SwissTransfer")
+            });
+            if collection && let Some(group) = group {
+                let key = group
+                    .split('/')
+                    .map(Self::component)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .iter()
+                    .map(|part| part.as_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if let Some(previous) = groups.insert(
+                    CollisionKey(Zeroizing::new(key)),
+                    Arc::clone(&file.input.group),
+                ) && !Arc::ptr_eq(&previous, &file.input.group)
+                {
+                    return Err(Error::LayoutConflict);
+                }
+            }
+            let mut components: Vec<_> = group
+                .map(|group| group.split('/').collect())
                 .unwrap_or_default();
-            components.push(file.name_hint().ok_or(Error::MissingName)?);
+            if collection {
+                Self::source_path(file.source_path())?;
+                components.extend(file.source_path().split('/'));
+            } else {
+                components.push(file.name_hint().ok_or(Error::MissingName)?);
+            }
+            if components.len() > 64 {
+                return Err(Error::LayoutLimit);
+            }
             layout.claim(&components)?;
             // Claim validates every component before any join. Names cannot escape the explicit
             // root or acquire URL-decoding/path-normalization meaning at the filesystem boundary.
@@ -183,7 +243,9 @@ impl Layout {
                 if self.directories.contains_key(prefix.as_str()) {
                     return Err(Error::LayoutConflict);
                 }
-                self.files.insert(CollisionKey(Zeroizing::clone(&prefix)));
+                if !self.files.insert(CollisionKey(Zeroizing::clone(&prefix))) {
+                    return Err(Error::LayoutConflict);
+                }
             } else if let Some(existing) = self.directories.get(prefix.as_str()) {
                 // Equivalent but differently spelled directories must not silently merge groups on
                 // one filesystem while creating separate groups on another.

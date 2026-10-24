@@ -1,4 +1,5 @@
-//! Bounded normalized private version 1 encoding. No references, foreign errors or hasher state.
+//! Bounded normalized private V1/V2 encoding. No references, foreign errors or hasher state.
+//! V1 round-trips as V1; V2 explicitly records input occurrence and adapter member/path bindings.
 
 use std::path::Path;
 #[cfg(unix)]
@@ -17,7 +18,6 @@ use crate::transfer::{Algorithm, ByteCount, Length, Measurement, Provenance};
 use crate::transfer::{Digest, StateRef};
 
 const MAGIC: &[u8; 8] = b"XGETRUN\0";
-const VERSION: u32 = 1;
 const MAX_PATH: usize = 4096;
 const MAX_VALIDATOR: usize = 8192;
 
@@ -31,9 +31,46 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
     {
         return Err(SavedError::Limit);
     }
+    if !matches!(record.version, 1 | 2) {
+        return Err(SavedError::Version);
+    }
+    for (index, member) in record.members.iter().enumerate() {
+        if member.occurrence.0 as usize >= MAX_FILES
+            || (record.version == 1
+                && (member.remote.is_some() || member.occurrence.0 as usize != index))
+        {
+            return Err(SavedError::Corrupt);
+        }
+        if let Some(remote) = &member.remote {
+            crate::client::layout::Layout::source_path(&remote.source_path)
+                .map_err(|_| SavedError::Corrupt)?;
+            if matches!(member.length, Length::Unknown)
+                || (!member.attempts.is_empty() && member.etag.is_none())
+            {
+                return Err(SavedError::Corrupt);
+            }
+        }
+        for previous in &record.members[..index] {
+            if previous.occurrence == member.occurrence
+                && (previous.binding != member.binding
+                    || previous.remote.is_none()
+                    || member.remote.is_none()
+                    || previous.remote.as_ref().map(|remote| remote.token)
+                        == member.remote.as_ref().map(|remote| remote.token))
+            {
+                return Err(SavedError::Corrupt);
+            }
+        }
+        if record.members[..index]
+            .last()
+            .is_some_and(|previous| previous.occurrence > member.occurrence)
+        {
+            return Err(SavedError::Corrupt);
+        }
+    }
     let mut out = Encoder(Vec::new());
     out.0.extend_from_slice(MAGIC);
-    out.u32(VERSION);
+    out.u32(record.version);
     out.path(&record.root)?;
     out.u64(record.identity.device.0);
     out.u64(record.identity.inode.0);
@@ -52,6 +89,17 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
     out.u32(record.members.len() as u32);
     for member in &record.members {
         out.0.extend_from_slice(&member.binding.0);
+        if record.version == 2 {
+            out.u32(member.occurrence.0);
+            match &member.remote {
+                None => out.byte(0),
+                Some(remote) => {
+                    out.byte(1);
+                    out.bytes(remote.token.as_str().as_bytes(), 36)?;
+                    out.bytes(remote.source_path.as_bytes(), MAX_PATH)?;
+                }
+            }
+        }
         out.path(&member.destination)?;
         match member.length {
             Length::Unknown => out.byte(0),
@@ -97,7 +145,8 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
     if input.take(8)? != MAGIC {
         return Err(SavedError::Corrupt);
     }
-    if input.u32()? != VERSION {
+    let version = input.u32()?;
+    if !matches!(version, 1 | 2) {
         return Err(SavedError::Version);
     }
     let payload_length = bytes.len() - 32;
@@ -133,8 +182,23 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
         return Err(SavedError::Corrupt);
     }
     let mut members = Vec::with_capacity(count);
-    for _ in 0..count {
+    for index in 0..count {
         let binding = input.fingerprint()?;
+        let (occurrence, remote) = if version == 1 {
+            (crate::input::InputOccurrence(index as u32), None)
+        } else {
+            let occurrence = crate::input::InputOccurrence(input.u32()?);
+            let remote = match input.byte()? {
+                0 => None,
+                1 => Some(super::FrozenMember {
+                    token: crate::input::MemberToken::parse(input.text(36)?)
+                        .ok_or(SavedError::Corrupt)?,
+                    source_path: Zeroizing::new(input.text(MAX_PATH)?.to_owned()),
+                }),
+                _ => return Err(SavedError::Corrupt),
+            };
+            (occurrence, remote)
+        };
         let destination = input.path()?;
         let length = match input.byte()? {
             0 => Length::Unknown,
@@ -195,6 +259,8 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
             return Err(SavedError::Corrupt);
         }
         members.push(Member {
+            occurrence,
+            remote,
             binding,
             destination,
             length,
@@ -208,6 +274,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
         return Err(SavedError::Corrupt);
     }
     let record = Record {
+        version,
         root,
         identity,
         store_identity,

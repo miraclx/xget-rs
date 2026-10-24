@@ -6,9 +6,10 @@
 - Read `STYLE.md` before writing code. It is the contract, including the narrow private-pipeline
   exception. `../craft/REVIEW.md` defines review evidence, severity and closure vocabulary.
 - `notes/craft-backlog.md` tracks open work. Historical reviews are not rewritten when a later fix lands.
-- The ordinary Client implements exact HTTP inventory, selection, frozen multi-input layout, serial
-  native publication/live opening and owned frozen-run continuation. It does not implement provider
-  collections, trees, parallel ranges/partial-byte reuse, restart/overwrite or the redesigned CLI.
+- The ordinary Client implements exact HTTP and optional bounded SwissTransfer inventories, literal
+  member selection, frozen multi-input layout, serial native publication/live opening and owned frozen-run
+  continuation. Other provider trees/catalogues, parallel ranges/partial-byte reuse, restart/overwrite
+  and the redesigned CLI remain unimplemented.
 
 ## Workspace boundary
 
@@ -133,7 +134,7 @@ not writable reader authority. This does not enable ordinary Client parallel ran
 
 ## Owned aggregate continuation
 
-Ordinary exact-HTTP runs use the designated root's bounded `.xget-runs` store. Unique unfinished
+Ordinary exact-HTTP and enabled collection runs use the designated root's bounded `.xget-runs` store. Unique unfinished
 matching precedes mutable discovery; complete prior runs do not match and ambiguity exposes actual
 paths. Request fingerprints are private intent matching, not source identity, authorization or reopen
 capabilities. Records freeze members, assignments, validators and check policies, never raw access
@@ -151,6 +152,21 @@ checks, never appends old partial bytes or invents a saved reader pin. Old attem
 Fresh bypasses continuation, not overwrite or cleanup. No restart/legacy import or successful pause is
 claimed. Atomic normalized metadata checksums are not hidden payload fingerprints or authenticated state.
 
+## Common collection adapter
+
+The optional library-only `swisstransfer` adapter feeds the ordinary Client coordinator. No CLI feature,
+synthetic member URL, provider scheduler, singleton flattening or opaque final root is implemented.
+Members carry share-scoped repeatable tokens separately from occurrence-local FileId and renewable
+access. Original occurrences map to zero/one/many frozen members; V2 saved records persist that mapping
+and source paths, while V1 exact records keep V1 checkpoint semantics. Match unfinished intent before
+mutable discovery/selection. Supplied selected files must agree with frozen member/version/check facts.
+
+Complete discovery debits shared count/text bounds before selection. Whole opening responses require
+identity encoding, exact manifest-compatible length and a strong ETag. Checkpoint the first pin before
+native submission; renewed access cannot silently select latest. One expired-denial renewal is bounded;
+a live denial is not renewal permission. Keep signatures/cookies/remote diagnostics out of records and
+source chains. Foreign parser temporary wiping and hard CPU deadline preemption are not promised.
+
 ## Transport scope
 
 HTTP validates the full requested response window and declared length. The current S3 policy instead
@@ -160,8 +176,8 @@ or version continuity. Their client uses explicit fixture credentials/region/end
 AWS configuration or metadata discovery. Do not substitute a handwritten response struct for SDK I/O.
 
 `s3` and `ipfs` gate library sources; the CLI forwards those capabilities. The root's vestigial
-aws-credential-types/aws-smithy-types feature aliases do not independently enable S3 code. SwissTransfer
-is a later common-library adapter, not a feature of this workspace boundary.
+aws-credential-types/aws-smithy-types feature aliases do not independently enable S3 code. SwissTransfer is a separate optional library
+adapter; the compiled legacy CLI does not yet use it.
 
 ## CLI contract and known carries
 

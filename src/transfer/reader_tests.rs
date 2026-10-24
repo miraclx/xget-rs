@@ -25,8 +25,20 @@ impl Directory {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("xget-reader-{}-{time:x}", std::process::id()));
+        Self::with_stamp(time)
+    }
+
+    fn with_stamp(time: u128) -> Self {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        // Wall-clock precision is not uniqueness. The counter distinguishes same-process calls;
+        // create_dir still rejects any stale collision rather than adopting an existing directory.
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "xget-reader-{}-{time:x}-{sequence:x}",
+            std::process::id()
+        ));
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
@@ -42,6 +54,14 @@ impl Drop for Directory {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).unwrap();
     }
+}
+
+#[test]
+fn directories_created_at_the_same_clock_stamp_do_not_alias() {
+    let first = Directory::with_stamp(1);
+    let second = Directory::with_stamp(1);
+    assert_ne!(first.0, second.0);
+    assert!(first.0.is_dir() && second.0.is_dir());
 }
 
 // Native protocol scenarios cannot execute on unsupported hosts.

@@ -749,6 +749,34 @@ fn invalid_inputs_exit_two_without_echoing_secrets_or_creating_outputs() {
 }
 
 #[test]
+fn malformed_expectations_explain_the_format_before_network_or_output_effects() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::Complete);
+    let reference = server.reference("/a.bin?signature=parse-query-marker");
+    for value in [
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "sha256:parse-value-marker",
+    ] {
+        let result = directory.run(&[&reference, "-o", "out.bin", "--expect", value, "--json"]);
+        assert_eq!(result.status.code(), Some(2));
+        assert!(result.stdout.is_empty());
+        let records = events(&result.stderr);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "Error");
+        let message = records[0]["facts"]["message"].as_str().unwrap();
+        assert!(message.contains("invalid --expect value"));
+        assert!(message.contains("sha256:"));
+        assert!(!message.contains(value));
+        let text = String::from_utf8(result.stderr).unwrap();
+        assert!(!text.contains("parse-query-marker"));
+        assert!(!text.contains("parse-value-marker"));
+        assert!(server.requests().is_empty());
+        assert!(!directory.path().join("out.bin").exists());
+        assert!(!directory.path().join(".xget-runs").exists());
+    }
+}
+
+#[test]
 fn list_and_real_dryrun_use_metadata_only_without_native_effects() {
     let directory = Directory::fresh();
     let server = Server::start(Behavior::Complete);

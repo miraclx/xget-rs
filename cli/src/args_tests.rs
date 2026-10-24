@@ -14,6 +14,39 @@ fn no_input_is_a_request_error_not_an_empty_success() {
 }
 
 #[test]
+fn malformed_expectations_explain_the_format_without_echoing_rejected_values() {
+    for value in [
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "https://example.invalid/parse-secret-marker",
+        "sha256:parse-secret-marker",
+    ] {
+        let error = Cli::try_parse_from(["xget", "--expect", value])
+            .err()
+            .unwrap();
+        let failure = Cli::parse_failure(&error);
+        assert_eq!(failure.code(), 2);
+        assert!(failure.message().contains("invalid --expect value"));
+        assert!(failure.message().contains("sha256:"));
+        assert!(!failure.message().contains(value));
+        assert!(!failure.message().contains("parse-secret-marker"));
+    }
+}
+
+#[test]
+fn unrelated_parser_errors_do_not_inherit_expectation_advice_or_reveal_values() {
+    for arguments in [
+        vec!["xget", "--parse-secret-marker"],
+        vec!["xget", "-s", "parse-secret-marker"],
+    ] {
+        let error = Cli::try_parse_from(arguments).err().unwrap();
+        let failure = Cli::parse_failure(&error);
+        assert_eq!(failure.code(), 2);
+        assert!(!failure.message().contains("invalid --expect value"));
+        assert!(!failure.message().contains("parse-secret-marker"));
+    }
+}
+
+#[test]
 fn exact_share_and_mixed_inputs_use_one_explicit_front_door() {
     for arguments in [
         vec!["xget", "https://example.test/a"],

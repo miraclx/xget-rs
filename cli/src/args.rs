@@ -25,6 +25,28 @@ pub(crate) struct Cli {
     pub(crate) download: download::Command,
 }
 
+impl Cli {
+    pub(crate) fn parse_failure(error: &clap::Error) -> crate::failure::Failure {
+        use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+        // Recognize only our fixed option spelling; rejected values and foreign diagnostics
+        // can contain bearer references and must never reach the presentation boundary.
+        if error.kind() == ErrorKind::ValueValidation
+            && matches!(
+                error.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(argument)) if argument == "--expect <ALGORITHM:HEX>"
+            )
+        {
+            return crate::failure::Failure::request(
+                "invalid --expect value; prefix the hex digest with its algorithm, for example sha256: followed by 64 hex digits",
+            );
+        }
+        crate::failure::Failure::request(
+            "invalid command or value; use xget --help and explicit -o/-D output",
+        )
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Inspect bounded remote metadata without opening payloads or creating outputs.

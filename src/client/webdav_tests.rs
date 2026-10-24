@@ -796,3 +796,66 @@ impl Drop for Scratch {
         let _cleanup = fs::remove_dir_all(&self.0);
     }
 }
+
+#[tokio::test]
+async fn scoped_headers_reach_propfind_and_member_opening_without_changing_managed_headers() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "/dav/",
+        listing([
+            directory("/dav/"),
+            file("/dav/empty", 0, Some("&quot;v1&quot;")),
+        ]),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/dav/empty"))
+        .and(header("authorization", "Bearer scoped-dav-marker"))
+        .and(header("if-match", "\"v1\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_bytes(Vec::<u8>::new()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let input = tree(&server)
+        .header("Authorization", "Bearer scoped-dav-marker")
+        .expect("access");
+    let client = Client::new().expect("client");
+    let file = client
+        .resolve(input)
+        .await
+        .expect("complete listing")
+        .select_one(|_| true)
+        .expect("one file");
+    let mut body = client.open(file).await.expect("opening").into_body();
+    while let Some(chunk) = body.next().await {
+        assert!(chunk.expect("body").is_empty());
+    }
+    body.finish().expect("clean checked EOF");
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(
+            request
+                .headers
+                .get("authorization")
+                .expect("scoped access")
+                .to_str()
+                .expect("ascii"),
+            "Bearer scoped-dav-marker"
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("accept-encoding")
+                .expect("managed encoding")
+                .to_str()
+                .expect("ascii"),
+            "identity"
+        );
+    }
+}

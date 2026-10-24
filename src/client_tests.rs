@@ -2237,3 +2237,154 @@ async fn multiple_files_emit_distinct_frozen_keys_and_one_terminal_event() {
     assert_eq!(events.last(), Some(&Observed::Completed(2)));
     assert_eq!(payload_gets, 2);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn access_headers_stay_with_one_input_and_never_enter_owned_records() {
+    let root = Directory::new();
+    let server = MockServer::start().await;
+    let private = exact(&server, "/private").await;
+    let public = exact(&server, "/public").await;
+    let secret = "Bearer scoped-secret-marker";
+    let client = Client::new().expect("client");
+    let report = client
+        .download_all([
+            Input::parse(&private)
+                .expect("private")
+                .header("Authorization", secret)
+                .expect("access"),
+            Input::parse(&public).expect("public"),
+        ])
+        .to_directory(root.path())
+        .run()
+        .await
+        .expect("both inputs");
+    assert_eq!(report.completed().len(), 2);
+    let requests = server.received_requests().await.expect("requests");
+    for request in requests {
+        if request.url.path() == "/private" {
+            assert_eq!(
+                request
+                    .headers
+                    .get("authorization")
+                    .expect("scoped header")
+                    .to_str()
+                    .expect("ascii"),
+                secret
+            );
+        } else {
+            assert!(!request.headers.contains_key("authorization"));
+        }
+    }
+    let state = fs::read(report.saved_run().expect("saved").join("state")).expect("metadata");
+    assert!(
+        !state
+            .windows(secret.len())
+            .any(|bytes| bytes == secret.as_bytes())
+    );
+}
+
+#[tokio::test]
+async fn access_headers_are_not_forwarded_through_a_redirect() {
+    let server = MockServer::start().await;
+    let foreign = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", format!("{}/file", foreign.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let input = Input::parse(&format!("{}/file", server.uri()))
+        .expect("reference")
+        .header("Authorization", "Bearer scoped-secret-marker")
+        .expect("access");
+    assert!(matches!(
+        Client::new().expect("client").resolve(input).await,
+        Err(Error::Redirect)
+    ));
+    assert!(
+        foreign
+            .received_requests()
+            .await
+            .expect("foreign requests")
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn renewed_access_headers_bind_frozen_work_without_repeating_discovery() {
+    let root = Directory::new();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(header("authorization", "Bearer first-access"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(header("authorization", "Bearer first-access"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reference = format!("{}/payload", server.uri());
+    let client = Client::new().expect("client");
+    let first = Input::parse(&reference)
+        .expect("reference")
+        .header("Authorization", "Bearer first-access")
+        .expect("access");
+    let failure = client
+        .download(first)
+        .to_directory(root.path())
+        .run()
+        .await
+        .expect_err("opening failed");
+    let saved = failure.report.saved_run().expect("owned run").to_path_buf();
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(header("authorization", "Bearer renewed-access"))
+        .and(header("if-match", "\"v1\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_bytes(b"abc"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let renewed = Input::parse(&reference)
+        .expect("reference")
+        .header("Authorization", "Bearer renewed-access")
+        .expect("renewal");
+    let report = client
+        .download(renewed)
+        .to_directory(root.path())
+        .run()
+        .await
+        .expect("frozen continuation");
+    assert_eq!(report.saved_run(), Some(saved.as_path()));
+    assert_eq!(
+        fs::read(root.path().join("payload")).expect("payload"),
+        b"abc"
+    );
+    let state = fs::read(saved.join("state")).expect("metadata");
+    for secret in ["first-access", "renewed-access"] {
+        assert!(
+            !state
+                .windows(secret.len())
+                .any(|bytes| bytes == secret.as_bytes())
+        );
+    }
+}

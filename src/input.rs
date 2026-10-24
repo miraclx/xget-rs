@@ -1,7 +1,10 @@
-//! Parsed request intent only, with no discovery, credentials lookup or destination authority.
+//! Parsed request intent and explicit access configuration, without discovery or destination authority.
 //!
 //! References are access-bearing secrets, not member identities or version evidence. Classification
 //! recognizes supported URL shapes; it does not establish that a remote object exists.
+//! [`Input::header`] attaches bounded HTTP/WebDAV access, counted in retained text but excluded from
+//! stored intent, fingerprints and source/version evidence. Values use shared zeroizing ownership;
+//! caller and foreign-library copies are not promised wiped.
 
 use core::fmt;
 use core::str::FromStr;
@@ -12,6 +15,11 @@ use zeroize::Zeroizing;
 
 pub use crate::selection::PatternError;
 use crate::selection::Selection;
+
+mod headers;
+
+use headers::HeaderSet;
+pub use headers::{HeaderError, RequestHeader};
 
 #[cfg(test)]
 #[path = "input_tests.rs"]
@@ -26,6 +34,8 @@ pub struct Input {
     kind: InputKind,
     scope: InputScope,
     namespace: Option<Namespace>,
+    // Transient access configuration: shared by this occurrence, never fingerprinted or persisted.
+    headers: Option<Arc<HeaderSet>>,
     // Selected-file re-entry owns metadata only when present, keeping ordinary parsed inputs small.
     pub(crate) selected: Option<Box<crate::inventory::Selected>>,
     pub(crate) member: Option<MemberToken>,
@@ -85,6 +95,7 @@ impl Input {
             kind,
             scope,
             namespace: None,
+            headers: None,
             selected: None,
             member: None,
             selection: None,
@@ -109,6 +120,57 @@ impl Input {
             }
         }
         Ok(input)
+    }
+
+    /// Sets access configuration for this HTTP input or WebDAV root only.
+    ///
+    /// Accepts at most 32 distinct names and 32768 combined name/value bytes per input. Each name is
+    /// limited to 128 bytes and each value to 8192 bytes; see [`RequestHeader`] for accepted syntax.
+    /// A repeated name explicitly replaces its previous value. Headers never become saved intent,
+    /// member identity or version evidence; renewed access must still satisfy frozen checks and pins.
+    /// Provider-owned access uses its own protocol, not these headers. Managed range/conditional and
+    /// framing names are rejected. Values are retained in shared zeroizing storage; foreign copies
+    /// and the caller's original value are not promised wiped.
+    pub fn header(self, name: &str, value: &str) -> Result<Self, HeaderError> {
+        self.request_header(RequestHeader::new(name, value)?)
+    }
+
+    /// Attaches an already parsed access header, with the same scope and limits as [`Self::header`].
+    pub fn request_header(mut self, header: RequestHeader) -> Result<Self, HeaderError> {
+        if self.kind != InputKind::Http {
+            return Err(HeaderError::UnsupportedInput);
+        }
+        if header.name() == "authorization"
+            && (!self.parsed_reference().username().is_empty()
+                || self.parsed_reference().password().is_some())
+        {
+            return Err(HeaderError::ConflictingAuthorization);
+        }
+        let previous = match self.headers.take() {
+            Some(headers) => {
+                Arc::try_unwrap(headers).unwrap_or_else(|shared| HeaderSet::clone(&shared))
+            }
+            None => HeaderSet::default(),
+        };
+        self.headers = Some(Arc::new(previous.set(header)?));
+        Ok(self)
+    }
+
+    pub(crate) fn request_headers(&self) -> impl Iterator<Item = &RequestHeader> {
+        self.headers.iter().flat_map(|headers| headers.iter())
+    }
+
+    // Only an explicitly validated same-origin transport projection may inherit this access.
+    #[cfg(any(feature = "webdav", test))]
+    pub(crate) fn copy_request_headers_from(&mut self, original: &Self) -> Result<(), HeaderError> {
+        if original.headers.is_some()
+            && (original.kind != InputKind::Http
+                || self.parsed_reference().origin() != original.parsed_reference().origin())
+        {
+            return Err(HeaderError::OriginChanged);
+        }
+        self.headers = original.headers.as_ref().map(Arc::clone);
+        Ok(())
     }
 
     /// Assigns a root-relative output namespace to this occurrence without changing its reference.
@@ -223,6 +285,7 @@ impl Input {
                 .namespace
                 .as_ref()
                 .map(|namespace| Namespace(String::clone(&namespace.0))),
+            headers: self.headers.as_ref().map(Arc::clone),
             selected: None,
             member: Option::<MemberToken>::clone(&self.member),
             selection: self.selection.as_ref().map(Arc::clone),
@@ -257,6 +320,11 @@ impl Input {
                 self.member
                     .as_ref()
                     .map_or(0, |member| member.as_str().len()),
+            )
+            .saturating_add(
+                self.headers
+                    .as_ref()
+                    .map_or(0, |headers| headers.text_bytes()),
             )
             .saturating_add(self.original_reference().len())
             .saturating_add(self.reference.parsed().as_str().len())

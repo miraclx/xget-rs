@@ -700,6 +700,77 @@ async fn missing_native_attempt_evidence_is_uncertainty_not_permission_to_refetc
 }
 
 #[tokio::test]
+async fn reader_publication_receipt_and_statistics_survive_a_real_completion_checkpoint_failure() {
+    fn exchange_state_role(path: &Path) {
+        fs::rename(path.join("state"), path.join("last-valid")).unwrap();
+        fs::create_dir(path.join("state")).unwrap();
+    }
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\"")
+                .insert_header("accept-ranges", "bytes"),
+        )
+        .mount(&server)
+        .await;
+    for (offset, byte) in b"abc".iter().enumerate() {
+        Mock::given(method("GET"))
+            .and(header("range", format!("bytes={offset}-{offset}")))
+            .and(header("if-match", "\"v1\""))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("etag", "\"v1\"")
+                    .insert_header("content-range", format!("bytes {offset}-{offset}/3"))
+                    .set_body_bytes([*byte]),
+            )
+            .mount(&server)
+            .await;
+    }
+    let client = Client::new().unwrap();
+    let reference = format!("{}/payload", server.uri());
+    // This fixture calls the private coordinator directly, so supply the canonical assignment that
+    // the public execute path installs after creating the owned record.
+    let canonical = fs::canonicalize(root.path()).unwrap();
+    let plan = client
+        .download(reference.as_str())
+        .to_directory(&canonical)
+        .plan()
+        .await
+        .unwrap();
+    let mut owned = Owned::create(&plan, None, crate::client::Reentry::Fresh)
+        .await
+        .unwrap();
+    owned.before_completed_checkpoint = Some(exchange_state_role);
+    let failure = client.execute_owned(plan, owned).await.unwrap_err();
+    assert!(matches!(failure.error, Error::Saved(SavedError::Corrupt)));
+    let published = failure.report.completed().next().unwrap();
+    assert_eq!(
+        published.range_stats().unwrap().source,
+        crate::transfer::ByteCount(3)
+    );
+    assert_eq!(fs::read(published.destination()).unwrap(), b"abc");
+    let native_state = published.receipt().state().path().to_path_buf();
+    let path = failure.report.saved_run().unwrap();
+    fs::remove_dir(path.join("state")).unwrap();
+    fs::rename(path.join("last-valid"), path.join("state")).unwrap();
+    let saved = SavedRun::inspect(path).await.unwrap();
+    let key = saved.members().next().unwrap().key();
+    let report = client
+        .resume(saved)
+        .input(key, reference.as_str())
+        .run()
+        .await
+        .unwrap();
+    let reconciled = report.completed().next().unwrap();
+    assert_eq!(reconciled.receipt().state().path(), native_state);
+    assert!(reconciled.range_stats().is_none());
+    assert_eq!(count(&server, "GET").await, 3);
+}
+
+#[tokio::test]
 async fn a_real_checkpoint_role_failure_after_publication_retains_the_partial_report_and_native_intent()
  {
     fn exchange_state_role(path: &Path) {
@@ -1053,10 +1124,251 @@ async fn stored_member_attempt_path_and_validator_bounds_fail_before_execution_a
             etag: None,
             requirements: member.requirements,
             measurement: member.measurement,
+            mode: crate::client::range::Mode::Whole,
             attempts: Vec::new(),
         })
         .collect();
     assert!(matches!(codec::encode(&record), Err(SavedError::Limit)));
+}
+
+#[tokio::test]
+async fn changed_selected_range_advertisement_cannot_bypass_an_unanchored_run() {
+    use core::num::NonZeroUsize;
+    use std::sync::Arc;
+
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let heads = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&heads);
+    Mock::given(method("HEAD"))
+        .respond_with(move |_: &wiremock::Request| {
+            let response = ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\"");
+            if observed.fetch_add(1, Ordering::Relaxed) == 0 {
+                response.insert_header("accept-ranges", "bytes")
+            } else {
+                response
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let client = Client::builder()
+        .max_requests(NonZeroUsize::MIN)
+        .build()
+        .unwrap();
+    let reference = format!("{}/payload", server.uri());
+    let file = client
+        .resolve(crate::Input::parse(&reference).unwrap())
+        .await
+        .unwrap()
+        .select_one(|_| true)
+        .unwrap();
+    let failure = client
+        .download(file)
+        .measurement(Measurement::None)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::RangeTransfer(_)));
+    let saved = failure.report.saved_run().unwrap().to_path_buf();
+    let reads = count(&server, "GET").await;
+    let file = client
+        .resolve(crate::Input::parse(&reference).unwrap())
+        .await
+        .unwrap()
+        .select_one(|_| true)
+        .unwrap();
+    let failure = client
+        .download(file)
+        .measurement(Measurement::None)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            failure.error,
+            Error::RangeRequest(crate::transfer::reader::ReaderRequestError::NoResumeAnchor)
+        ),
+        "{failure:?}"
+    );
+    assert_eq!(failure.report.saved_run(), Some(saved.as_path()));
+    assert_eq!(count(&server, "GET").await, reads);
+    assert_eq!(root.runs().len(), 1);
+}
+
+#[tokio::test]
+async fn old_selected_whole_runs_keep_their_mode_when_new_metadata_advertises_ranges() {
+    use std::sync::Arc;
+
+    for version in [1, 2] {
+        for explicit in [false, true] {
+            let root = Fixture::new();
+            let server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-length", "3")
+                        .insert_header("etag", "\"v1\"")
+                        .insert_header("accept-ranges", "bytes"),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+            let gets = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&gets);
+            Mock::given(method("GET"))
+                .respond_with(move |request: &wiremock::Request| {
+                    if request.headers.contains_key("range") {
+                        return ResponseTemplate::new(400);
+                    }
+                    let status = if observed.fetch_add(1, Ordering::Relaxed) == 0 {
+                        503
+                    } else {
+                        200
+                    };
+                    ResponseTemplate::new(status)
+                        .insert_header("etag", "\"v1\"")
+                        .set_body_bytes(b"abc")
+                })
+                .expect(2)
+                .mount(&server)
+                .await;
+            let client = Client::new().unwrap();
+            let reference = format!("{}/payload", server.uri());
+            let mut file = client
+                .resolve(crate::Input::parse(&reference).unwrap())
+                .await
+                .unwrap()
+                .select_one(|_| true)
+                .unwrap();
+            // Accepted V1/V2 selected Files did not carry this newly introduced capability hint.
+            file.input.ranges = crate::input::RangeSupport::Unknown;
+            let failure = client
+                .download(file)
+                .to_directory(root.path())
+                .run()
+                .await
+                .unwrap_err();
+            let saved_path = failure.report.saved_run().unwrap().to_path_buf();
+            let mut record = codec::decode(&fs::read(saved_path.join("state")).unwrap()).unwrap();
+            record.version = version;
+            fs::write(saved_path.join("state"), codec::encode(&record).unwrap()).unwrap();
+            let file = client
+                .resolve(crate::Input::parse(&reference).unwrap())
+                .await
+                .unwrap()
+                .select_one(|_| true)
+                .unwrap();
+            let report = if explicit {
+                let saved = SavedRun::inspect(&saved_path).await.unwrap();
+                let key = saved.members().next().unwrap().key();
+                client.resume(saved).input(key, file).run().await.unwrap()
+            } else {
+                client
+                    .download(file)
+                    .to_directory(root.path())
+                    .run()
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(report.saved_run(), Some(saved_path.as_path()));
+            let published = report.completed().next().unwrap();
+            assert!(published.range_stats().is_none());
+            assert_eq!(fs::read(published.destination()).unwrap(), b"abc");
+            assert_eq!(
+                SavedRun::inspect(&saved_path).await.unwrap().record.version,
+                version
+            );
+            assert_eq!(root.runs().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn reader_mode_is_a_v3_extension_and_older_records_keep_their_whole_body_meaning() {
+    use crate::client::range::Mode;
+    use crate::transfer::{ByteCount, Length};
+
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\"")
+                .insert_header("accept-ranges", "bytes"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_bytes(b"abc"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reference = format!("{}/payload", server.uri());
+    let client = Client::new().unwrap();
+    let plan = client
+        .download(reference.as_str())
+        .to_directory(root.path())
+        .plan()
+        .await
+        .unwrap();
+    let owned = Owned::create(&plan, None, crate::client::Reentry::Fresh)
+        .await
+        .unwrap();
+    let path = owned.path().to_path_buf();
+    drop(owned);
+    let bytes = fs::read(path.join("state")).unwrap();
+    let mut record = codec::decode(&bytes).unwrap();
+    assert_eq!(record.version, 3);
+    assert_eq!(record.members[0].mode, Mode::Ranges);
+    assert_eq!(codec::encode(&record).unwrap(), bytes);
+    record.version = 2;
+    assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
+    record.version = 3;
+    record.members[0].length = Length::Unknown;
+    assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
+    record.members[0].length = Length::Known(ByteCount(3));
+    record.members[0].etag = None;
+    assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
+    let mut record = codec::decode(&bytes).unwrap();
+    record.version = 2;
+    record.members[0].mode = Mode::Whole;
+    let old_bytes = codec::encode(&record).unwrap();
+    assert_eq!(
+        codec::encode(&codec::decode(&old_bytes).unwrap()).unwrap(),
+        old_bytes
+    );
+    fs::write(path.join("state"), &old_bytes).unwrap();
+    let saved = SavedRun::inspect(&path).await.unwrap();
+    let key = saved.members().next().unwrap().key();
+    let report = client
+        .resume(saved)
+        .input(key, reference.as_str())
+        .run()
+        .await
+        .unwrap();
+    assert!(report.completed().next().unwrap().range_stats().is_none());
+    let stored = codec::decode(&fs::read(path.join("state")).unwrap()).unwrap();
+    assert_eq!(stored.version, 2);
+    assert_eq!(stored.members[0].mode, Mode::Whole);
+    assert_eq!(count(&server, "HEAD").await, 1);
+    for request in server.received_requests().await.unwrap() {
+        assert!(!request.headers.contains_key("range"));
+    }
 }
 
 #[tokio::test]
@@ -1114,6 +1426,7 @@ async fn version_two_mapping_rejects_duplicate_exact_occurrences_before_authorit
         etag: None,
         requirements: first.requirements,
         measurement: first.measurement,
+        mode: crate::client::range::Mode::Whole,
         attempts: Vec::new(),
     });
     assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));

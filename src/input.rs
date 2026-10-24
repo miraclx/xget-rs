@@ -27,6 +27,8 @@ pub struct Input {
     pub(crate) selected: Option<Box<crate::inventory::Selected>>,
     pub(crate) member: Option<MemberToken>,
     pub(crate) occurrence: InputOccurrence,
+    // Advisory HEAD capability, retained with selected metadata, never inferred from a URL or digest.
+    pub(crate) ranges: RangeSupport,
     // Consumed Files from one resolved inventory retain grouping, while separately parsed identical
     // references remain distinct requested occurrences. This is not a persistent member identifier.
     pub(crate) group: Arc<()>,
@@ -77,6 +79,7 @@ impl Input {
             selected: None,
             member: None,
             occurrence: InputOccurrence(0),
+            ranges: RangeSupport::Unknown,
             group: Arc::new(()),
         })
     }
@@ -130,6 +133,7 @@ impl Input {
             selected: None,
             member: self.member,
             occurrence: self.occurrence,
+            ranges: self.ranges,
             group: Arc::clone(&self.group),
         })
     }
@@ -217,6 +221,16 @@ impl fmt::Display for Input {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("input [redacted]")
     }
+}
+
+/// Explicit metadata evidence for identity byte windows, not a promise that any GET is valid.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum RangeSupport {
+    /// No explicit accepted HEAD byte-range declaration. This includes unsupported responses.
+    #[default]
+    Unknown,
+    /// HEAD explicitly advertised byte windows; every actual response still needs validation.
+    Bytes,
 }
 
 /// A recognized reference family, independent of a remote member, version or local name.

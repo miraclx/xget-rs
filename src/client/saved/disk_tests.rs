@@ -81,6 +81,7 @@ async fn seed(root: &Path) -> (PathBuf, Vec<u8>, OperationOwner, oneshot::Receiv
             etag: None,
             requirements: Requirements::default(),
             measurement: Measurement::default(),
+            mode: crate::client::range::Mode::Whole,
             attempts: Vec::new(),
         }],
     )

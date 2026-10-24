@@ -1,5 +1,6 @@
-//! Bounded normalized private V1/V2 encoding. No references, foreign errors or hasher state.
-//! V1 round-trips as V1; V2 explicitly records input occurrence and adapter member/path bindings.
+//! Bounded normalized private V1/V2/V3 encoding. No references, foreign errors or hasher state.
+//! V1/V2 round-trip unchanged. V3 adds a per-member execution-mode byte after the ETag field:
+//! 0 is ordered whole-body, 1 is exact HTTP reader. Its pin/size remain the existing member fields.
 
 use std::path::Path;
 #[cfg(unix)]
@@ -31,13 +32,23 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
     {
         return Err(SavedError::Limit);
     }
-    if !matches!(record.version, 1 | 2) {
+    if !matches!(record.version, 1..=3) {
         return Err(SavedError::Version);
     }
     for (index, member) in record.members.iter().enumerate() {
         if member.occurrence.0 as usize >= MAX_FILES
             || (record.version == 1
                 && (member.remote.is_some() || member.occurrence.0 as usize != index))
+        {
+            return Err(SavedError::Corrupt);
+        }
+        if member.mode == crate::client::range::Mode::Ranges
+            && (record.version != 3
+                || member.remote.is_some()
+                || !crate::client::range::Mode::supports(
+                    member.length,
+                    member.etag.as_deref().map(String::as_str),
+                ))
         {
             return Err(SavedError::Corrupt);
         }
@@ -89,7 +100,7 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
     out.u32(record.members.len() as u32);
     for member in &record.members {
         out.0.extend_from_slice(&member.binding.0);
-        if record.version == 2 {
+        if record.version >= 2 {
             out.u32(member.occurrence.0);
             match &member.remote {
                 None => out.byte(0),
@@ -114,6 +125,12 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>, SavedError> {
                 out.byte(1);
                 out.bytes(etag.as_bytes(), MAX_VALIDATOR)?;
             }
+        }
+        if record.version == 3 {
+            out.byte(match member.mode {
+                crate::client::range::Mode::Whole => 0,
+                crate::client::range::Mode::Ranges => 1,
+            });
         }
         out.0
             .extend_from_slice(&policy(member.requirements, member.measurement));
@@ -146,7 +163,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
         return Err(SavedError::Corrupt);
     }
     let version = input.u32()?;
-    if !matches!(version, 1 | 2) {
+    if !matches!(version, 1..=3) {
         return Err(SavedError::Version);
     }
     let payload_length = bytes.len() - 32;
@@ -223,6 +240,15 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
             }
             _ => return Err(SavedError::Corrupt),
         };
+        let mode = if version == 3 {
+            match input.byte()? {
+                0 => crate::client::range::Mode::Whole,
+                1 => crate::client::range::Mode::Ranges,
+                _ => return Err(SavedError::Corrupt),
+            }
+        } else {
+            crate::client::range::Mode::Whole
+        };
         let (requirements, measurement) = input.policy()?;
         let count = input.u32()? as usize;
         if count > MAX_ATTEMPTS {
@@ -267,6 +293,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Record, SavedError> {
             etag,
             requirements,
             measurement,
+            mode,
             attempts,
         });
     }

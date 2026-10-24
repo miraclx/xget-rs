@@ -8,8 +8,8 @@
 - `notes/craft-backlog.md` tracks open work. Historical reviews are not rewritten when a later fix lands.
 - The ordinary Client implements exact HTTP and optional bounded SwissTransfer inventories, literal
   member selection, frozen multi-input layout, serial native publication/live opening and owned frozen-run
-  continuation. Other provider trees/catalogues, parallel ranges/partial-byte reuse, restart/overwrite
-  and the redesigned CLI remain unimplemented.
+  continuation. Eligible pinned exact HTTP uses the common range reader and anchored-prefix recovery.
+  Other provider trees/catalogues, restart/overwrite and the redesigned CLI remain unimplemented.
 
 ## Workspace boundary
 
@@ -130,7 +130,8 @@ source bytes and physical writes; native partials remain logical assembled facts
 Persist closed/sealing intent before sealing can take effect. Stops settle submitted work and are
 observed again after sealing, before publication; a closed stage never reopens writable. Queued/running
 physical operations retain registrations after waiter drop. V1/V2 one-shot records remain decodable,
-not writable reader authority. This does not enable ordinary Client parallel ranges or partial-byte reuse.
+not writable reader authority. Eligible ordinary exact HTTP reuses this coordinator; custom readers
+remain a distinct caller-owned entrance, and the legacy CLI is unchanged.
 
 ## Owned aggregate continuation
 
@@ -147,8 +148,15 @@ protection still applies. Expected destination/check policy must bind native rec
 
 Native attempts are recorded before execution. Missing intent/evidence is uncertainty, not refetch or
 publication authority. Completed entries require recorded strong content plus identity; nohash/weak-only
-completion remains NotRevalidatable. Pending work opens fresh full ordered HTTP bodies with frozen ETag
-checks, never appends old partial bytes or invents a saved reader pin. Old attempts remain untouched.
+completion remains NotRevalidatable. Whole-mode pending work uses fresh ordered responses with frozen
+ETag checks and leaves old partials untouched. V3 aggregate records can freeze exact-HTTP range mode;
+V1/V2 retain whole mode. Range reentry supplies the recorded native state to the existing reader's
+leased prefix authority, without fresh HEAD or a refetch fallback for missing/unanchored/closed state.
+Explicit HEAD byte-range support, known nonzero size and a strong ETag fitting the 256-byte reader
+bound select ranges. Longer legitimate pins retain whole mode. Every conditional response must match
+its full window/total, identity encoding, length and frozen strong ETag. No new scheduler or payload
+probe exists; live opening and Swiss remain whole mode. Range stats separate restored/current source/
+physical writes from logical native partials; reconciled completions do not invent attempt statistics.
 Fresh bypasses continuation, not overwrite or cleanup. No restart/legacy import or successful pause is
 claimed. Atomic normalized metadata checksums are not hidden payload fingerprints or authenticated state.
 

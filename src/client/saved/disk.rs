@@ -84,22 +84,31 @@ pub(super) async fn create(
     let members = plan
         .files
         .iter()
-        .map(|file| Member {
-            occurrence: file.file.input.occurrence,
-            remote: file.file.input.member.map(|token| super::FrozenMember {
-                token,
-                source_path: zeroize::Zeroizing::new(file.file.source_path().to_owned()),
-            }),
-            binding: Fingerprint::reference(&file.file.input),
-            destination: PathBuf::clone(&file.destination),
-            length: file.file.length(),
-            etag: Option::clone(&file.file.selected.description.etag),
-            requirements: file.requirements,
-            measurement: file.measurement,
-            mode: crate::client::range::Mode::of(&file.file),
-            attempts: Vec::new(),
+        .map(|file| {
+            Ok(Member {
+                occurrence: file.file.input.occurrence,
+                intent: super::FrozenIntent::capture(&file.file.input)?,
+                remote: file
+                    .file
+                    .input
+                    .member
+                    .as_ref()
+                    .map(|token| super::FrozenMember {
+                        token: crate::input::MemberToken::clone(token),
+                        source_path: zeroize::Zeroizing::new(file.file.source_path().to_owned()),
+                        s3_version: Option::clone(&file.file.input.s3_version),
+                    }),
+                binding: Fingerprint::reference(&file.file.input),
+                destination: PathBuf::clone(&file.destination),
+                length: file.file.length(),
+                etag: Option::clone(&file.file.selected.description.etag),
+                requirements: file.requirements,
+                measurement: file.measurement,
+                mode: crate::client::range::Mode::of(&file.file),
+                attempts: Vec::new(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, SavedError>>()?;
     let root = absolute(root)?;
     let record = work(move || Disk::prepare(root, request, members)).await?;
     let registration = lease_directory(record.root.join(STORE))
@@ -231,7 +240,15 @@ mod unix {
             }
             let store_identity = Self::identity(&store)?;
             Ok(Record {
-                version: if members
+                version: if members.iter().any(|member| {
+                    member.intent.is_some()
+                        || member
+                            .remote
+                            .as_ref()
+                            .is_some_and(|remote| remote.token.is_s3())
+                }) {
+                    4
+                } else if members
                     .iter()
                     .any(|member| member.mode == crate::client::range::Mode::Ranges)
                 {

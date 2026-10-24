@@ -141,6 +141,53 @@ async fn construction_and_planning_do_not_spend_a_payload_get_or_create_outputs(
     assert_eq!(get_count(&server).await, 0);
 }
 
+#[tokio::test]
+async fn resolve_all_keeps_duplicate_original_occurrences_and_selected_files_need_no_new_heads() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\""),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let reference = format!("{}/object", server.uri());
+    let client = Client::new().expect("client");
+    let inventory = client
+        .resolve_all([reference.as_str(), reference.as_str()])
+        .await
+        .expect("complete multi input");
+    assert_eq!(inventory.files().len(), 2);
+    let mut files = inventory.into_files();
+    let first = files.next().expect("first occurrence");
+    let second = files.next().expect("second occurrence");
+    assert_ne!(first.id(), second.id());
+    assert!(first.input.occurrence != second.input.occurrence);
+    let selected = client
+        .resolve_all([first, second])
+        .await
+        .expect("frozen inputs");
+    assert_eq!(selected.files().len(), 2);
+    assert_eq!(get_count(&server).await, 0);
+}
+
+#[tokio::test]
+async fn resolve_all_rejects_empty_or_overbudget_original_input_sets_before_discovery() {
+    let client = Client::new().expect("client");
+    assert!(matches!(
+        client.resolve_all(core::iter::empty::<Input>()).await,
+        Err(Error::NoInputs)
+    ));
+    let inputs =
+        (0..129).map(|_| Input::parse("https://example.invalid/never-requested").expect("intent"));
+    assert!(matches!(
+        client.resolve_all(inputs).await,
+        Err(Error::Inventory(_))
+    ));
+}
+
 #[test]
 fn missing_runtime_is_typed_before_http_or_native_io() {
     let client = Client::new().expect("construction needs no runtime");
@@ -176,7 +223,6 @@ async fn no_inputs_is_not_a_genuine_complete_empty_inventory() {
 async fn unsupported_providers_and_trees_fail_without_fake_inventory_success() {
     let client = Client::new().expect("client");
     for input in [
-        Input::parse("s3://bucket/key").expect("s3 intent"),
         Input::parse("ipfs://bafyexample/path").expect("ipfs intent"),
         #[cfg(not(feature = "swisstransfer"))]
         Input::parse("https://swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444")
@@ -187,6 +233,20 @@ async fn unsupported_providers_and_trees_fail_without_fake_inventory_success() {
         assert!(matches!(
             client.resolve(input).await,
             Err(Error::UnsupportedInput { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn missing_configured_s3_is_actionable_for_exact_and_explicit_tree() {
+    let client = Client::new().expect("client");
+    for input in [
+        Input::parse("s3://bucket/key").expect("exact"),
+        Input::tree("s3://bucket/prefix/").expect("tree"),
+    ] {
+        assert!(matches!(
+            client.resolve(input).await,
+            Err(Error::S3Unavailable)
         ));
     }
 }
@@ -1588,14 +1648,20 @@ async fn mixed_exact_and_collection_inputs_keep_independent_original_path_intent
 
 #[cfg(feature = "swisstransfer")]
 #[tokio::test]
-async fn genuinely_empty_collection_with_patterns_remains_a_noop() {
+async fn empty_collection_requires_positive_matches_but_exclusion_only_is_a_noop() {
     let server = MockServer::start().await;
-    path_share_manifest(&server, &[], 2).await;
+    path_share_manifest(&server, &[], 3).await;
     let client = path_share_client(&server);
+    assert!(matches!(
+        client
+            .resolve(path_share_input().include("nothing/**").expect("include"))
+            .await,
+        Err(Error::PathSelection)
+    ));
     let inventory = client
-        .resolve(path_share_input().include("nothing/**").expect("include"))
+        .resolve(path_share_input().exclude("**").expect("exclude"))
         .await
-        .expect("genuinely empty inventory");
+        .expect("genuinely empty exclusion-only inventory");
     assert_eq!(inventory.files().len(), 0);
     let plan = client
         .download(path_share_input())
@@ -1609,13 +1675,12 @@ async fn genuinely_empty_collection_with_patterns_remains_a_noop() {
 
 #[cfg(all(unix, feature = "swisstransfer"))]
 #[tokio::test]
-async fn genuinely_empty_pattern_run_creates_no_owned_store_or_payload_outputs() {
+async fn genuinely_empty_exclusion_only_run_creates_no_owned_store_or_payload_outputs() {
     let server = MockServer::start().await;
     path_share_manifest(&server, &[], 1).await;
     let root = Directory::new();
     let report = path_share_client(&server)
         .download(path_share_input())
-        .include("missing/**")
         .exclude("**")
         .to_directory(root.path())
         .run()
@@ -1721,7 +1786,9 @@ async fn frozen_pattern_request_reentry_uses_recorded_members_without_changed_ma
         .expect_err("access failure leaves frozen intent");
     let saved = failure.report.saved_run().expect("saved run").to_path_buf();
     let state = fs::read(saved.join("state")).expect("bounded saved state");
-    assert!(!String::from_utf8_lossy(&state).contains("docs/**"));
+    // V4 retains the nonsecret recipe for explicit reference-only rebinding, never access URLs.
+    assert!(String::from_utf8_lossy(&state).contains("docs/**"));
+    assert!(!String::from_utf8_lossy(&state).contains("https://"));
     server.reset().await;
     // If mutable discovery were repeated, the same glob would now select a different member.
     path_share_manifest(&server, &[(PATH_MEMBER_B, "docs/new.bin", 3)], 0).await;

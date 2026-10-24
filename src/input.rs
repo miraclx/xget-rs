@@ -31,9 +31,13 @@ pub struct Input {
     pub(crate) member: Option<MemberToken>,
     // Parsed once at request construction and shared unchanged by every discovered member.
     pub(crate) selection: Option<Arc<Selection>>,
+    // In-memory evidence from complete Client resolution, not persisted matching authority.
+    pub(crate) checked_selection: Option<Arc<Selection>>,
     pub(crate) occurrence: InputOccurrence,
     // Advisory HEAD capability, retained with selected metadata, never inferred from a URL or digest.
     pub(crate) ranges: RangeSupport,
+    // S3 evidence is separate from reference intent and the provider-scoped member selector.
+    pub(crate) s3_version: Option<Zeroizing<String>>,
     // Consumed Files from one resolved inventory retain grouping, while separately parsed identical
     // references remain distinct requested occurrences. This is not a persistent member identifier.
     pub(crate) group: Arc<()>,
@@ -84,8 +88,10 @@ impl Input {
             selected: None,
             member: None,
             selection: None,
+            checked_selection: None,
             occurrence: InputOccurrence(0),
             ranges: RangeSupport::Unknown,
+            s3_version: None,
             group: Arc::new(()),
         })
     }
@@ -114,22 +120,33 @@ impl Input {
         Ok(self)
     }
 
-    /// Requests one repeatable SwissTransfer member token within this input occurrence.
+    /// Requests one repeatable provider-scoped member token within this input occurrence.
+    /// SwissTransfer uses canonical file UUIDs; S3 trees use literal full object keys, not paths
+    /// relative to the prefix and not percent-encoded URLs.
     ///
     /// This is not authorization or an occurrence-local FileId. Fresh discovery must contain exactly
     /// this member; a stale token fails without a path, position or filename fallback. A selected File
     /// already carries its frozen member and cannot be redirected by this method.
     pub fn select_id(mut self, token: &str) -> Result<Self, InputError> {
-        if self.kind != InputKind::SwissTransfer || self.selected.is_some() {
+        if self.selected.is_some() {
             return Err(InputError::UnsupportedMemberSelection);
         }
-        self.member = Some(MemberToken::parse(token).ok_or(InputError::InvalidMemberToken)?);
+        let member = match (self.kind, self.scope) {
+            (InputKind::SwissTransfer, InputScope::Collection) => MemberToken::parse(token),
+            (InputKind::S3, InputScope::Tree) => MemberToken::s3(token),
+            _ => return Err(InputError::UnsupportedMemberSelection),
+        };
+        self.member = Some(member.ok_or(InputError::InvalidMemberToken)?);
         Ok(self)
     }
 
     /// Adds an include glob over ORIGINAL source-relative member paths, not output namespaces.
     ///
-    /// Includes form a union (no includes means all), followed by exclusions. Literal member-token
+    /// Each positive include must match the complete original executable-file scope before any
+    /// exclusions are subtracted. Matching includes then form a union (no includes means all),
+    /// followed by exclusions. Duplicate positive criteria may match the same file. An empty file
+    /// scope cannot satisfy a positive criterion, including a directory-marker-only scope.
+    /// Literal member-token
     /// intent remains independent. Matching is whole-path and case-sensitive, without decoding or
     /// Unicode normalization: `/` separates components, `*` matches zero/many scalars within one
     /// component, `?` matches one scalar, and complete `**` components match zero/many components.
@@ -140,7 +157,9 @@ impl Input {
     /// 16384 UTF-8 spelling bytes; each pattern allows at most 1024 bytes and 64 components.
     /// Patterns also count toward common retained request/discovery text limits. Repeated calls add
     /// intent in order. A nonempty discovery filtered to none is an error; genuine empty discovery
-    /// remains empty. Selected Files keep their frozen metadata, versions and checks.
+    /// remains empty only with no positive criteria. Selected Files keep their frozen metadata,
+    /// versions, checks and already-satisfied original criteria; choosing a subset does not re-test
+    /// prior positive criteria against that subset. Newly appended includes must match the subset.
     /// Configured matching also requires each original source path to fit 4096 UTF-8 bytes and
     /// 64 slash-separated components; exceeding that separate path ceiling returns an inventory
     /// limit during resolution/planning, even when an exact HTTP output name is supplied explicitly.
@@ -164,6 +183,35 @@ impl Input {
         Ok(self)
     }
 
+    pub(crate) fn pending_includes(&self) -> Result<Option<Arc<Selection>>, InputError> {
+        let Some(selection) = &self.selection else {
+            return Ok(None);
+        };
+        let Some(checked) = self
+            .checked_selection
+            .as_ref()
+            .filter(|_| self.selected.is_some())
+        else {
+            return Ok(Some(Arc::clone(selection)));
+        };
+        // Selecting a File does not turn its already-satisfied original criteria into new criteria
+        // over that one-file subset. Appending a positive criterion does need a new subset proof.
+        if Arc::ptr_eq(checked, selection) {
+            return Ok(None);
+        }
+        let mut pending = selection.includes();
+        for prior in checked.includes() {
+            if pending.next() != Some(prior) {
+                return Ok(Some(Arc::clone(selection)));
+            }
+        }
+        let mut additional = Selection::default();
+        for pattern in pending {
+            additional = additional.including(pattern)?;
+        }
+        Ok(additional.is_configured().then(|| Arc::new(additional)))
+    }
+
     pub(crate) fn duplicate_reference(&self) -> Result<Self, InputError> {
         Ok(Self {
             reference: Reference::parse(self.original_reference())?,
@@ -174,10 +222,12 @@ impl Input {
                 .as_ref()
                 .map(|namespace| Namespace(String::clone(&namespace.0))),
             selected: None,
-            member: self.member,
+            member: Option::<MemberToken>::clone(&self.member),
             selection: self.selection.as_ref().map(Arc::clone),
+            checked_selection: self.checked_selection.as_ref().map(Arc::clone),
             occurrence: self.occurrence,
             ranges: self.ranges,
+            s3_version: Option::clone(&self.s3_version),
             group: Arc::clone(&self.group),
         })
     }
@@ -198,8 +248,15 @@ impl Input {
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.original_reference()
-            .len()
+        self.s3_version
+            .as_ref()
+            .map_or(0, |version| version.len())
+            .saturating_add(
+                self.member
+                    .as_ref()
+                    .map_or(0, |member| member.as_str().len()),
+            )
+            .saturating_add(self.original_reference().len())
             .saturating_add(self.reference.parsed().as_str().len())
             .saturating_add(
                 self.namespace
@@ -209,6 +266,16 @@ impl Input {
             .saturating_add(
                 self.selection
                     .as_ref()
+                    .map_or(0, |selection| selection.retained_bytes()),
+            )
+            .saturating_add(
+                self.checked_selection
+                    .as_ref()
+                    .filter(|checked| {
+                        self.selection
+                            .as_ref()
+                            .is_none_or(|selection| !Arc::ptr_eq(checked, selection))
+                    })
                     .map_or(0, |selection| selection.retained_bytes()),
             )
             .saturating_add(
@@ -372,12 +439,18 @@ impl InputKind {
     }
 }
 
-/// A repeatable SwissTransfer member token. Its meaning is scoped by the original share input.
+/// A repeatable provider-scoped member selector, not an access capability or FileId.
 ///
-/// It contains only a canonical file UUID, never access credentials. It is not a global identity or
-/// the occurrence-local [`crate::inventory::FileId`]. Default diagnostics redact it.
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-pub struct MemberToken([u8; 36]);
+/// SwissTransfer selectors are canonical UUIDs. S3 selectors are genuine literal full object keys,
+/// scoped by their original bucket/prefix input. Key spelling is not hashed or URL-normalized.
+/// Swiss UUIDs stay inline; S3 text has shared zeroizing ownership. Clone is explicit and cheap,
+/// not an implicit copy of the maximum key size. Only explicit `as_str` access reveals names.
+pub struct MemberToken(MemberSelector);
+
+enum MemberSelector {
+    Swiss([u8; 36]),
+    S3(Arc<Zeroizing<String>>),
+}
 
 impl MemberToken {
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -388,21 +461,77 @@ impl MemberToken {
         for (output, byte) in token.iter_mut().zip(value.bytes()) {
             *output = byte.to_ascii_lowercase();
         }
-        Some(Self(token))
+        Some(Self(MemberSelector::Swiss(token)))
     }
 
-    /// Canonical literal selector to use with the same share input, not a URL or access capability.
-    pub fn as_str(&self) -> &str {
-        match core::str::from_utf8(&self.0) {
-            Ok(value) => value,
-            Err(_) => unreachable!("member tokens contain only validated ASCII UUID bytes"),
+    pub(crate) fn s3(value: &str) -> Option<Self> {
+        if value.is_empty() || value.len() > 1024 {
+            return None;
         }
+        Some(Self(MemberSelector::S3(Arc::new(Zeroizing::new(
+            value.to_owned(),
+        )))))
+    }
+
+    pub(crate) fn is_s3(&self) -> bool {
+        matches!(&self.0, MemberSelector::S3(_))
+    }
+
+    /// Provider family whose original input scopes this selector, not its file/directory role.
+    /// An S3 key spelled like a Swiss UUID is still an S3 object selector.
+    pub fn kind(&self) -> InputKind {
+        match &self.0 {
+            MemberSelector::Swiss(_) => InputKind::SwissTransfer,
+            MemberSelector::S3(_) => InputKind::S3,
+        }
+    }
+
+    /// Literal selector for the same provider/input, not a URL or authorization token.
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            MemberSelector::Swiss(bytes) => match core::str::from_utf8(bytes) {
+                Ok(value) => value,
+                Err(_) => unreachable!("swiss member selectors contain validated ASCII"),
+            },
+            MemberSelector::S3(key) => key.as_str(),
+        }
+    }
+}
+
+impl Clone for MemberToken {
+    fn clone(&self) -> Self {
+        Self(match &self.0 {
+            MemberSelector::Swiss(bytes) => MemberSelector::Swiss(*bytes),
+            MemberSelector::S3(key) => MemberSelector::S3(Arc::clone(key)),
+        })
+    }
+}
+
+impl PartialEq for MemberToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_s3() == other.is_s3() && self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for MemberToken {}
+
+impl PartialOrd for MemberToken {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MemberToken {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.is_s3()
+            .cmp(&other.is_s3())
+            .then_with(|| self.as_str().cmp(other.as_str()))
     }
 }
 
 impl fmt::Debug for MemberToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MemberToken([share-scoped])")
+        formatter.write_str("MemberToken([provider-scoped])")
     }
 }
 
@@ -431,7 +560,7 @@ pub enum InputScope {
 pub struct Namespace(String);
 
 impl Namespace {
-    fn parse(value: &str) -> Result<Self, NamespaceError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, NamespaceError> {
         if value.is_empty() {
             return Err(NamespaceError::Empty);
         }
@@ -509,8 +638,8 @@ pub enum InputError {
     /// Only a materialization adapter with stable member tokens supports ID intent.
     #[error("member selection is unsupported for this input; select from its resolved inventory")]
     UnsupportedMemberSelection,
-    /// Tokens are literal UUIDs, never row indices or paths.
-    #[error("invalid member token; supply the literal token from this share's inventory")]
+    /// Tokens use the recognized provider's literal spelling, never a row index or synthetic URL.
+    #[error("invalid member token; supply the literal selector from this input's inventory")]
     InvalidMemberToken,
     /// Tree intent is supported only for HTTP(S)/WebDAV and S3 in this draft.
     #[error("unsupported tree scope; use an exact or collection reference for this input kind")]

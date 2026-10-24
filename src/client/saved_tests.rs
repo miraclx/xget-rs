@@ -1305,6 +1305,7 @@ async fn stored_member_attempt_path_and_validator_bounds_fail_before_execution_a
     record.members = (0..=crate::inventory::MAX_FILES)
         .map(|index| super::Member {
             occurrence: crate::input::InputOccurrence(index as u32),
+            intent: None,
             remote: None,
             binding: member.binding,
             destination: root.path().join(format!("file-{index}")),
@@ -1560,6 +1561,132 @@ async fn reader_mode_is_a_v3_extension_and_older_records_keep_their_whole_body_m
 }
 
 #[tokio::test]
+async fn reference_only_binding_for_old_default_records_preserves_their_codec_and_needs_no_head() {
+    for version in [1, 2, 3] {
+        let root = Fixture::new();
+        let server = MockServer::start().await;
+        let (reference, path) = failed_get(&root, &server).await;
+        let mut record = codec::decode(&fs::read(path.join("state")).unwrap()).unwrap();
+        record.version = version;
+        assert!(record.members[0].intent.is_none());
+        let bytes = codec::encode(&record).unwrap();
+        fs::write(path.join("state"), &bytes).unwrap();
+        let saved = SavedRun::inspect(&path).await.unwrap();
+        let member = saved.members().next().unwrap();
+        let input = member.binding_input(&reference).unwrap();
+        assert_eq!(input.scope(), crate::input::InputScope::Exact);
+        assert!(input.namespace().is_none());
+        let key = member.key();
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(header("if-match", "\"old\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"old\"")
+                    .set_body_bytes(b"abc"),
+            )
+            .mount(&server)
+            .await;
+        Client::new()
+            .unwrap()
+            .resume(saved)
+            .input(key, input)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(count(&server, "HEAD").await, 0);
+        assert_eq!(count(&server, "GET").await, 1);
+        assert_eq!(
+            &fs::read(path.join("state")).unwrap()[8..12],
+            &version.to_le_bytes()
+        );
+    }
+}
+
+#[tokio::test]
+async fn v4_binding_recipe_roundtrips_nonsecret_intent_and_never_reinterprets_old_versions() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let (reference, path) = failed_get(&root, &server).await;
+    let input = crate::Input::parse(&reference)
+        .unwrap()
+        .under("original/group")
+        .unwrap()
+        .include("**")
+        .unwrap()
+        .include("**")
+        .unwrap()
+        .exclude("*.tmp")
+        .unwrap();
+    let mut record = codec::decode(&fs::read(path.join("state")).unwrap()).unwrap();
+    record.version = 4;
+    record.members[0].binding = Fingerprint::reference(&input);
+    record.members[0].intent = super::FrozenIntent::capture(&input).unwrap();
+    let bytes = codec::encode(&record).unwrap();
+    assert_eq!(
+        codec::encode(&codec::decode(&bytes).unwrap()).unwrap(),
+        bytes
+    );
+    assert!(
+        !bytes
+            .windows(reference.len())
+            .any(|bytes| bytes == reference.as_bytes())
+    );
+    fs::write(path.join("state"), &bytes).unwrap();
+    let saved = SavedRun::inspect(&path).await.unwrap();
+    let member = saved.members().next().unwrap();
+    let rebuilt = member.binding_input(&reference).unwrap();
+    assert_eq!(rebuilt.namespace().unwrap().as_str(), "original/group");
+    assert_eq!(
+        rebuilt
+            .selection
+            .as_ref()
+            .unwrap()
+            .includes()
+            .collect::<Vec<_>>(),
+        ["**", "**"]
+    );
+    assert!(matches!(
+        member.binding_input("https://example.test/wrong"),
+        Err(SavedError::Binding)
+    ));
+    for version in [1, 2, 3] {
+        record.version = version;
+        assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
+    }
+    record.version = 4;
+    record.members[0].intent.as_mut().unwrap().namespace =
+        Some(crate::input::Namespace::parse(&"x".repeat(4097)).unwrap());
+    assert!(matches!(codec::encode(&record), Err(SavedError::Limit)));
+    assert_eq!(count(&server, "GET").await, 1);
+}
+
+#[tokio::test]
+async fn older_complex_bindings_need_original_intent_instead_of_guessing_from_reference() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let (reference, path) = failed_get(&root, &server).await;
+    let input = crate::Input::parse(&reference)
+        .unwrap()
+        .under("original")
+        .unwrap()
+        .include("**")
+        .unwrap()
+        .exclude("*.tmp")
+        .unwrap();
+    let mut record = codec::decode(&fs::read(path.join("state")).unwrap()).unwrap();
+    record.members[0].binding = Fingerprint::reference(&input);
+    assert!(record.members[0].intent.is_none());
+    fs::write(path.join("state"), codec::encode(&record).unwrap()).unwrap();
+    let saved = SavedRun::inspect(&path).await.unwrap();
+    assert!(matches!(
+        saved.members().next().unwrap().binding_input(&reference),
+        Err(SavedError::BindingIntentRequired)
+    ));
+    assert_eq!(count(&server, "GET").await, 1);
+}
+
+#[tokio::test]
 async fn version_one_exact_runs_remain_readable_and_checkpoint_as_version_one() {
     let root = Fixture::new();
     let server = MockServer::start().await;
@@ -1607,6 +1734,7 @@ async fn version_two_mapping_rejects_duplicate_exact_occurrences_before_authorit
     let first = &record.members[0];
     record.members.push(super::Member {
         occurrence: first.occurrence,
+        intent: None,
         remote: None,
         binding: first.binding,
         destination: root.path().join("another"),

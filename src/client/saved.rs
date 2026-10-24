@@ -1,5 +1,6 @@
 //! Frozen aggregate continuation. V3 adds exact HTTP reader mode to V2 member bindings.
-//! V1/V2 retain their original whole-body meaning and encoding.
+//! V4 adds genuine S3 key selectors and optional versionId without changing V1/V2/V3 encoding.
+//! S3 stays whole mode, with fresh conditional GETs, no listing/HEAD on reentry and no byte reuse.
 //! This codec is not a public manifest API.
 
 use core::convert::Infallible;
@@ -13,8 +14,9 @@ use zeroize::Zeroizing;
 use super::{Client, Error, Plan, PlannedFile, Report, RunFailure, Target};
 use crate::checks::{CheckPolicy, Requirements};
 use crate::checksum::OwnedSha256;
-use crate::input::{Input, InputOccurrence, MemberToken};
+use crate::input::{Input, InputOccurrence, InputScope, MemberToken, Namespace};
 use crate::inventory::{Description, File, FileId, Selected};
+use crate::selection::Selection;
 use crate::transfer::{Length, Measurement, OperationOwner, Receipt, Reconciliation, StateRef};
 
 mod codec;
@@ -159,6 +161,27 @@ pub struct SavedMember<'a> {
 }
 
 impl SavedMember<'_> {
+    /// Rebuilds frozen nonsecret binding intent from a caller-supplied original reference.
+    ///
+    /// This pure operation performs no discovery, selector matching, filesystem work or lease
+    /// acquisition. V4 intent restores scope, namespace and ordered patterns, then checks both the
+    /// exact original-reference fingerprint and the existing full binding. Frozen member/version,
+    /// checks, mode and assignment remain authoritative in Resume::input. No URL or credentials are
+    /// recovered from disk. Older records can reconstruct a default parsed input only when its full
+    /// binding agrees; complex older intent requires the caller to supply the original Input explicitly.
+    pub fn binding_input(&self, reference: &str) -> Result<Input, SavedError> {
+        match &self.member.intent {
+            Some(intent) => intent.input(reference, self.member.binding),
+            None => {
+                let input = Input::parse(reference).map_err(|_| SavedError::Binding)?;
+                if Fingerprint::reference(&input) != self.member.binding {
+                    return Err(SavedError::BindingIntentRequired);
+                }
+                Ok(input)
+            }
+        }
+    }
+
     /// Key accepted by the consumed continuation builder.
     pub fn key(&self) -> BindingKey {
         self.key
@@ -308,7 +331,10 @@ impl<'a> Resume<'a> {
             return self;
         }
         input.occurrence = member.occurrence;
-        input.member = member.remote.as_ref().map(|remote| remote.token);
+        input.member = member
+            .remote
+            .as_ref()
+            .map(|remote| MemberToken::clone(&remote.token));
         self.bindings[index] = Some(input);
         self
     }
@@ -326,6 +352,20 @@ impl<'a> Resume<'a> {
             retained_bytes: _,
         } = self;
         let path = PathBuf::clone(&saved.path);
+        if error.is_none() {
+            for input in bindings.iter().flatten() {
+                if let Err(error) = client.capability(input) {
+                    return Err(Box::new(RunFailure {
+                        error,
+                        report: Report {
+                            completed: Vec::new(),
+                            saved_run: Some(path),
+                        },
+                        failed: None,
+                    }));
+                }
+            }
+        }
         let result = async {
             if let Some(error) = error {
                 return Err(error);
@@ -426,6 +466,11 @@ pub enum SavedError {
         "saved run limit exceeded; use a new owned destination or retain fewer pending requests"
     )]
     Limit,
+    /// Older records lack a reconstructable nonsecret recipe, or the supplied default binding differs.
+    #[error(
+        "saved binding needs original intent; supply the original scope, namespace and patterns explicitly"
+    )]
+    BindingIntentRequired,
     /// Missing attempt/intent or publication evidence cannot authorize a replacement or refetch.
     #[error("native publication is uncertain; retain the evidence and inspect the native attempt")]
     Uncertain,
@@ -468,9 +513,27 @@ impl Fingerprint {
         hash.update(&(bytes.len() as u64).to_le_bytes());
         hash.update(bytes);
     }
+    fn original(input: &Input) -> Self {
+        let mut hash = OwnedSha256::default();
+        Self::field(&mut hash, b"xget original reference only 1");
+        Self::field(&mut hash, input.original_reference().as_bytes());
+        Self(hash.finish())
+    }
+
     fn reference(input: &Input) -> Self {
         let mut hash = OwnedSha256::default();
         Self::field(&mut hash, b"xget exact original binding 1");
+        if input.kind() == crate::input::InputKind::S3 {
+            Self::field(&mut hash, b"s3 scope 1");
+            Self::field(
+                &mut hash,
+                match input.scope() {
+                    crate::input::InputScope::Exact => b"exact",
+                    crate::input::InputScope::Tree => b"tree",
+                    _ => b"unsupported",
+                },
+            );
+        }
         Self::field(&mut hash, input.original_reference().as_bytes());
         Self::field(
             &mut hash,
@@ -514,7 +577,11 @@ impl Fingerprint {
         Self::field(&mut hash, b"xget exact request intent 1");
         for (index, input) in inputs.iter().enumerate() {
             Self::field(&mut hash, &Self::reference(input).0);
-            if input.kind() == crate::input::InputKind::SwissTransfer && input.selected.is_some() {
+            if matches!(
+                input.kind(),
+                crate::input::InputKind::SwissTransfer | crate::input::InputKind::S3
+            ) && input.selected.is_some()
+            {
                 let group = inputs[..index]
                     .iter()
                     .position(|previous| Arc::ptr_eq(&previous.group, &input.group))
@@ -522,13 +589,32 @@ impl Fingerprint {
                 Self::field(&mut hash, b"frozen collection grouping 1");
                 Self::field(&mut hash, &(group as u32).to_le_bytes());
             }
-            if let Some(token) = input.member {
-                Self::field(&mut hash, b"swiss member token 1");
+            if let Some(token) = &input.member {
+                Self::field(
+                    &mut hash,
+                    if token.is_s3() {
+                        b"s3 object key 1"
+                    } else {
+                        b"swiss member token 1"
+                    },
+                );
                 Self::field(&mut hash, token.as_str().as_bytes());
             }
             // Selected-file requests carry a frozen session; do not merge with mutable discovery.
             if let Some(selected) = &input.selected {
                 Self::field(&mut hash, b"selected");
+                if input.kind() == crate::input::InputKind::S3 {
+                    Self::field(&mut hash, b"s3 frozen version 1");
+                    Self::field(
+                        &mut hash,
+                        input
+                            .s3_version
+                            .as_deref()
+                            .map_or("", String::as_str)
+                            .as_bytes(),
+                    );
+                    Self::field(&mut hash, selected.description.source_path.as_bytes());
+                }
                 // Advisory range support is not caller intent. Matching must still find an older
                 // run when fresh metadata advertises different transport capabilities.
                 match selected.description.length {
@@ -594,10 +680,75 @@ struct RootInode(u64);
 struct FrozenMember {
     token: MemberToken,
     source_path: Zeroizing<String>,
+    // V4 only: an S3 HEAD versionId, separate from opaque conditional ETag and key selector.
+    s3_version: Option<Zeroizing<String>>,
+}
+
+struct FrozenIntent {
+    original: Fingerprint,
+    scope: InputScope,
+    namespace: Option<Namespace>,
+    selection: Option<Arc<Selection>>,
+}
+
+impl FrozenIntent {
+    fn capture(input: &Input) -> Result<Option<Self>, SavedError> {
+        if input.kind() != crate::input::InputKind::S3
+            && input.namespace().is_none()
+            && input
+                .selection
+                .as_ref()
+                .is_none_or(|selection| !selection.is_configured())
+        {
+            return Ok(None);
+        }
+        let namespace = input
+            .namespace()
+            .map(|namespace| {
+                if namespace.as_str().len() > 4096 || namespace.as_str().split('/').count() > 64 {
+                    return Err(SavedError::Limit);
+                }
+                Namespace::parse(namespace.as_str()).map_err(|_| SavedError::Corrupt)
+            })
+            .transpose()?;
+        Ok(Some(Self {
+            original: Fingerprint::original(input),
+            scope: input.scope(),
+            namespace,
+            selection: input
+                .selection
+                .as_ref()
+                .filter(|selection| selection.is_configured())
+                .map(Arc::clone),
+        }))
+    }
+
+    fn input(&self, reference: &str, binding: Fingerprint) -> Result<Input, SavedError> {
+        let mut input = if self.scope == InputScope::Tree {
+            Input::tree(reference)
+        } else {
+            Input::parse(reference)
+        }
+        .map_err(|_| SavedError::Binding)?;
+        if Fingerprint::original(&input) != self.original || input.scope() != self.scope {
+            return Err(SavedError::Binding);
+        }
+        if let Some(namespace) = &self.namespace {
+            input = input
+                .under(namespace.as_str())
+                .map_err(|_| SavedError::Binding)?;
+        }
+        input.selection = self.selection.as_ref().map(Arc::clone);
+        if Fingerprint::reference(&input) != binding {
+            return Err(SavedError::Binding);
+        }
+        Ok(input)
+    }
 }
 
 struct Member {
     occurrence: InputOccurrence,
+    intent: Option<FrozenIntent>,
     remote: Option<FrozenMember>,
     binding: Fingerprint,
     destination: PathBuf,
@@ -611,11 +762,16 @@ struct Member {
 
 impl Member {
     fn accepts_selected(&self, input: &Input) -> bool {
-        let token = self.remote.as_ref().map(|remote| remote.token);
-        if input.member.is_some() && input.member != token {
+        let token = self.remote.as_ref().map(|remote| &remote.token);
+        if input.member.is_some() && input.member.as_ref() != token {
             return false;
         }
-        if (input.kind() == crate::input::InputKind::SwissTransfer) != self.remote.is_some() {
+        let provider_matches = match &self.remote {
+            Some(remote) if remote.token.is_s3() => input.kind() == crate::input::InputKind::S3,
+            Some(_) => input.kind() == crate::input::InputKind::SwissTransfer,
+            None => input.kind() == crate::input::InputKind::Http,
+        };
+        if !provider_matches {
             return false;
         }
         let Some(selected) = &input.selected else {
@@ -628,6 +784,9 @@ impl Member {
         self.remote
             .as_ref()
             .is_none_or(|remote| supplied.source_path.as_str() == remote.source_path.as_str())
+            && self.remote.as_ref().is_none_or(|remote| {
+                !remote.token.is_s3() || input.s3_version.as_deref() == remote.s3_version.as_deref()
+            })
             && supplied.length == self.length
             && supplied.etag.as_deref() == self.etag.as_deref()
             && supplied.requirements.iter().all(|required| {
@@ -677,6 +836,10 @@ impl Owned {
             // Resume::input already rejected incompatible selected evidence before ownership.
             // The stored session remains authoritative; compatible metadata grants no policy change.
             input.selected = None;
+            input.s3_version = member
+                .remote
+                .as_ref()
+                .and_then(|remote| Option::clone(&remote.s3_version));
             input.ranges = match member.mode {
                 super::range::Mode::Whole => crate::input::RangeSupport::Unknown,
                 super::range::Mode::Ranges => crate::input::RangeSupport::Bytes,

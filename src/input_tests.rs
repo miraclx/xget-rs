@@ -7,6 +7,38 @@ use super::{Input, InputError, InputKind, InputScope, NamespaceError};
 const SHARE: &str = "https://www.swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444";
 
 #[test]
+fn member_tokens_are_compact_provider_scoped_and_share_zeroizing_s3_keys_on_explicit_clone() {
+    use std::sync::Arc;
+
+    use super::{MemberSelector, MemberToken};
+
+    assert!(core::mem::size_of::<MemberToken>() <= 64);
+    let spelling = "AAAAAAAA-1111-2222-3333-444444444444";
+    let swiss = MemberToken::parse(spelling).expect("swiss selector");
+    let key = MemberToken::s3(spelling).expect("same-spelling object key");
+    assert_eq!(swiss.as_str(), "aaaaaaaa-1111-2222-3333-444444444444");
+    assert_eq!(key.as_str(), spelling);
+    assert_eq!(swiss.kind(), InputKind::SwissTransfer);
+    assert_eq!(key.kind(), InputKind::S3);
+    assert_ne!(swiss, key);
+    assert!(swiss < key);
+    let clone = MemberToken::clone(&key);
+    assert_eq!(key, clone);
+    let (MemberSelector::S3(left), MemberSelector::S3(right)) = (&key.0, &clone.0) else {
+        panic!("s3 tokens keep shared ownership");
+    };
+    assert!(Arc::ptr_eq(left, right));
+    assert!(!format!("{key:?}").contains(spelling));
+    assert!(MemberToken::s3(&"x".repeat(1025)).is_none());
+    let input = Input::tree("s3://bucket/prefix/")
+        .expect("tree")
+        .select_id("prefix/key")
+        .expect("literal key");
+    let duplicate = input.duplicate_reference().expect("original occurrence");
+    assert_eq!(input.member, duplicate.member);
+}
+
+#[test]
 fn path_intent_is_parsed_once_shared_by_duplicates_and_charged_as_request_text() {
     let bare = Input::parse(SHARE).expect("reference");
     let bare_bytes = bare.retained_bytes();
@@ -63,7 +95,10 @@ fn path_intent_and_literal_member_token_do_not_replace_each_other() {
         .expect("path intent")
         .exclude("nested/private.bin")
         .expect("exclusion");
-    assert_eq!(input.member.expect("token retained").as_str(), token);
+    assert_eq!(
+        input.member.as_ref().expect("token retained").as_str(),
+        token
+    );
     assert_eq!(input.kind(), InputKind::SwissTransfer);
     assert_eq!(input.scope(), InputScope::Collection);
     assert_eq!(input.original_reference(), SHARE);

@@ -257,6 +257,64 @@ URLs or cookies. Frozen-run continuation uses original occurrence/member mapping
 without manifest rediscovery or partial-byte reuse. Other provider catalogues and trees remain separate
 work.
 
+### Common Client S3 objects and prefix inventories
+
+Enable the library's `s3` feature and supply a caller-configured `aws_sdk_s3::Client`. Construction
+loads no AWS configuration, profiles or `.env`; the supplied SDK owns credentials, endpoint, retry and
+connection policies. These are not the HTTP adapter's defaults. The legacy CLI above is unchanged;
+this section describes the common Rust Client, not new CLI tree flags.
+
+```rust
+use xget::{Client, Input};
+
+async fn fetch_prefix(sdk: aws_sdk_s3::Client)
+    -> Result<(), Box<dyn core::error::Error>>
+{
+    let client = Client::builder().s3_client(sdk).build()?;
+    let input = Input::tree("s3://example-bucket/archive/")?;
+    let inventory = client.resolve(input).await?;
+    for marker in inventory.directories() {
+        println!("directory metadata: {}", marker.source_path());
+    }
+    if inventory.files().len() == 0 {
+        return Ok(());
+    }
+    client.download_all(inventory.into_files())
+        .to_directory("downloads").run().await?;
+    Ok(())
+}
+```
+
+`Input::parse("s3://bucket/key")` is exact: HEAD metadata followed by a whole conditional GET, never
+listing after missing/denied lookup. A known versionId and opaque strong ETag are preserved separately
+from key identity and payload requirements. An ETag is not an expected MD5 or recovery content anchor.
+S3 stays whole mode, with no partial-byte reuse. Frozen continuation opens conditional whole bodies
+without relisting or a new HEAD; checked native publication and owned recovery are the common path.
+
+`Input::tree` requests a literal prefix and complete bounded ListObjectsV2 pagination. Listing is not
+a point-in-time snapshot. Each object's listing length/ETag must agree with its conditional HEAD, then
+its GET must preserve that HEAD evidence. Source paths are relative to the prefix's last complete slash
+ancestor: `dir/fo` lists `dir/foo` as `foo`; the genuine member selector remains `dir/foo`. Full-key
+selectors are provider-scoped, not synthetic URLs or occurrence-local FileIds.
+
+Zero-byte slash-ending objects are genuine inspection-only `inventory.directories()` entries. They
+share count/text budgets with files, but do not create file jobs or empty directories. Directory-only
+unconfigured/exclusion-only requests are zero-file no-ops with no output root. Nonempty slash-key
+payloads fail explicitly; request that exact object with a safe explicit file target instead.
+
+`resolve_all` shares one 128-original-input bound, 128 combined discovered file/directory entries,
+1 MiB accounted metadata and a 15-second async discovery deadline across inputs. Each S3 metadata
+response has a separate enforced 2 MiB HTTP body-data cap before SDK collection/XML deserialization,
+including chunked responses. HEAD Content-Length still describes object size; successful GET payloads
+are not metadata-capped. Each listing asks for 129 keys and accepts at most 128 pages, with real,
+nonrepeating continuation tokens. These limits are not a total transport/RSS or parser CPU guarantee.
+Client clones share request admission, SDK/HTTP pools and body ownership, not run identity.
+
+Pre-release API changes: `MemberToken` is no longer Copy; use an explicit cheap Clone or borrow its
+provider-scoped value. Ordinary whole-body source failures use `client::SourceError` around concrete
+HTTP/S3 causes; explicit `Failure<HttpError>` annotations need updating. HTTP range-reader and existing
+legacy Source/get/from/Download/Output/Report families retain their separate contracts.
+
 ### Include and exclude original paths
 
 Use Input-local intent when one request combines multiple references. Download's `include`/`exclude`
@@ -278,7 +336,9 @@ async fn download_selected(client: &Client, reference: &str, root: &Path)
 
 Patterns match the whole ORIGINAL source-relative path, case-sensitively by Unicode scalar. `*` stays
 within one component, `?` consumes one scalar, and a complete `**` component consumes zero or more
-components. Includes form a union; no includes means all paths. Exclusions apply afterward. Namespaces,
+components. Every positive include must match at least one file in the complete original scope before
+exclusions; duplicates may match the same file. Matching includes form a union; no includes means all
+paths. Exclusions apply afterward. Namespaces,
 normalized collision keys and assigned filenames are not matching input. A remote exact-HTTP ancestor
 such as `con` is routing data, not a local filename; its spelling does not prevent an explicit safe
 output. Actual destination names still undergo the same conservative local validation. Collection
@@ -291,14 +351,22 @@ Configured matching also requires each original source path to fit 4096 UTF-8 by
 slash-separated components. Exceeding that separate source-path ceiling is an inventory-limit error,
 even for one exact HTTP input with an explicit output name. Pattern text participates in the existing
 request/discovery metadata accounting. Discovery remains complete and bounded before filtering; exclusions cannot hide an over-limit inventory. A genuinely
-empty discovered inventory remains a no-op, but filtering a nonempty input to no files is an error,
-even if another input still matches. Literal member tokens remain separate selection intent.
+empty discovered inventory remains a no-op only without positive criteria. A positive on an empty
+file scope, or filtering a nonempty input to no files, is an error even if another input still matches.
+Literal identities are validated against complete metadata before path subtraction, and the complete
+accounted charge survives both filters. Selecting a frozen File subset preserves already-proved
+criteria; newly appended includes require matches in that subset.
 
 Automatic continuation matches the original ordered pattern intent before discovery and restores its
 frozen members without rerunning patterns against changed metadata. Explicit `resume(...).input(...)`
 bindings must reconstruct the same original pattern intent and namespace, as well as the same original
-reference. The record stores fingerprints, not a recipe from which forgotten patterns can be recovered.
-Unconfigured requests retain their existing matching behavior. This is library selection; the compiled
+reference. New V4 records can retain the bounded nonsecret scope/namespace/ordered-pattern recipe,
+with separate original-reference-only and full binding fingerprints. `SavedMember::binding_input`
+checks a caller-supplied original reference and reconstructs that intent without discovery or pattern
+reevaluation; pass its Input to `Resume::input`. Older/default records reconstruct only when their full
+binding agrees; complex older intent returns an actionable need-original-intent error rather than
+guessing. No raw reference, credentials or renewed access is recovered from disk. Unconfigured
+request fingerprints retain their existing byte streams. This is library selection; the compiled
 legacy CLI has not adopted these flags.
 
 ### Owned run continuation
@@ -329,7 +397,9 @@ Reentry checks that state and rehashes an already-recorded strong proper prefix 
 the suffix, without a fresh HEAD. Weak/no-hash, missing, unanchored, foreign and closed receiving
 states do not authorize reuse or silently fall back to refetching. Use the explicit `Fresh` entrance
 for deliberately new work, not overwrite or cleanup. V1/V2 aggregate records keep whole-response
-semantics; V3 records can freeze range mode. A fresh selected File's changed range advertisement is
+semantics; V3 records can freeze range mode. V4 additionally stores genuine S3 key/version evidence
+and optional bounded nonsecret binding intent; it does not persist directory jobs or reader authority
+for S3. A fresh selected File's changed range advertisement is
 not new request intent and cannot upgrade/downgrade that stored mode or bypass unfinished work.
 
 `PublishedFile::range_stats()` reports restored bytes and current-attempt source/acknowledged writes.

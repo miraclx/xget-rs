@@ -30,6 +30,9 @@ const MAX_PATH: usize = 4096;
 pub(super) struct Http {
     client: reqwest::Client,
     admission: Arc<Semaphore>,
+    // Optional configured SDK shares this transport root's admission, never its HTTP policies.
+    #[cfg(feature = "s3")]
+    pub(super) s3: Option<Arc<super::s3::S3>>,
     // Tests map already-validated service/object authorities onto one owned loopback listener.
     // There is deliberately no production endpoint override or credential-origin bypass.
     #[cfg(test)]
@@ -56,6 +59,8 @@ impl Http {
         Ok(Self {
             client,
             admission: Arc::new(Semaphore::new(maximum.get())),
+            #[cfg(feature = "s3")]
+            s3: None,
             #[cfg(test)]
             fixture: None,
         })
@@ -66,6 +71,15 @@ impl Http {
         let mut http = Self::new(maximum).unwrap_or_else(|_| panic!("fixture http configuration"));
         http.fixture = Some(url::Url::parse(uri).unwrap_or_else(|_| panic!("fixture uri")));
         http
+    }
+
+    #[cfg(feature = "s3")]
+    pub(super) async fn admit(&self) -> Result<OwnedSemaphorePermit, Error> {
+        // One shared permit covers metadata calls/pages and owning payloads across all adapters.
+        Arc::clone(&self.admission)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::AdmissionLimit)
     }
 
     pub(super) fn runtime() -> Result<(), Error> {

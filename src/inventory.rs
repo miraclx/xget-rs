@@ -23,21 +23,55 @@ pub(crate) const MAX_METADATA_BYTES: usize = 1024 * 1024;
 /// Unsupported providers do not manufacture successful empty results.
 pub struct Inventory {
     files: Vec<File>,
+    directories: Vec<Directory>,
     metadata_bytes: usize,
+}
+
+// Discovery carries inspection-only directory facts separately from executable file selections.
+// No provider scheduler or public discovery framework is introduced.
+#[derive(Default)]
+pub(crate) struct Discovered {
+    pub(crate) files: Vec<File>,
+    pub(crate) directories: Vec<Directory>,
+}
+
+impl From<Vec<File>> for Discovered {
+    fn from(files: Vec<File>) -> Self {
+        Self {
+            files,
+            directories: Vec::new(),
+        }
+    }
 }
 
 impl Inventory {
     pub(crate) fn complete(files: Vec<File>) -> Result<Self, InventoryError> {
-        let metadata_bytes = files.iter().fold(0_usize, |bytes, file| {
-            bytes.saturating_add(file.retained_bytes())
-        });
-        if files.len() > MAX_FILES || metadata_bytes > MAX_METADATA_BYTES {
+        Self::discovered(files.into())
+    }
+
+    pub(crate) fn discovered(discovered: Discovered) -> Result<Self, InventoryError> {
+        let Discovered { files, directories } = discovered;
+        let metadata_bytes = files
+            .iter()
+            .map(File::retained_bytes)
+            .chain(directories.iter().map(Directory::retained_bytes))
+            .fold(0_usize, usize::saturating_add);
+        if files.len().saturating_add(directories.len()) > MAX_FILES
+            || metadata_bytes > MAX_METADATA_BYTES
+        {
             return Err(InventoryError::Limit);
         }
         Ok(Self {
             files,
+            directories,
             metadata_bytes,
         })
+    }
+
+    pub(crate) fn freeze_path_selection(&mut self) {
+        for file in &mut self.files {
+            file.input.checked_selection = file.input.selection.as_ref().map(Arc::clone);
+        }
     }
 
     /// Only complete, accounted discovery may be filtered; its original charge remains visible.
@@ -50,7 +84,18 @@ impl Inventory {
         self.files.iter()
     }
 
-    /// Consumes the complete inventory, preserving each file's private origin/group context.
+    /// Inspects genuine directory metadata separately from executable files.
+    ///
+    /// These entries do not create local directories or file jobs. In particular, an inventory
+    /// containing only directory metadata has zero files and executes as a no-op. Directory entries
+    /// share the 128-entry and 1 MiB accounted-text limits with files, before file selection. File
+    /// include/exclude intent does not remove these inspection facts or create a directory job.
+    pub fn directories(&self) -> impl ExactSizeIterator<Item = &Directory> {
+        self.directories.iter()
+    }
+
+    /// Consumes executable files, preserving each file's private origin/group context.
+    /// Inspection-only directory metadata is discarded, never converted to executable file jobs.
     pub fn into_files(self) -> impl ExactSizeIterator<Item = File> {
         self.files.into_iter()
     }
@@ -73,8 +118,9 @@ impl Inventory {
         selected.ok_or(SelectionError::NoMatch)
     }
 
-    /// Accounted discovery reference, pattern, path, hint and validator bytes before input path
-    /// filtering, not total process RSS. Excluding members does not erase their discovery charge.
+    /// Accounted discovery reference, pattern, path, hint and validator bytes before literal-member
+    /// and input-path filtering, not total process RSS. Neither selection erases the complete scope's
+    /// charge, including inspection-only directories. This is the common complete-discovery receipt.
     pub fn metadata_bytes(&self) -> usize {
         self.metadata_bytes
     }
@@ -85,9 +131,80 @@ impl fmt::Debug for Inventory {
         formatter
             .debug_struct("Inventory")
             .field("files", &self.files.len())
+            .field("directories", &self.directories.len())
             .field("metadata_bytes", &self.metadata_bytes)
             .finish()
     }
+}
+
+/// Genuine inspection-only directory metadata, not an executable file or local directory promise.
+///
+/// The S3 adapter records a zero-byte slash-ending object as a folder marker only after its
+/// conditional HEAD agrees with the listing's size and ETag. This does not establish an atomic tree
+/// snapshot or authorize restoring empty directories. Original occurrence/reference/group, full key,
+/// source path and HEAD version evidence remain separate internally. Default diagnostics redact them.
+pub struct Directory {
+    pub(crate) input: Input,
+    pub(crate) description: Description,
+}
+
+impl Directory {
+    /// The evidenced directory metadata kind, not a filesystem operation or payload type guess.
+    pub fn kind(&self) -> DirectoryKind {
+        DirectoryKind::S3FolderMarker
+    }
+
+    /// Original source-relative directory path without its marker's terminal slash.
+    /// Empty means the explicitly requested prefix root, not a normalized absolute path.
+    /// This explicit accessor may expose sensitive names; default formatting does not.
+    pub fn source_path(&self) -> &str {
+        &self.description.source_path
+    }
+
+    /// Genuine full-key selector, including the slash, scoped by the original S3 input.
+    /// It identifies the marker object, not an executable File or authorization capability.
+    pub fn member_token(&self) -> Option<&crate::input::MemberToken> {
+        self.input.member.as_ref()
+    }
+
+    /// Caller-requested original-occurrence grouping, independent of the remote marker key.
+    pub fn namespace(&self) -> Option<&Namespace> {
+        self.input.namespace()
+    }
+
+    /// Conditional HEAD evidence for this marker object, not a content hash or tree snapshot.
+    pub fn version(&self) -> VersionEvidence {
+        if self.description.etag.is_some() {
+            VersionEvidence::StrongEtag
+        } else {
+            VersionEvidence::Unpinned
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.input
+            .retained_bytes()
+            .saturating_add(self.description.retained_bytes())
+    }
+}
+
+impl fmt::Debug for Directory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Directory")
+            .field("kind", &self.kind())
+            .field("version", &self.version())
+            .field("reference_and_names", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Source evidence behind inspection-only directory metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryKind {
+    /// An actual S3 zero-byte slash-ending object, conditionally checked against listing metadata.
+    /// Nonempty slash-ending object payload is not classified as directory metadata.
+    S3FolderMarker,
 }
 
 /// A selected remote file with its original occurrence and advisory metadata intact.

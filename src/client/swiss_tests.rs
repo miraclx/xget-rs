@@ -238,6 +238,50 @@ async fn equal_fallback_groups_conflict_even_with_disjoint_member_names() {
 }
 
 #[tokio::test]
+async fn literal_selection_keeps_the_complete_share_metadata_charge() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/dl/{SHARE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(page(
+            SHARE,
+            &[(FILE_A, "nested/a", 3), (FILE_B, "other/b", 3)],
+        )))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    let complete = client.resolve(reference(SHARE)).await.unwrap();
+    let charge = complete.metadata_bytes();
+    let selected = client
+        .resolve(
+            Input::parse(&reference(SHARE))
+                .unwrap()
+                .select_id(FILE_B)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(complete.files().len(), 2);
+    assert_eq!(selected.files().len(), 1);
+    assert_eq!(
+        selected
+            .files()
+            .next()
+            .unwrap()
+            .member_token()
+            .unwrap()
+            .as_str(),
+        FILE_B
+    );
+    assert_eq!(selected.metadata_bytes(), charge);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        2,
+        "metadata pages only"
+    );
+}
+
+#[tokio::test]
 async fn explicit_selection_is_scoped_stale_safe_and_global_expectation_checks_selected_count() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

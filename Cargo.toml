@@ -9,9 +9,19 @@ repository = "https://github.com/miraclx/xget-rs"
 license = "MIT OR Apache-2.0"
 keywords = ["download", "http", "range", "resume", "parallel"]
 categories = ["network-programming", "asynchronous"]
+# The review record is tracked in ../craft and reached through a symlink. It is not part of the library.
+# `harness/` cannot run from an unpacked tarball: scenarios.sh builds from `..`, so shipping it would be
+# a promise the tarball cannot keep.
+exclude = ["notes", "harness", "AGENTS.md", ".claude"]
 
 [features]
-s3 = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sdk-s3", "dep:aws-smithy-types", "dep:tokio-util"]
+s3 = [
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:aws-sdk-s3",
+    "dep:aws-smithy-types",
+    "dep:tokio-util",
+]
 ipfs = ["dep:cid"]
 aws-credential-types = ["dep:aws-credential-types"]
 aws-smithy-types = ["dep:aws-smithy-types"]

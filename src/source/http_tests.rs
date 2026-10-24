@@ -1,4 +1,41 @@
-use super::http::{content_disposition_name, content_range_start, content_range_total};
+use super::http::{
+    content_disposition_name, content_range, content_range_start, content_range_total,
+};
+use crate::ByteRange;
+
+#[test]
+fn a_content_range_is_a_nonempty_window_within_its_known_total() {
+    assert_eq!(
+        content_range("bytes 0-0/1"),
+        Some(ByteRange { start: 0, end: 1 })
+    );
+    assert_eq!(
+        content_range("bytes 100-199/1000"),
+        Some(ByteRange {
+            start: 100,
+            end: 200
+        })
+    );
+    assert_eq!(
+        content_range("bytes 100-199/*"),
+        Some(ByteRange {
+            start: 100,
+            end: 200
+        })
+    );
+    for value in [
+        "bytes 0-0/0",
+        "bytes 100-199/199",
+        "bytes 200-100/1000",
+        "bytes */1000",
+        "bytes 0-18446744073709551615/*",
+        "bytes 0-1/2/3",
+        "bytes 0-1/garbage",
+        "items 0-1/2",
+    ] {
+        assert_eq!(content_range(value), None, "invalid Content-Range: {value}");
+    }
+}
 
 #[test]
 fn total_is_the_number_after_the_slash() {

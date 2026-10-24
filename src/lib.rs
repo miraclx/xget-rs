@@ -24,6 +24,8 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use tokio::io::AsyncWrite;
 
+use crate::control::Control;
+
 mod builder;
 mod checksum;
 mod control;
@@ -31,6 +33,8 @@ mod engine;
 mod plan;
 mod source;
 
+#[cfg(test)]
+mod control_tests;
 #[cfg(test)]
 mod plan_tests;
 
@@ -41,8 +45,12 @@ pub use crate::engine::{Report, sweep_orphans};
 /// Whether an interrupted download left a resumable partial beside `output`: its `.xget` file with a
 /// valid control trailer. A caller can use this to resume automatically without an explicit request. The
 /// naming and format of the partial are the engine's to own, so a caller need not know them.
+///
+/// This reads the control from disk on every call. It is an advisory check for callers such as the CLI;
+/// the engine rereads and validates the current control before reusing bytes rather than trusting an
+/// earlier inspection that may have gone stale.
 pub async fn resumable(output: &Path) -> bool {
-    crate::control::is_resumable(&crate::engine::part_path(output)).await
+    Control::is_resumable(&crate::engine::part_path(output)).await
 }
 
 /// The source URL recorded inside a `.xget` control file, if `control_path` is a valid control that
@@ -50,7 +58,7 @@ pub async fn resumable(output: &Path) -> bool {
 /// rebuild the source from it, and finish the download. `control_path` is the `.xget` file itself, not
 /// the output it belongs to.
 pub async fn control_source(control_path: &Path) -> Option<String> {
-    crate::control::read(control_path)
+    Control::read(control_path)
         .await
         .and_then(|control| control.source)
 }
@@ -74,7 +82,7 @@ pub struct Inspection {
 /// reads only the local file and never probes the network, so it can identify a stray partial. Powers
 /// `xget --info`.
 pub async fn inspect(control_path: &Path) -> Option<Inspection> {
-    let control = crate::control::read(control_path).await?;
+    let control = Control::read(control_path).await?;
     Some(Inspection {
         source: control.source,
         total: control.total,

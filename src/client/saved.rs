@@ -534,6 +534,9 @@ impl Fingerprint {
                 },
             );
         }
+        if input.kind() == crate::input::InputKind::Http && input.scope() == InputScope::Tree {
+            Self::field(&mut hash, b"webdav tree scope 1");
+        }
         Self::field(&mut hash, input.original_reference().as_bytes());
         Self::field(
             &mut hash,
@@ -577,10 +580,11 @@ impl Fingerprint {
         Self::field(&mut hash, b"xget exact request intent 1");
         for (index, input) in inputs.iter().enumerate() {
             Self::field(&mut hash, &Self::reference(input).0);
-            if matches!(
+            if (matches!(
                 input.kind(),
                 crate::input::InputKind::SwissTransfer | crate::input::InputKind::S3
-            ) && input.selected.is_some()
+            ) || input.scope() == InputScope::Tree)
+                && input.selected.is_some()
             {
                 let group = inputs[..index]
                     .iter()
@@ -594,6 +598,8 @@ impl Fingerprint {
                     &mut hash,
                     if token.is_s3() {
                         b"s3 object key 1"
+                    } else if token.is_webdav() {
+                        b"webdav scoped href 1"
                     } else {
                         b"swiss member token 1"
                     },
@@ -694,6 +700,7 @@ struct FrozenIntent {
 impl FrozenIntent {
     fn capture(input: &Input) -> Result<Option<Self>, SavedError> {
         if input.kind() != crate::input::InputKind::S3
+            && input.scope() != InputScope::Tree
             && input.namespace().is_none()
             && input
                 .selection
@@ -768,6 +775,9 @@ impl Member {
         }
         let provider_matches = match &self.remote {
             Some(remote) if remote.token.is_s3() => input.kind() == crate::input::InputKind::S3,
+            Some(remote) if remote.token.is_webdav() => {
+                input.kind() == crate::input::InputKind::Http && input.scope() == InputScope::Tree
+            }
             Some(_) => input.kind() == crate::input::InputKind::SwissTransfer,
             None => input.kind() == crate::input::InputKind::Http,
         };
@@ -913,6 +923,20 @@ impl Owned {
     pub(super) async fn opened(&mut self, index: usize, file: &File) -> Result<(), SavedError> {
         let member = &mut self.saved.record.members[index];
         if member.remote.is_none() {
+            return Ok(());
+        }
+        if member
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.token.is_webdav())
+        {
+            // Unpinned DAV is honestly a fresh whole response, not first-open snapshot evidence.
+            // A discovered strong pin is already frozen before any native submission.
+            if member.etag.as_deref() != file.selected.description.etag.as_deref()
+                || member.length != file.length()
+            {
+                return Err(SavedError::Binding);
+            }
             return Ok(());
         }
         let etag = file

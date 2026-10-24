@@ -67,6 +67,8 @@ mod s3;
 mod saved;
 #[cfg(feature = "swisstransfer")]
 mod swiss;
+#[cfg(feature = "webdav")]
+mod webdav;
 
 pub use builtin::SourceError;
 use http::Http;
@@ -82,6 +84,10 @@ pub use saved::{
 };
 #[cfg(feature = "swisstransfer")]
 use swiss::Swiss;
+#[cfg(feature = "webdav")]
+use webdav::WebDav;
+#[cfg(feature = "webdav")]
+pub use webdav::WebDavError;
 
 #[cfg(test)]
 #[path = "client/discovery_tests.rs"]
@@ -405,6 +411,10 @@ impl Client {
             #[cfg(not(feature = "s3"))]
             return Err(Error::S3Unavailable);
         }
+        #[cfg(feature = "webdav")]
+        if input.kind() == InputKind::Http && input.scope() == InputScope::Tree {
+            return WebDav::resolve(&self.http, input, budget).await;
+        }
         let description = self.http.describe(&mut input).await?;
         let file = File {
             input,
@@ -434,6 +444,10 @@ impl Client {
         }
         #[cfg(feature = "swisstransfer")]
         if input.kind() == InputKind::SwissTransfer && input.scope() == InputScope::Collection {
+            return Ok(());
+        }
+        #[cfg(feature = "webdav")]
+        if input.kind() == InputKind::Http && input.scope() == InputScope::Tree {
             return Ok(());
         }
         if input.kind() != InputKind::Http || input.scope() != InputScope::Exact {
@@ -486,6 +500,10 @@ impl Client {
         #[cfg(feature = "swisstransfer")]
         if file.input.kind() == InputKind::SwissTransfer {
             return Swiss::open(&self.http, file).await.map(Into::into);
+        }
+        #[cfg(feature = "webdav")]
+        if file.input.kind() == InputKind::Http && file.input.scope() == InputScope::Tree {
+            return WebDav::open(&self.http, file).await.map(Into::into);
         }
         self.http.open(file).await.map(Into::into)
     }
@@ -1187,7 +1205,7 @@ impl DiscoveryBudget {
         self.reserve_entry(file.retained_bytes())
     }
 
-    #[cfg(feature = "s3")]
+    #[cfg(any(feature = "s3", feature = "webdav"))]
     fn reserve_directory(&mut self, directory: &crate::inventory::Directory) -> Result<(), Error> {
         self.reserve_entry(directory.retained_bytes())
     }
@@ -1400,6 +1418,10 @@ impl RunFailure {
 /// Built-in errors expose only safe typed context, never a bearer reference or unsafe remote name.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Bounded namespace-aware DAV discovery failure, without remote diagnostic text.
+    #[cfg(feature = "webdav")]
+    #[error("webdav discovery failed; inspect the typed metadata category")]
+    WebDav(#[from] WebDavError),
     /// Exact S3 and explicit S3 trees require the feature and a caller-configured SDK client.
     #[error(
         "s3 capability unavailable; enable s3 and configure the client builder with an sdk client"

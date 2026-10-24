@@ -315,6 +315,50 @@ provider-scoped value. Ordinary whole-body source failures use `client::SourceEr
 HTTP/S3 causes; explicit `Failure<HttpError>` annotations need updating. HTTP range-reader and existing
 legacy Source/get/from/Download/Output/Report families retain their separate contracts.
 
+### Bounded WebDAV trees
+
+Enable the library-only `webdav` feature and use an explicit tree input. An ordinary HTTP URL remains
+exact; failure never turns it into a crawl:
+
+```rust
+use xget::{Client, Input};
+
+async fn fetch_dav() -> Result<(), Box<dyn core::error::Error>> {
+    let client = Client::new()?;
+    let input = Input::tree("https://example.org/dav/archive/")?;
+    let report = client.download(input).to_directory("downloads").run().await?;
+    println!("published {} files", report.completed().len());
+    Ok(())
+}
+```
+
+The root must end in `/`. Discovery uses complete Depth-1 PROPFIND responses, then traverses the
+returned immediate collections under the same origin and root. Absolute URI-path hrefs and same-origin
+absolute URLs are supported; relative hrefs, redirects, query/fragment access, dot paths, encoded
+separators, aliases and incomplete property/status responses fail explicitly. Caller-supplied userinfo
+in the original root is explicit access configuration for that same origin. Returned hrefs may not
+supply credentials or change origin. Credentials are neither inferred nor persisted in saved records;
+the exact original reference must be resupplied for continuation, so URL-userinfo rotation is not
+supported. HTTP sends credentials without encryption; use HTTPS except for an intentionally trusted
+HTTP endpoint.
+
+Discovery shares the Client's count/text/admission limits and 15-second async deadline. Additional
+bounds are 128 listings, 64 source components, 256 KiB per control body, 1 MiB total control bytes and
+16384 XML nodes per document. DTD processing is disabled. These are input/work bounds, not a hard
+synchronous CPU deadline, total RSS guarantee or point-in-time tree snapshot.
+
+`Inventory::directories()` retains inspection-only `WebDavCollection` facts; empty directories are not
+restored or persisted as jobs. A genuine directory-only request is a zero-file no-op. Literal file
+selectors use genuine scoped href paths; path patterns match decoded original relative source paths.
+Whole GETs must match the frozen known length and any discovered strong ETag. Without a strong pin,
+consistency remains `Unpinned`; optional hashing is not an expected digest or source authenticity.
+There is no WebDAV range assembly or partial-byte reuse.
+
+V4 saved records retain the member href/source path and check/version evidence, never the access root
+or credentials. Explicit continuation rebinds the original root and opens the frozen member directly,
+without another PROPFIND, HEAD or selector replay. Native reconciliation still requires its recorded
+strong content and filesystem identity. The compiled legacy CLI is unchanged in this prefix.
+
 ### Include and exclude original paths
 
 Use Input-local intent when one request combines multiple references. Download's `include`/`exclude`

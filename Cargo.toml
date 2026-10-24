@@ -35,6 +35,7 @@ s3 = [
 ]
 ipfs = ["dep:cid"]
 swisstransfer = ["dep:scraper", "dep:serde", "dep:serde_json", "dep:time"]
+webdav = ["dep:roxmltree"]
 aws-credential-types = ["dep:aws-credential-types"]
 aws-smithy-types = ["dep:aws-smithy-types"]
 
@@ -58,6 +59,8 @@ md-5 = "0.10"
 percent-encoding = "2"
 # The ordinary Client explicitly disables the retry policy introduced in this release.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+# Namespace-aware bounded DAV multistatus parsing without external entities.
+roxmltree = { version = "0.21", optional = true }
 # Parse the bounded service HTML bootstrap without string-based HTML heuristics.
 scraper = { version = "0.24", optional = true }
 # Typed external metadata stays separate from internal and stored representations.

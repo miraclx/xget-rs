@@ -139,10 +139,11 @@ impl fmt::Debug for Inventory {
 
 /// Genuine inspection-only directory metadata, not an executable file or local directory promise.
 ///
-/// The S3 adapter records a zero-byte slash-ending object as a folder marker only after its
-/// conditional HEAD agrees with the listing's size and ETag. This does not establish an atomic tree
-/// snapshot or authorize restoring empty directories. Original occurrence/reference/group, full key,
-/// source path and HEAD version evidence remain separate internally. Default diagnostics redact them.
+/// S3 folder markers require a zero-byte slash-ending object and conditional HEAD agreement with
+/// the listing. WebDAV collections come from complete scoped PROPFIND evidence. Neither establishes
+/// an atomic tree snapshot or authorizes restoring empty directories. Original input/group, scoped
+/// selector, decoded source path and discovered version evidence remain separate. Default diagnostics
+/// redact those names and references.
 pub struct Directory {
     pub(crate) input: Input,
     pub(crate) description: Description,
@@ -151,7 +152,16 @@ pub struct Directory {
 impl Directory {
     /// The evidenced directory metadata kind, not a filesystem operation or payload type guess.
     pub fn kind(&self) -> DirectoryKind {
-        DirectoryKind::S3FolderMarker
+        if self
+            .input
+            .member
+            .as_ref()
+            .is_some_and(crate::input::MemberToken::is_webdav)
+        {
+            DirectoryKind::WebDavCollection
+        } else {
+            DirectoryKind::S3FolderMarker
+        }
     }
 
     /// Original source-relative directory path without its marker's terminal slash.
@@ -161,8 +171,8 @@ impl Directory {
         &self.description.source_path
     }
 
-    /// Genuine full-key selector, including the slash, scoped by the original S3 input.
-    /// It identifies the marker object, not an executable File or authorization capability.
+    /// Provider-scoped directory selector: an S3 full key or a WebDAV collection href.
+    /// It identifies inspection metadata, not an executable File or authorization capability.
     pub fn member_token(&self) -> Option<&crate::input::MemberToken> {
         self.input.member.as_ref()
     }
@@ -172,7 +182,8 @@ impl Directory {
         self.input.namespace()
     }
 
-    /// Conditional HEAD evidence for this marker object, not a content hash or tree snapshot.
+    /// Discovered strong-validator evidence, not a content hash or atomic tree snapshot.
+    /// S3 markers use conditional HEAD evidence; WebDAV collections use PROPFIND evidence.
     pub fn version(&self) -> VersionEvidence {
         if self.description.etag.is_some() {
             VersionEvidence::StrongEtag
@@ -205,6 +216,8 @@ pub enum DirectoryKind {
     /// An actual S3 zero-byte slash-ending object, conditionally checked against listing metadata.
     /// Nonempty slash-ending object payload is not classified as directory metadata.
     S3FolderMarker,
+    /// A DAV:collection reported by complete explicit Depth:1 traversal, not an empty-directory job.
+    WebDavCollection,
 }
 
 /// A selected remote file with its original occurrence and advisory metadata intact.

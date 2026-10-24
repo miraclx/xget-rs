@@ -10,8 +10,8 @@
   S3 exact objects/explicit prefix inventories. Shared bounded resolution, literal/original-path selection,
   inspection-only directory metadata, frozen layout, serial checked publication/live opening and owned
   continuation use the same coordinator. Eligible exact HTTP uses anchored-prefix range recovery;
-  S3 and Swiss stay whole mode. WebDAV/catalogues, restart/overwrite and the redesigned CLI remain
-  unimplemented in this prefix.
+  S3, Swiss and explicit optional WebDAV trees stay whole mode. Release catalogues,
+  restart/overwrite and the redesigned CLI remain unimplemented in this prefix.
 
 ## Workspace boundary
 
@@ -206,6 +206,24 @@ or credentials. SavedMember::binding_input verifies both that fingerprint and th
 before restoring intent without discovery/matching. Older/default records work only when the full
 binding agrees; complex older recipes require the original explicit Input. V1/V2/V3 encoding is retained.
 Saved key correlation and declared requirement provenance APIs from the parent remain available.
+
+## WebDAV tree adapter
+
+The optional library-only `webdav` adapter uses explicit HTTP(S) tree intent, complete Depth-1 PROPFIND
+and scoped same-origin/root hrefs. No crawling or exact-to-tree fallback. Directory facts are inspection
+metadata, not filesystem jobs. Shared complete accounting and positive/literal selection apply before
+execution. Whole responses repeat known length and any strong pin; an absent pin remains Unpinned,
+not a hidden snapshot or range-reuse capability.
+
+Roots end in slash; relative hrefs, redirects, query/fragments, normalized dot paths and
+encoded-separator/decoded-path aliases are refused. Explicit original-root userinfo is same-origin
+caller access, not member identity; returned hrefs cannot add credentials or change origin. Original
+references are resupplied exactly, not persisted or silently rotated. Control bodies
+are capped at 256 KiB each and 1 MiB per traversal, XML at 16384 nodes with DTD disabled, listings at
+128 and source depth at 64, within shared discovery/admission bounds. No hard parser CPU/RSS promise.
+V4 remote tag 3 stores scoped href/source-path evidence and frozen intent, not an access root or
+credentials. Reentry opens the recorded member without new listing/HEAD/selection or a partial fallback.
+The parent S3/Swiss formats, advanced native APIs and compiled legacy CLI remain separate.
 
 ## Original-path selection
 

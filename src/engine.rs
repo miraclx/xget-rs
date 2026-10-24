@@ -30,6 +30,10 @@ use crate::control::{Control, Writer};
 use crate::plan::{plan_range, plan_resume};
 use crate::{ByteRange, Checksum, Error, Options, Output, Probe, Progress, Source};
 
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod engine_tests;
+
 /// Bumped for each temp scratch a `Writer`/`Discard` download needs, so concurrent downloads in one
 /// process never collide on the same `.xget` scratch name.
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);

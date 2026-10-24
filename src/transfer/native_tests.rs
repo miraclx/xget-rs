@@ -768,6 +768,91 @@ fn subprocess_ownership_probe() {
     }
 }
 
+#[tokio::test]
+async fn native_reconciliation_reads_a_real_v1_publishing_record_without_replacing_the_output() {
+    let fixture = Fixture::new();
+    let state = lose_ack(&fixture).await;
+    let inode = fs::metadata(fixture.output()).unwrap().ino();
+    // Independent old-format fixture, using only this run's actual anchored file identities.
+    let mut bytes = b"XGETNF01".to_vec();
+    bytes.push(2);
+    for path in [
+        fixture.path().to_path_buf(),
+        state.path().to_path_buf(),
+        state.path().join("data"),
+    ] {
+        let metadata = fs::metadata(path).unwrap();
+        bytes.extend_from_slice(&metadata.dev().to_le_bytes());
+        bytes.extend_from_slice(&metadata.ino().to_le_bytes());
+    }
+    let digest = requirement(b"abc").digest();
+    bytes.extend_from_slice(&digest.0);
+    bytes.push(1);
+    bytes.extend_from_slice(&digest.0);
+    bytes.push(0);
+    for _ in 0..3 {
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+    }
+    bytes.extend_from_slice(&6u16.to_le_bytes());
+    bytes.extend_from_slice(b"output");
+    fs::write(state.path().join("state"), bytes).unwrap();
+    let outcome = state.reconcile().await.unwrap();
+    match outcome {
+        Reconciliation::Published(receipt) => {
+            assert_eq!(receipt.required, Some(requirement(b"abc")));
+            assert_eq!(receipt.checks().matched_requirements().count(), 1);
+            assert_eq!(
+                receipt.checks().measured(),
+                Some(requirement(b"abc").into())
+            );
+        }
+        other => panic!("expected anchored v1 publication evidence, got {other:?}"),
+    }
+    assert_eq!(fs::metadata(fixture.output()).unwrap().ino(), inode);
+    assert_eq!(
+        &fs::read(state.path().join("state")).unwrap()[..8],
+        b"XGETNF02"
+    );
+}
+
+#[tokio::test]
+async fn no_hash_lost_ack_stays_not_revalidatable_without_a_recovery_fingerprint_or_receipt() {
+    let fixture = Fixture::new();
+    let policy = crate::checks::CheckPolicy {
+        requirements: crate::checks::Requirements::default(),
+        measurement: crate::transfer::Measurement::None,
+    };
+    let plan = Plan::new(&fixture.output(), policy).unwrap();
+    let state = StateRef::clone(plan.state());
+    let native = Native::acquire(plan).await.unwrap();
+    native
+        .hooks()
+        .lose_publish_ack
+        .store(true, Ordering::Release);
+    let failure = Run {
+        native,
+        state: StateRef::clone(&state),
+        length: Length::Known(ByteCount(3)),
+    }
+    .execute(body(), pending())
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        failure.kind,
+        FailureKind::PublicationUnknown { .. }
+    ));
+    assert_eq!(failure.partial.hashed, ByteCount(0));
+    assert_eq!(failure.partial.actual, None);
+    let before = fs::read(state.path().join("state")).unwrap();
+    assert_eq!(before[8], 2);
+    assert!(matches!(
+        state.reconcile().await.unwrap(),
+        Reconciliation::NotRevalidatable(_)
+    ));
+    assert_eq!(fs::read(state.path().join("state")).unwrap(), before);
+    assert_eq!(fs::read(fixture.output()).unwrap(), b"abc");
+}
+
 async fn owned_run(fixture: &Fixture) -> (Run, StateRef) {
     let plan = Plan::new(&fixture.output(), requirement(b"abc")).unwrap();
     let state = StateRef::clone(plan.state());

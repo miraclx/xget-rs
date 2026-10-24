@@ -82,10 +82,15 @@ Persistent file partials must never be swept. Test actual CLI runs with their ow
 
 ## Advanced native-file invariants
 
-`Transfer::from_body(...).expect(required_sha256).to_file(...)` is a separate checked entrance, not the
-ordinary Client or a replacement for the legacy CLI. Required digest conflicts are sticky before effects.
-Clean EOF, declared length when known, settled writes and the required digest precede absent-only
-publication. Existing destinations are not overwritten, even when their contents match.
+Body-based `Transfer` is separate from the ordinary Client and legacy CLI. Same-algorithm requirement
+conflicts are sticky before effects; agreeing values merge bounded provenance. All configured checks
+share one traversal, independently of optional measurement. SHA-256 measurement is the default; None
+cannot disable requirements, and no requirements plus None performs no hashing.
+
+Clean EOF, declared length when known, settled writes, sealing and all required matches precede
+absent-only publication. Existing destinations are not overwritten, even when their contents match.
+Reports separate matched requirements from measurement. Advanced failures are concrete typed boxes,
+not erased causes; borrowed/local values and conditional native Send remain supported.
 
 The final physical-operation registration owns both leases/descriptors through queued and running
 blocking work. Dropping a waiter cannot unlock them early. `FlockLease` explicitly unlocks at final
@@ -93,8 +98,11 @@ owner destruction, with acquiring-PID protection; incidental inherited descripto
 prolong a settled parent's authority or let a child's destructor unlock a live parent. Stable lock names
 are never unlinked. Release notification follows guard cleanup.
 
-Reconciliation requires anchored digest and inode/device evidence; equal foreign bytes are not adopted,
-and absent destinations are not republished. Keep publication uncertainty and unconfirmed write extents
+Reconciliation requires recorded strong content and inode/device evidence; equal foreign bytes are
+not adopted, and absent destinations are not republished. Matching identities without a strong recorded
+anchor return NotRevalidatable, with no hidden fingerprint. MD5/SHA-1 are compatibility checks, not
+strong guards. V2 state writes remain bounded and preserve the V1 reader; legacy XGETCTL1 is unchanged.
+Keep publication uncertainty and unconfirmed write extents
 explicit. No one-shot source reopening, automatic cleanup, fsync or universal filesystem promise exists.
 Unix hardlink support, a caller-owned Tokio runtime and a suitable existing caller-owned parent are
 required. Non-Unix returns a typed unsupported result. Windows compilation is not native runtime proof.

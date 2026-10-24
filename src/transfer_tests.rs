@@ -16,8 +16,8 @@ use bytes::Bytes;
 use futures::stream;
 
 use super::{
-    ByteCount, FailureKind, Length, OwnedSha256, Partial, Reconciliation, RequestError,
-    RequiredSha256, Sha256Digest, StateRef, Transfer,
+    Algorithm, ByteCount, Digest, FailureKind, Length, Measurement, OwnedSha256, Partial,
+    Provenance, Reconciliation, RequestError, RequiredSha256, Sha256Digest, StateRef, Transfer,
 };
 
 #[test]
@@ -39,14 +39,14 @@ fn requirements_are_parsed_not_silently_dropped() {
 }
 
 #[test]
-fn missing_and_unsupported_requirements_have_no_filesystem_effects() {
+fn unrequired_planning_and_unsupported_compatibility_parsing_have_no_filesystem_effects() {
     let fixture = Fixture::new();
     let missing = Transfer::from_body(
         stream::empty::<Result<Bytes, Infallible>>(),
         Length::Unknown,
     )
     .to_file(fixture.output());
-    assert!(matches!(missing, Err(RequestError::MissingRequirement)));
+    assert!(missing.is_ok());
     assert!(matches!(
         "blake3:00".parse::<RequiredSha256>(),
         Err(RequestError::UnsupportedRequirement)
@@ -81,7 +81,7 @@ async fn conflicting_requirements_do_not_disappear_when_another_is_added() {
     .to_file(fixture.output());
     assert!(matches!(
         pending,
-        Err(RequestError::ConflictingRequirements)
+        Err(RequestError::ConflictingRequirements(_))
     ));
     assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 0);
 }
@@ -100,7 +100,7 @@ fn conflicts_remain_rejected_when_an_earlier_requirement_is_repeated() {
     .to_file(fixture.output());
     assert!(matches!(
         pending,
-        Err(RequestError::ConflictingRequirements)
+        Err(RequestError::ConflictingRequirements(_))
     ));
     assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 0);
 }
@@ -289,7 +289,7 @@ async fn digest_mismatch_really_hashes_and_preserves_the_incumbent_bytes_and_ino
         .run()
         .await
         .unwrap_err();
-    assert!(matches!(failure.kind, FailureKind::DigestMismatch));
+    assert!(matches!(failure.kind, FailureKind::DigestMismatch(_)));
     assert_eq!(failure.partial.actual, Some(requirement(b"abc").digest()));
     assert_eq!(failure.partial.hashed, ByteCount(3));
     assert_eq!(fs::read(fixture.output()).unwrap(), b"sentinel");
@@ -429,6 +429,368 @@ fn no_tokio_runtime_is_a_typed_failure_before_native_effects() {
     assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 0);
 }
 
+const ABC_DIGESTS: [&str; 5] = [
+    "md5:900150983cd24fb0d6963f7d28e17f72",
+    "sha1:a9993e364706816aba3e25717850c26c9cd0d89d",
+    "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    concat!(
+        "sha512:ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a",
+        "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    ),
+    "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+];
+
+const EMPTY_DIGESTS: [&str; 5] = [
+    "md5:d41d8cd98f00b204e9800998ecf8427e",
+    "sha1:da39a3ee5e6b4b0d3255bfef95601890afd80709",
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    concat!(
+        "sha512:cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce",
+        "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    ),
+    "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+];
+
+#[tokio::test]
+async fn every_required_algorithm_publishes_real_empty_and_abc_vectors() {
+    for (payload, vectors) in [
+        (b"".as_slice(), EMPTY_DIGESTS),
+        (b"abc".as_slice(), ABC_DIGESTS),
+    ] {
+        for value in vectors {
+            let fixture = Fixture::new();
+            let required: Digest = value.parse().unwrap();
+            let receipt = Transfer::from_body(
+                stream::iter([Ok::<_, Infallible>(Bytes::copy_from_slice(payload))]),
+                Length::Known(ByteCount(payload.len() as u64)),
+            )
+            .expect(required)
+            .measurement(Measurement::None)
+            .to_file(fixture.output())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+            assert_eq!(receipt.checks().measured(), None);
+            assert_eq!(
+                receipt
+                    .checks()
+                    .matched_requirements()
+                    .next()
+                    .unwrap()
+                    .digest,
+                required
+            );
+            assert_eq!(receipt.partial.hashed, ByteCount(payload.len() as u64));
+            assert_eq!(fs::read(fixture.output()).unwrap(), payload);
+        }
+    }
+}
+
+#[tokio::test]
+async fn all_required_algorithms_share_the_real_body_traversal_with_measurement_disabled() {
+    let fixture = Fixture::new();
+    let chunks = Rc::new(Cell::new(0));
+    let seen = Rc::clone(&chunks);
+    let body = stream::iter([b"a".as_slice(), b"", b"b", b"c"].into_iter().map(|bytes| {
+        seen.set(seen.get() + 1);
+        Ok::<_, Infallible>(Bytes::copy_from_slice(bytes))
+    }));
+    let mut transfer =
+        Transfer::from_body(body, Length::Known(ByteCount(3))).measurement(Measurement::None);
+    for value in ABC_DIGESTS {
+        transfer = transfer.expect(value.parse::<Digest>().unwrap());
+    }
+    assert_eq!(chunks.get(), 0);
+    let receipt = transfer
+        .to_file(fixture.output())
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(chunks.get(), 4);
+    assert_eq!(receipt.partial.received, ByteCount(3));
+    assert_eq!(receipt.partial.written, ByteCount(3));
+    assert_eq!(receipt.partial.hashed, ByteCount(3));
+    assert_eq!(receipt.checks().matched_requirements().count(), 5);
+    assert_eq!(receipt.checks().measured(), None);
+    assert!(matches!(
+        receipt.state.reconcile().await.unwrap(),
+        Reconciliation::Published(_)
+    ));
+}
+
+#[tokio::test]
+async fn agreeing_provenance_merges_and_never_manufactures_optional_measurement() {
+    let fixture = Fixture::new();
+    let required: Digest = ABC_DIGESTS[0].parse().unwrap();
+    let receipt = Transfer::from_body(
+        stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"abc"))]),
+        Length::Unknown,
+    )
+    .require(required, Provenance::Caller)
+    .require(required, Provenance::Source)
+    .require(required, Provenance::Sidecar)
+    .expect(required)
+    .measurement(Measurement::None)
+    .to_file(fixture.output())
+    .unwrap()
+    .run()
+    .await
+    .unwrap();
+    let matched = receipt.checks().matched_requirements().collect::<Vec<_>>();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(
+        matched[0].origins.iter().collect::<Vec<_>>(),
+        [Provenance::Caller, Provenance::Source, Provenance::Sidecar]
+    );
+    assert_eq!(receipt.checks().measured(), None);
+    assert_eq!(receipt.required, None);
+}
+
+#[test]
+fn general_conflicts_stay_typed_and_sticky_before_native_effects() {
+    let fixture = Fixture::new();
+    let first: Digest = ABC_DIGESTS[0].parse().unwrap();
+    let proposed: Digest = EMPTY_DIGESTS[0].parse().unwrap();
+    let result = Transfer::from_body(
+        stream::empty::<Result<Bytes, Infallible>>(),
+        Length::Unknown,
+    )
+    .expect(first)
+    .require(proposed, Provenance::Sidecar)
+    .expect(ABC_DIGESTS[3].parse::<Digest>().unwrap())
+    .expect(first)
+    .measurement(Measurement::None)
+    .to_file(fixture.output());
+    match result {
+        Err(RequestError::ConflictingRequirements(conflict)) => {
+            assert_eq!(conflict.existing.digest, first);
+            assert_eq!(conflict.proposed, proposed);
+            assert_eq!(conflict.provenance, Provenance::Sidecar);
+        }
+        _ => panic!("expected a sticky typed conflict before native effects"),
+    }
+    assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_late_required_algorithm_mismatch_cannot_publish_or_be_disabled_by_none() {
+    let fixture = Fixture::new();
+    fs::write(fixture.output(), b"sentinel").unwrap();
+    let inode = fs::metadata(fixture.output()).unwrap().ino();
+    let mut transfer = Transfer::from_body(
+        stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"abc"))]),
+        Length::Unknown,
+    )
+    .measurement(Measurement::None);
+    for value in &ABC_DIGESTS[..4] {
+        transfer = transfer.expect(value.parse::<Digest>().unwrap());
+    }
+    transfer = transfer.expect(EMPTY_DIGESTS[4].parse::<Digest>().unwrap());
+    let failure = transfer
+        .to_file(fixture.output())
+        .unwrap()
+        .run()
+        .await
+        .unwrap_err();
+    match &failure.kind {
+        FailureKind::DigestMismatch(mismatch) => {
+            assert_eq!(mismatch.actual, ABC_DIGESTS[4].parse::<Digest>().unwrap());
+            assert_eq!(
+                mismatch.requirement.digest,
+                EMPTY_DIGESTS[4].parse::<Digest>().unwrap()
+            );
+            assert_eq!(mismatch.results.matched_requirements().count(), 4);
+            assert_eq!(mismatch.results.measured(), None);
+        }
+        other => panic!("expected the required blake3 mismatch, got {other:?}"),
+    }
+    assert_eq!(failure.partial.hashed, ByteCount(3));
+    assert_eq!(fs::read(fixture.output()).unwrap(), b"sentinel");
+    assert_eq!(fs::metadata(fixture.output()).unwrap().ino(), inode);
+    assert!(matches!(
+        failure.state.unwrap().reconcile().await.unwrap(),
+        Reconciliation::NeedsBody { .. }
+    ));
+}
+
+#[tokio::test]
+async fn an_unrequired_file_has_only_the_default_optional_sha256_measurement() {
+    let fixture = Fixture::new();
+    let receipt = Transfer::from_body(
+        stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"abc"))]),
+        Length::Unknown,
+    )
+    .to_file(fixture.output())
+    .unwrap()
+    .run()
+    .await
+    .unwrap();
+    assert_eq!(receipt.required, None);
+    assert_eq!(receipt.checks().matched_requirements().count(), 0);
+    assert_eq!(
+        receipt.checks().measured(),
+        Some(ABC_DIGESTS[2].parse().unwrap())
+    );
+    assert_eq!(receipt.partial.hashed, ByteCount(3));
+    assert!(matches!(
+        receipt.state.reconcile().await.unwrap(),
+        Reconciliation::Published(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_different_optional_algorithm_is_reported_separately_and_can_anchor_recovery() {
+    let fixture = Fixture::new();
+    let required: Digest = ABC_DIGESTS[0].parse().unwrap();
+    let measured: Digest = ABC_DIGESTS[3].parse().unwrap();
+    let receipt = Transfer::from_body(
+        stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"abc"))]),
+        Length::Unknown,
+    )
+    .expect(required)
+    .measurement(Measurement::Algorithm(Algorithm::Sha512))
+    .to_file(fixture.output())
+    .unwrap()
+    .run()
+    .await
+    .unwrap();
+    assert_eq!(
+        receipt
+            .checks()
+            .matched_requirements()
+            .next()
+            .unwrap()
+            .digest,
+        required
+    );
+    assert_eq!(receipt.checks().measured(), Some(measured));
+    assert_eq!(receipt.checks().strong_anchor(), Some(measured));
+    assert_eq!(receipt.partial.actual, None);
+    assert_eq!(receipt.partial.hashed, ByteCount(3));
+    assert!(matches!(
+        receipt.state.reconcile().await.unwrap(),
+        Reconciliation::Published(_)
+    ));
+}
+
+#[tokio::test]
+async fn required_strong_algorithms_anchor_recovery_without_optional_or_hidden_hashes() {
+    for value in &ABC_DIGESTS[2..] {
+        let fixture = Fixture::new();
+        let required: Digest = value.parse().unwrap();
+        let receipt = Transfer::from_body(
+            stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"abc"))]),
+            Length::Unknown,
+        )
+        .expect(required)
+        .measurement(Measurement::None)
+        .to_file(fixture.output())
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(receipt.checks().measured(), None);
+        assert_eq!(receipt.checks().strong_anchor(), Some(required));
+        assert!(matches!(
+            receipt.state.reconcile().await.unwrap(),
+            Reconciliation::Published(_)
+        ));
+        fs::write(fixture.output(), b"xyz").unwrap();
+        assert!(matches!(
+            receipt.state.reconcile().await.unwrap(),
+            Reconciliation::Conflict(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn no_anchor_means_not_revalidatable_not_a_hidden_recovery_fingerprint() {
+    for required in [None, Some(ABC_DIGESTS[0]), Some(ABC_DIGESTS[1])] {
+        let fixture = Fixture::new();
+        let mut transfer = Transfer::from_body(
+            stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"abc"))]),
+            Length::Unknown,
+        )
+        .measurement(Measurement::None);
+        if let Some(required) = required {
+            transfer = transfer.expect(required.parse::<Digest>().unwrap());
+        }
+        let receipt = transfer
+            .to_file(fixture.output())
+            .unwrap()
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(receipt.checks().measured(), None);
+        assert_eq!(receipt.checks().strong_anchor(), None);
+        assert_eq!(receipt.partial.actual, None);
+        assert_eq!(
+            receipt.partial.hashed,
+            ByteCount(if required.is_some() { 3 } else { 0 })
+        );
+        assert!(matches!(
+            receipt.state.reconcile().await.unwrap(),
+            Reconciliation::NotRevalidatable(_)
+        ));
+        fs::write(fixture.output(), b"xyz").unwrap();
+        assert!(matches!(
+            receipt.state.reconcile().await.unwrap(),
+            Reconciliation::NotRevalidatable(_)
+        ));
+        assert_eq!(fs::read(fixture.output()).unwrap(), b"xyz");
+    }
+}
+
+#[tokio::test]
+async fn no_hash_policy_still_rejects_a_foreign_inode_with_equal_bytes_and_does_not_republish_missing_output()
+ {
+    let fixture = Fixture::new();
+    let receipt = Transfer::from_body(
+        stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"abc"))]),
+        Length::Unknown,
+    )
+    .measurement(Measurement::None)
+    .to_file(fixture.output())
+    .unwrap()
+    .run()
+    .await
+    .unwrap();
+    fs::remove_file(fixture.output()).unwrap();
+    assert!(matches!(
+        receipt.state.reconcile().await.unwrap(),
+        Reconciliation::PublicationUnknown(_)
+    ));
+    fs::write(fixture.output(), b"abc").unwrap();
+    let inode = fs::metadata(fixture.output()).unwrap().ino();
+    assert!(matches!(
+        receipt.state.reconcile().await.unwrap(),
+        Reconciliation::Conflict(_)
+    ));
+    assert_eq!(fs::metadata(fixture.output()).unwrap().ino(), inode);
+}
+
+#[tokio::test]
+async fn no_hash_policy_still_requires_clean_actual_eof() {
+    let fixture = Fixture::new();
+    let failure = Transfer::from_body(
+        stream::iter([Ok(Bytes::from_static(b"abc")), Err(Borrowed("late"))]),
+        Length::Known(ByteCount(3)),
+    )
+    .measurement(Measurement::None)
+    .to_file(fixture.output())
+    .unwrap()
+    .run()
+    .await
+    .unwrap_err();
+    assert!(matches!(failure.kind, FailureKind::Body(Borrowed("late"))));
+    assert_eq!(failure.partial.written, ByteCount(3));
+    assert_eq!(failure.partial.hashed, ByteCount(0));
+    assert_eq!(failure.partial.checks, None);
+    assert!(!fixture.output().exists());
+}
+
 pub(super) struct Fixture {
     path: PathBuf,
 }
@@ -469,13 +831,16 @@ pub(super) fn requirement(bytes: &[u8]) -> RequiredSha256 {
 }
 
 pub(super) fn complete(bytes: &[u8]) -> Partial {
-    Partial {
+    let mut checks = super::CheckPolicy::from(requirement(bytes)).start();
+    checks.update(bytes);
+    let mut partial = Partial {
         received: ByteCount(bytes.len() as u64),
         written: ByteCount(bytes.len() as u64),
         hashed: ByteCount(bytes.len() as u64),
-        actual: Some(requirement(bytes).digest()),
         ..Partial::default()
-    }
+    };
+    partial.set_checks(checks.finish().unwrap());
+    partial
 }
 
 fn require_send<T: Send>(value: T) -> T {

@@ -1,12 +1,41 @@
-//! Checked, one-shot native file publication, separate from the legacy download engine.
+//! One-shot native publication with required checks and optional measurement, separate from the legacy engine.
 //!
-//! Required SHA-256, clean body EOF and settled writes precede atomic no-replace publication.
+//! Clean body EOF, settled writes and every required digest precede atomic no-replace publication.
+//! Optional measurement defaults to SHA-256; explicit none never creates a hidden recovery hash.
 //! The native backend requires a caller-owned Tokio runtime, an existing caller-owned parent without
 //! group/other write permission, and Unix regular-file hardlink support. Published files retain the
 //! private stage's mode 0600. Other hosts return a typed unsupported capability before filesystem work.
 //! The retained private stage is an identity witness, not a resumable source. State is flushed to the
 //! operating system without fsync: recovery covers process interruption, not power loss. Leases
 //! exclude cooperating new writers only, not the legacy CLI or arbitrary same-user filesystem edits.
+//!
+//! Required checks are independent of optional measurement. Run native operations on a caller-owned
+//! Tokio runtime, with an absent destination in a suitable existing parent:
+//!
+//! ```no_run
+//! use bytes::Bytes;
+//! use futures::stream;
+//! use xget::Transfer;
+//! use xget::transfer::{Digest, Length, Measurement};
+//!
+//! # async fn example() -> Result<(), Box<dyn core::error::Error>> {
+//! let required: Digest =
+//!     "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85".parse()?;
+//! let body = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))]);
+//! let receipt = Transfer::from_body(body, Length::Unknown)
+//!     .expect(required)
+//!     .measurement(Measurement::None)
+//!     .to_file("download.bin")?
+//!     .run().await?;
+//! assert_eq!(receipt.checks().matched_requirements().count(), 1);
+//! assert_eq!(receipt.checks().measured(), None);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Omitting requirements is ordinary file publication. With `Measurement::None` as well, no hash is
+//! computed and later reconciliation returns `NotRevalidatable` when identities still agree. It does
+//! not compute a recovery-only fingerprint, adopt foreign bytes, or republish a missing destination.
 
 use core::convert::Infallible;
 use core::fmt;
@@ -17,6 +46,12 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use futures::Stream;
 
+pub use crate::checks::{
+    Algorithm, Conflict, Digest, Measurement, Mismatch, Origins, Outcome as CheckResults,
+    ParseDigestError, Provenance, Requirement,
+};
+use crate::checks::{CheckPolicy, Requirements};
+#[cfg(all(test, unix))]
 use crate::checksum::OwnedSha256;
 
 #[cfg(unix)]
@@ -41,7 +76,8 @@ mod tests;
 pub struct Transfer<B> {
     body: B,
     length: Length,
-    required: Result<Option<RequiredSha256>, RequestError>,
+    requirements: Result<Requirements, Box<Conflict>>,
+    measurement: Measurement,
 }
 
 impl<B> Transfer<B> {
@@ -50,30 +86,46 @@ impl<B> Transfer<B> {
         Self {
             body,
             length,
-            required: Ok(None),
+            requirements: Ok(Requirements::default()),
+            measurement: Measurement::default(),
         }
     }
 
-    /// Require a whole-file SHA-256 check. Agreeing requirements are idempotent; conflicts cannot
-    /// discard an earlier requirement, even if another call later repeats it.
-    pub fn expect(mut self, required: RequiredSha256) -> Self {
-        self.required = match self.required {
-            Ok(Some(previous)) if previous != required => {
-                Err(RequestError::ConflictingRequirements)
-            }
-            Ok(_) => Ok(Some(required)),
-            Err(error) => Err(error),
-        };
+    /// Require a whole-file digest from the caller. Agreeing values merge; conflicts stay sticky.
+    /// The original RequiredSha256 value also converts into this general digest entrance.
+    pub fn expect(self, required: impl Into<Digest>) -> Self {
+        self.require(required.into(), Provenance::Caller)
+    }
+
+    /// Require a digest with bounded provenance. Provenance records origin, not authenticity.
+    pub fn require(mut self, required: Digest, provenance: Provenance) -> Self {
+        self.requirements = self.requirements.and_then(|mut requirements| {
+            requirements.insert(required, provenance)?;
+            Ok(requirements)
+        });
+        self
+    }
+
+    /// Select optional measurement independently of required checks. None performs no extra hashing.
+    pub fn measurement(mut self, measurement: Measurement) -> Self {
+        self.measurement = measurement;
         self
     }
 
     /// Plan an absent-only file publication without filesystem effects.
     ///
     /// An existing destination is deliberately checked by the publication primitive, after hashing.
-    /// Missing checks and invalid destinations fail here, before a stage or lock can be created.
+    /// Conflicting requirements and invalid destinations fail before a stage or lock is created.
+    /// With no requirement this is ordinary absent-only publication, not expectation verification.
     pub fn to_file(self, destination: impl AsRef<Path>) -> Result<PendingFile<B>, RequestError> {
-        let required = self.required?.ok_or(RequestError::MissingRequirement)?;
-        let plan = Plan::new(destination.as_ref(), required)?;
+        let requirements = self
+            .requirements
+            .map_err(RequestError::ConflictingRequirements)?;
+        let checks = CheckPolicy {
+            requirements,
+            measurement: self.measurement,
+        };
+        let plan = Plan::new(destination.as_ref(), checks)?;
         Ok(PendingFile {
             body: self.body,
             length: self.length,
@@ -97,7 +149,7 @@ impl<B> PendingFile<B> {
     }
 
     /// Execute without a cooperative stop signal. Dropping the future stops further body polling.
-    pub async fn run<E>(self) -> Result<Receipt, Failure<E>>
+    pub async fn run<E>(self) -> Result<Receipt, Box<Failure<E>>>
     where
         B: Stream<Item = Result<Bytes, E>>,
     {
@@ -110,7 +162,7 @@ impl<B> PendingFile<B> {
     /// this future can leave the directory Busy until an already-submitted physical operation settles.
     /// The body, error and stop future need neither Send nor static; owned Send components yield Send.
     #[tracing::instrument(skip_all, name = "checked_native_file")]
-    pub async fn run_until<E, S>(self, stop: S) -> Result<Receipt, Failure<E>>
+    pub async fn run_until<E, S>(self, stop: S) -> Result<Receipt, Box<Failure<E>>>
     where
         B: Stream<Item = Result<Bytes, E>>,
         S: Future<Output = ()>,
@@ -143,7 +195,7 @@ pub enum Length {
     Unknown,
 }
 
-/// A parsed whole-file SHA-256 requirement. Other algorithms are not supported by this entrance yet.
+/// Compatibility whole-file SHA-256 requirement. Use Digest for the general algorithm entrance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequiredSha256(Sha256Digest);
 
@@ -172,9 +224,34 @@ impl FromStr for RequiredSha256 {
     }
 }
 
+impl From<RequiredSha256> for Digest {
+    fn from(required: RequiredSha256) -> Self {
+        let RequiredSha256(Sha256Digest(bytes)) = required;
+        Self::sha256(bytes)
+    }
+}
+
+impl From<RequiredSha256> for CheckPolicy {
+    fn from(required: RequiredSha256) -> Self {
+        Self {
+            requirements: Requirements::single(required.into(), Provenance::Caller),
+            measurement: Measurement::default(),
+        }
+    }
+}
+
 /// An actual or required whole-file digest, never a source version or an ETag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sha256Digest(pub(crate) [u8; 32]);
+
+impl Sha256Digest {
+    fn from_digest(digest: Digest) -> Option<Self> {
+        if digest.algorithm() != Algorithm::Sha256 {
+            return None;
+        }
+        digest.as_bytes().try_into().ok().map(Self)
+    }
+}
 
 impl fmt::Display for Sha256Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -196,7 +273,7 @@ pub enum WriteExtent {
     Unconfirmed,
 }
 
-/// Last observed counts. `actual` exists only after clean EOF and complete settled hashing.
+/// Last observed counts. Finished hash facts do not themselves assert publication or remote freshness.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Partial {
     /// Bytes admitted from successful body chunks, including a rejected overlong chunk.
@@ -205,21 +282,104 @@ pub struct Partial {
     pub written: ByteCount,
     /// An exceptional lost worker result cannot be represented as all-or-zero physical progress.
     pub write_extent: WriteExtent,
-    /// Written bytes folded into the concrete incremental SHA-256 owner.
+    /// Payload bytes fed to the active digest set, counted once, not once per algorithm.
+    /// Zero when no requirements and Measurement::None requested no hashing.
     pub hashed: ByteCount,
-    /// Whole-file measurement, not an assertion that requirements matched.
+    /// Compatibility SHA-256 value when present in the finished measured/matched results.
+    /// This is not an independently requested measurement or a verification claim.
     pub actual: Option<Sha256Digest>,
+    /// Finished optional measurement and individual matching requirements, only after clean EOF.
+    pub checks: Option<CheckResults>,
 }
 
-/// Evidence of checked publication. The owned stage hardlink remains for offline reconciliation.
+/// Evidence of absent-only publication after the configured required checks, if any.
+/// Read-only views keep final counts and check results consistent. The owned stage hardlink remains
+/// for offline reconciliation, which may be NotRevalidatable; this value is not a transferable lease.
 #[derive(Debug)]
 pub struct Receipt {
-    /// All bytes were received, written and hashed, with a clean EOF.
-    pub partial: Partial,
-    /// The matched whole-file requirement.
-    pub required: RequiredSha256,
+    partial: Partial,
+    required: Option<RequiredSha256>,
+    state: StateRef,
+}
+
+impl Partial {
+    fn set_checks(&mut self, results: CheckResults) {
+        self.actual = results
+            .digest_for(Algorithm::Sha256)
+            .and_then(Sha256Digest::from_digest);
+        self.checks = Some(results);
+    }
+
+    #[cfg(unix)]
+    fn results_fit(self, policy: CheckPolicy) -> bool {
+        match self.checks {
+            None => self.actual.is_none(),
+            Some(results) => {
+                self.write_extent == WriteExtent::Confirmed
+                    && self.received == self.written
+                    && self.hashed
+                        == (if policy.hashing() {
+                            self.written
+                        } else {
+                            ByteCount(0)
+                        })
+                    && policy.describes(results)
+                    && self.actual
+                        == results
+                            .digest_for(Algorithm::Sha256)
+                            .and_then(Sha256Digest::from_digest)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn complete_for(self, policy: CheckPolicy) -> bool {
+        self.results_fit(policy)
+            && self
+                .checks
+                .is_some_and(|results| policy.satisfied_by(results))
+    }
+}
+
+impl Receipt {
+    /// Clean EOF and settled counts. Hash work is counted once per payload byte, not per algorithm.
+    pub fn partial(&self) -> &Partial {
+        &self.partial
+    }
+
+    /// Matched requirements and the separate optional measurement, stored once with the final counts.
+    pub fn checks(&self) -> &CheckResults {
+        match &self.partial.checks {
+            Some(checks) => checks,
+            None => unreachable!("completed receipts always contain finished check results"),
+        }
+    }
+
+    /// Compatibility view of a matched SHA-256 requirement, absent for an unrequired file.
+    /// Use [`Self::checks`] to inspect algorithm-general requirements.
+    pub fn required(&self) -> Option<RequiredSha256> {
+        self.required
+    }
+
     /// A locator for retained evidence, not a transferable lease.
-    pub state: StateRef,
+    pub fn state(&self) -> &StateRef {
+        &self.state
+    }
+
+    fn completed(mut partial: Partial, checks: CheckResults, state: StateRef) -> Self {
+        // Keeping one result set prevents the receipt's views from diverging or doubling its size.
+        partial.set_checks(checks);
+        let required = checks
+            .matched_requirements()
+            .find(|requirement| requirement.digest.algorithm() == Algorithm::Sha256)
+            .and_then(|requirement| Sha256Digest::from_digest(requirement.digest))
+            .map(RequiredSha256);
+        Self {
+            partial,
+            required,
+            state,
+        }
+    }
 }
 
 /// A locator for one private workspace. Merely cloning or possessing it does not acquire a lease.
@@ -232,11 +392,12 @@ impl StateRef {
         &self.0
     }
 
-    /// Reacquire ownership and rehash anchored stage content before recognizing publication.
+    /// Reacquire ownership and rehash only an already-recorded strong content anchor.
+    /// Without one, return NotRevalidatable rather than computing an unrequested fingerprint.
     ///
     /// No network or refetch occurs. Missing or conflicting publication evidence is never adopted.
     #[tracing::instrument(skip_all, name = "reconcile_native_file")]
-    pub async fn reconcile(&self) -> Result<Reconciliation, Failure<Infallible>> {
+    pub async fn reconcile(&self) -> Result<Reconciliation, Box<Failure<Infallible>>> {
         Native::reconcile(Self::clone(self))
             .await
             .map_err(|error| Failure::native(error, Partial::default(), Some(Self::clone(self))))
@@ -272,25 +433,30 @@ pub enum Reconciliation {
         /// Last atomically recorded counts, possibly behind writes interrupted after that checkpoint.
         partial: Partial,
     },
-    /// Rehashed stage and destination share the recorded file identity and required content.
+    /// Stage and destination share the recorded identity and revalidated strong content anchor.
+    /// This checks recorded completed content, not authenticity or the current remote version.
     Published(Receipt),
     /// An intent exists, but evidence is absent or incomplete. Do not blindly republish or refetch.
     PublicationUnknown(StateRef),
     /// Destination evidence disagrees, even if another inode contains identical bytes.
     Conflict(StateRef),
+    /// There is no already-recorded strong content anchor. Identity alone cannot certify completion.
+    /// No payload hash, refetch, adoption or republication is performed for this result.
+    NotRevalidatable(StateRef),
 }
 
 /// Request errors are resolved before any native filesystem effects.
 #[derive(Debug, thiserror::Error)]
 pub enum RequestError {
-    /// This first entrance is checked-only.
+    /// Compatibility error retained for callers of the original checked-only entrance.
+    /// Ordinary unrequired publication no longer produces this error.
     #[error("supply a whole-file sha256 requirement before creating a native file")]
     MissingRequirement,
     /// Different required values cannot replace or cancel one another.
-    #[error("supply agreeing sha256 requirements for one native file")]
-    ConflictingRequirements,
-    /// The caller requested an algorithm this slice does not implement.
-    #[error("use sha256 for checked native file publication")]
+    #[error("supply agreeing whole-file requirements for one native file")]
+    ConflictingRequirements(#[source] Box<Conflict>),
+    /// The compatibility RequiredSha256 parser was given a different algorithm.
+    #[error("use sha256 in a requiredsha256 value or use digest for other algorithms")]
     UnsupportedRequirement,
     /// Digest syntax does not encode one SHA-256 value.
     #[error("use sha256 followed by a colon and 64 hexadecimal digits")]
@@ -342,9 +508,9 @@ pub enum FailureKind<E> {
     /// Exact counts cannot represent the admitted body.
     #[error("body byte count exceeds the supported range")]
     LengthOverflow,
-    /// A clean whole-file measurement did not satisfy the requirement.
-    #[error("whole-file sha256 requirement did not match")]
-    DigestMismatch,
+    /// At least one required check failed, independently of optional measurement.
+    #[error("whole-file requirement did not match")]
+    DigestMismatch(#[source] Box<Mismatch>),
     /// Cooperative stop successfully settled and checkpointed the one-shot partial.
     #[error("transfer stopped; supply a fresh body for a new attempt")]
     Stopped,
@@ -388,6 +554,8 @@ pub enum FailureKind<E> {
 }
 
 /// Failure plus exact in-task progress and optional owned-state locator.
+/// Returned behind a concrete Box to keep multi-check failures off the success path, without
+/// erasing the caller cause or requiring it to be Send, Sync or static.
 #[derive(Debug)]
 pub struct Failure<E> {
     /// A matchable reason, including the original caller-owned body error.
@@ -399,12 +567,12 @@ pub struct Failure<E> {
 }
 
 impl<E> Failure<E> {
-    fn native(error: NativeError, partial: Partial, state: Option<StateRef>) -> Self {
-        Self {
+    fn native(error: NativeError, partial: Partial, state: Option<StateRef>) -> Box<Self> {
+        Box::new(Self {
             kind: error.into_kind(),
             partial,
             state,
-        }
+        })
     }
 }
 
@@ -419,6 +587,7 @@ impl<E: core::error::Error + 'static> core::error::Error for Failure<E> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match &self.kind {
             FailureKind::Body(cause) => Some(cause),
+            FailureKind::DigestMismatch(cause) => Some(cause.as_ref()),
             FailureKind::CheckpointFailed { checkpoint, .. } => checkpoint.native_source(),
             FailureKind::Io { cause, .. } | FailureKind::PublicationUnknown { cause } => {
                 Some(cause)
@@ -432,6 +601,7 @@ impl<E: core::error::Error + 'static> FailureKind<E> {
     fn native_source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Body(cause) => Some(cause),
+            Self::DigestMismatch(cause) => Some(cause.as_ref()),
             Self::Io { cause, .. } | Self::PublicationUnknown { cause } => Some(cause),
             Self::CheckpointFailed { checkpoint, .. } => checkpoint.native_source(),
             _ => None,

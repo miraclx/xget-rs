@@ -897,6 +897,7 @@ async fn the_control_file_records_the_source_url_for_a_standalone_resume() {
     struct TaggedSource {
         body: Arc<Vec<u8>>,
         fail_from: u64,
+        control: PathBuf,
     }
     impl Source for TaggedSource {
         fn identity(&self) -> Option<String> {
@@ -912,6 +913,20 @@ async fn the_control_file_records_the_source_url_for_a_standalone_resume() {
         async fn fetch(&self, range: Option<ByteRange>) -> Result<ByteStream, Error> {
             let range = range.expect("a range fetch");
             if range.start >= self.fail_from {
+                // Inject failure only after the other ranges are actually checkpointed. Receiving or
+                // hashing their bytes does not establish that the control writer has recorded them.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if xget::inspect(&self.control)
+                            .await
+                            .is_some_and(|info| info.downloaded >= self.fail_from)
+                        {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("the completed ranges reach a valid checkpoint before failure");
                 return Err(Error::Transport(Box::new(std::io::Error::other("drop"))));
             }
             let start = range.start as usize;
@@ -925,6 +940,7 @@ async fn the_control_file_records_the_source_url_for_a_standalone_resume() {
         TaggedSource {
             body: Arc::new(sample_body(4096)),
             fail_from: 3072,
+            control: scratch.part(),
         },
         Output::File(&scratch.path),
         4,

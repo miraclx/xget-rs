@@ -20,9 +20,10 @@ use super::record::{
     Binding, DeviceId, Identity, InodeId, InvalidRecord, MAX_RECORD, Record, Status,
 };
 use super::{
-    AcquisitionFailure, ByteCount, FailureKind, OwnedSha256, Partial, Phase, Receipt,
-    Reconciliation, Sha256Digest, StateRef,
+    AcquisitionFailure, ByteCount, FailureKind, Measurement, Partial, Phase, Receipt,
+    Reconciliation, StateRef,
 };
+use crate::checks::{CheckPolicy, Requirements};
 
 const DIRECTORY_LOCK: &CStr = c".xget-native.lock";
 const DIRECTORY_MARKER: &[u8] = b"XGETNF-DIRECTORY-1\n";
@@ -82,7 +83,7 @@ impl Native {
                 workspace: workspace.identity(Phase::Acquire)?,
                 data: Identity::of(&data_metadata),
                 destination: plan.destination.as_os_str().as_bytes().to_vec(),
-                required: plan.required,
+                checks: plan.checks,
             };
             #[cfg(test)]
             let released = Arc::new(tokio::sync::Notify::new());
@@ -218,7 +219,7 @@ impl Native {
     pub(super) async fn publish(&self, partial: Partial) -> Result<(), NativeError> {
         self.submit(Phase::Publish, move |lease| {
             if lease.mode.load(Ordering::Acquire) != SEALED
-                || partial.actual != Some(lease.binding.required.digest())
+                || !partial.complete_for(lease.binding.checks)
             {
                 return Err(NativeError::InvalidState);
             }
@@ -331,32 +332,6 @@ impl Native {
         if metadata.len() != record.partial.written.0 {
             return Ok(Reconciliation::PublicationUnknown(state));
         }
-        let mut hasher = OwnedSha256::default();
-        let mut buffer = [0; 64 * 1024];
-        let mut remaining = record.partial.written.0;
-        while remaining > 0 {
-            let limit = remaining.min(buffer.len() as u64) as usize;
-            let count = data
-                .read(&mut buffer[..limit])
-                .map_err(|cause| NativeError::io(Phase::Reconcile, cause))?;
-            if count == 0 {
-                return Ok(Reconciliation::Conflict(state));
-            }
-            hasher.update(&buffer[..count]);
-            remaining -= count as u64;
-        }
-        // Even an externally growing witness cannot turn reconciliation into an unbounded read.
-        if data
-            .read(&mut buffer[..1])
-            .map_err(|cause| NativeError::io(Phase::Reconcile, cause))?
-            != 0
-        {
-            return Ok(Reconciliation::Conflict(state));
-        }
-        let actual = Sha256Digest(hasher.finish());
-        if Some(actual) != record.partial.actual || actual != record.binding.required.digest() {
-            return Ok(Reconciliation::Conflict(state));
-        }
         let destination = Name::from_bytes(&record.binding.destination)?;
         let metadata = match directory.parent.metadata(&destination, Phase::Reconcile) {
             Ok(metadata) => metadata,
@@ -371,9 +346,57 @@ impl Native {
         if !metadata.is_file() || Identity::of(&metadata) != record.binding.data {
             return Ok(Reconciliation::Conflict(state));
         }
+        let Some(results) = record.partial.checks else {
+            return Err(NativeError::InvalidState);
+        };
+        let Some(anchor) = results.strong_anchor() else {
+            return Ok(Reconciliation::NotRevalidatable(state));
+        };
+        // Only revalidate an already-recorded strong digest. No recovery-only measurement is added.
+        let mut checks = Requirements::default().start(Measurement::Algorithm(anchor.algorithm()));
+        let mut buffer = [0; 64 * 1024];
+        let mut remaining = record.partial.written.0;
+        while remaining > 0 {
+            let limit = remaining.min(buffer.len() as u64) as usize;
+            let count = data
+                .read(&mut buffer[..limit])
+                .map_err(|cause| NativeError::io(Phase::Reconcile, cause))?;
+            if count == 0 {
+                return Ok(Reconciliation::Conflict(state));
+            }
+            checks.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        // An externally growing witness cannot turn reconciliation into an unbounded read.
+        if data
+            .read(&mut buffer[..1])
+            .map_err(|cause| NativeError::io(Phase::Reconcile, cause))?
+            != 0
+        {
+            return Ok(Reconciliation::Conflict(state));
+        }
+        let actual = checks
+            .finish()
+            .map_err(|_| NativeError::InvalidState)?
+            .measured();
+        if actual != Some(anchor) {
+            return Ok(Reconciliation::Conflict(state));
+        }
         // Recheck the retained name after hashing, before converting intent into an acknowledged receipt.
         if Identity::of(&workspace.metadata(DATA, Phase::Reconcile)?) != record.binding.data {
             return Ok(Reconciliation::Conflict(state));
+        }
+        match directory.parent.metadata(&destination, Phase::Reconcile) {
+            Ok(metadata)
+                if metadata.is_file() && Identity::of(&metadata) == record.binding.data => {}
+            Ok(_) => return Ok(Reconciliation::Conflict(state)),
+            Err(NativeError::Io { cause, .. }) if cause.kind() == io::ErrorKind::NotFound => {
+                return Ok(Reconciliation::PublicationUnknown(state));
+            }
+            Err(NativeError::Io { cause, .. }) if cause.raw_os_error() == Some(libc::ELOOP) => {
+                return Ok(Reconciliation::Conflict(state));
+            }
+            Err(error) => return Err(error),
         }
         workspace.replace_record(
             &Record {
@@ -383,15 +406,15 @@ impl Native {
             },
             RecordAccess::Existing,
         )?;
-        Ok(Reconciliation::Published(Receipt {
-            partial: record.partial,
-            required: record.binding.required,
+        Ok(Reconciliation::Published(Receipt::completed(
+            record.partial,
+            results,
             state,
-        }))
+        )))
     }
 
-    pub(super) fn required(&self) -> super::RequiredSha256 {
-        self.0.binding.required
+    pub(super) fn policy(&self) -> CheckPolicy {
+        self.0.binding.checks
     }
 
     #[cfg(test)]

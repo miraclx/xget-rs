@@ -152,8 +152,12 @@ impl Native {
             {
                 return Err(NativeError::InvalidState);
             }
-            // Check the retained name read-only before opening writable. Only receiving v3 state
-            // can cross this boundary; v1/v2, sealed and publication-intent inodes never do.
+            let incumbent = Incumbent::capture(&directory.parent, &plan)?;
+            if incumbent.as_ref().map(|incumbent| incumbent.identity) != record.binding.incumbent {
+                return Err(NativeError::InvalidState);
+            }
+            // Check the retained name read-only before opening writable. Only receiving reader state
+            // can cross this boundary; older one-shot, closed and publication-intent inodes never do.
             let witness = workspace.open(DATA, libc::O_RDONLY, 0, Phase::Acquire)?;
             let metadata = witness
                 .metadata()
@@ -181,6 +185,7 @@ impl Native {
                 workspace,
                 _workspace_lock: workspace_lock,
                 data,
+                incumbent,
                 binding: record.binding,
                 runtime,
                 mode: AtomicU8::new(RECEIVING),
@@ -218,6 +223,14 @@ impl Native {
             #[cfg(test)]
             tests::enter_registered_work(plan.state.path(), tests::PhysicalOperation::Acquire);
             let directory = DirectoryLease::acquire(&plan.parent)?;
+            // Hold the old receiving witness and its lease through the new attempt's creation. No old
+            // payload/control is reset or removed, including when the new checkpoint fails.
+            let _retired = plan
+                .restart
+                .as_ref()
+                .map(|state| RestartWitness::open(&directory, &plan, state, reader.as_ref()))
+                .transpose()?;
+            let incumbent = Incumbent::capture(&directory.parent, &plan)?;
             let workspace_name = Name::from_os(&plan.workspace)?;
             directory.parent.mkdir(&workspace_name)?;
             retained = Some(StateRef::clone(&plan.state));
@@ -241,6 +254,8 @@ impl Native {
                 parent: directory.parent.identity(Phase::Acquire)?,
                 workspace: workspace.identity(Phase::Acquire)?,
                 data: Identity::of(&data_metadata),
+                incumbent: incumbent.as_ref().map(|incumbent| incumbent.identity),
+                receiving_authority: true,
                 destination: plan.destination.as_os_str().as_bytes().to_vec(),
                 checks: plan.checks,
             };
@@ -251,6 +266,7 @@ impl Native {
                 workspace,
                 _workspace_lock: workspace_lock,
                 data,
+                incumbent,
                 binding,
                 runtime,
                 mode: AtomicU8::new(RECEIVING),
@@ -387,18 +403,16 @@ impl Native {
 
     pub(super) async fn seal(&self, length: ByteCount) -> Result<(), NativeError> {
         self.submit(Phase::Seal, move |lease| {
-            if lease.reader.is_some() {
-                let mut record = lease.workspace.read_record(Phase::Seal)?;
-                let Some(reader) = &mut record.reader else {
-                    return Err(NativeError::InvalidState);
-                };
+            let mut record = lease.workspace.read_record(Phase::Seal)?;
+            if let Some(reader) = &mut record.reader {
                 reader.closed = true;
-                // Persist the irreversible reader lifecycle before validation, hooks, or a dropped
-                // waiter can leave the old receiving checkpoint looking writable again.
-                lease
-                    .workspace
-                    .replace_record(&record, RecordAccess::Existing)?;
             }
+            // Closing intent precedes the irreversible transition, including for one-shot bodies.
+            // A failed check, stop or dropped seal waiter must never restore receiving authority.
+            record.status = Status::Closed;
+            lease
+                .workspace
+                .replace_record(&record, RecordAccess::Existing)?;
             lease
                 .mode
                 .compare_exchange(RECEIVING, SEALED, Ordering::AcqRel, Ordering::Acquire)
@@ -654,7 +668,10 @@ impl Native {
                 Err(NativeError::InvalidState)
             };
         }
-        if matches!(record.status, Status::NeedsBody | Status::Sealed) {
+        if matches!(
+            record.status,
+            Status::NeedsBody | Status::Closed | Status::Sealed
+        ) {
             return Ok(Reconciliation::NeedsBody {
                 state,
                 partial: record.partial,
@@ -760,6 +777,7 @@ struct Lease {
     workspace: Directory,
     _workspace_lock: FlockLease,
     data: File,
+    incumbent: Option<Incumbent>,
     binding: Binding,
     runtime: Handle,
     // These atomics enforce a monotonic inode lifecycle and distinguish initial create from replace.
@@ -793,7 +811,13 @@ impl Lease {
 
     fn checkpoint(&self, status: Status, partial: Partial) -> Result<(), NativeError> {
         let mode = self.mode.load(Ordering::Acquire);
+        let status = if status == Status::NeedsBody && mode == SEALED {
+            Status::Closed
+        } else {
+            status
+        };
         match status {
+            Status::Closed if mode != SEALED => return Err(NativeError::InvalidState),
             Status::NeedsBody if mode >= PUBLISHING => return Err(NativeError::InvalidState),
             Status::Sealed if mode != SEALED => return Err(NativeError::InvalidState),
             Status::Publishing if mode != PUBLISHING => return Err(NativeError::InvalidState),
@@ -834,9 +858,172 @@ impl Lease {
 
     fn link(&self) -> Result<(), NativeError> {
         let destination = Name::from_bytes(&self.binding.destination)?;
-        self.directory
+        match &self.incumbent {
+            None => self
+                .directory
+                .parent
+                .publish(&self.workspace, DATA, &destination),
+            Some(incumbent) => {
+                // Keep data as the exact new-inode witness. The private commit link is consumed by
+                // rename, not cleaned up, and a failed operation remains publication intent.
+                self.workspace.publish(&self.workspace, DATA, c"commit")?;
+                incumbent.validate(&self.directory.parent, &destination)?;
+                self.directory
+                    .parent
+                    .replace(&self.workspace, c"commit", &destination)
+            }
+        }
+    }
+}
+
+/// Retains the captured incumbent descriptor through queued/running commit and waiter drop.
+struct Incumbent {
+    file: File,
+    identity: Identity,
+    destination: PathBuf,
+    targets: Arc<[PathBuf]>,
+}
+
+impl Incumbent {
+    fn capture(parent: &Directory, plan: &Plan) -> Result<Option<Self>, NativeError> {
+        if plan.publication == super::Publication::Absent {
+            return Ok(None);
+        }
+        let destination = Name::from_os(&plan.destination)?;
+        let file = match parent.open(&destination, libc::O_RDONLY, 0, Phase::Acquire) {
+            Ok(file) => file,
+            Err(NativeError::Io { cause, .. }) if cause.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|cause| NativeError::io(Phase::Acquire, cause))?;
+        Self::check(&metadata)?;
+        let incumbent = Self {
+            identity: Identity::of(&metadata),
+            file,
+            destination: plan.parent.join(&plan.destination),
+            targets: Arc::clone(&plan.targets),
+        };
+        incumbent.check_targets(Phase::Acquire)?;
+        Ok(Some(incumbent))
+    }
+
+    fn check(metadata: &Metadata) -> Result<(), NativeError> {
+        // Other links can be retained native publication witnesses. Only aliases of another frozen
+        // target prohibit replacement; unlinking this name must not mutate those other links.
+        if !metadata.is_file() || metadata.uid() != effective_uid() || metadata.nlink() == 0 {
+            return Err(NativeError::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn check_targets(&self, phase: Phase) -> Result<(), NativeError> {
+        for target in self
+            .targets
+            .iter()
+            .filter(|target| target.as_path() != self.destination.as_path())
+        {
+            let metadata = match std::fs::symlink_metadata(target) {
+                Ok(metadata) => metadata,
+                Err(cause) if cause.kind() == io::ErrorKind::NotFound => continue,
+                Err(cause) => return Err(NativeError::io(phase, cause)),
+            };
+            // The frozen assignments were validated by common layout. Under the cooperating lease,
+            // also refuse actual inode aliases, including a link added after planning. Ancestor
+            // substitution by arbitrary filesystem writers remains outside the caller-owned host contract.
+            if !metadata.is_file() || Identity::of(&metadata) == self.identity {
+                return Err(NativeError::InvalidState);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate(&self, parent: &Directory, destination: &CStr) -> Result<(), NativeError> {
+        self.check_targets(Phase::Publish)?;
+        let held = self
+            .file
+            .metadata()
+            .map_err(|cause| NativeError::io(Phase::Publish, cause))?;
+        let named = parent.metadata(destination, Phase::Publish)?;
+        Self::check(&held)?;
+        Self::check(&named)?;
+        if Identity::of(&held) != self.identity || Identity::of(&named) != self.identity {
+            return Err(NativeError::InvalidState);
+        }
+        Ok(())
+    }
+}
+
+/// Restart creates a new owned attempt, never truncates or rewrites the old attempt.
+struct RestartWitness {
+    _workspace: Directory,
+    _lock: FlockLease,
+    _data: File,
+}
+
+impl RestartWitness {
+    fn open(
+        directory: &DirectoryLease,
+        plan: &Plan,
+        state: &StateRef,
+        reader: Option<&Checkpoint>,
+    ) -> Result<Self, NativeError> {
+        if state.path().parent() != Some(plan.parent.as_path()) {
+            return Err(NativeError::InvalidState);
+        }
+        let name = state.path().file_name().ok_or(NativeError::InvalidState)?;
+        if !name.as_bytes().starts_with(b".xget-native-") {
+            return Err(NativeError::InvalidState);
+        }
+        let workspace = directory
             .parent
-            .publish(&self.workspace, DATA, &destination)
+            .directory(&Name::from_os(name)?, Phase::Acquire)?;
+        workspace.check_private_directory(Phase::Acquire)?;
+        let lock = workspace.lock(
+            c"lease",
+            WORKSPACE_MARKER,
+            LockAccess::Existing,
+            Phase::Acquire,
+        )?;
+        let record = workspace.read_record(Phase::Acquire)?;
+        if record.status != Status::NeedsBody
+            || record.binding.checks != plan.checks
+            || record.binding.destination != plan.destination.as_bytes()
+            || record.binding.parent != directory.parent.identity(Phase::Acquire)?
+            || record.binding.workspace != workspace.identity(Phase::Acquire)?
+            || (!record.binding.receiving_authority && record.reader.is_none())
+        {
+            return Err(NativeError::InvalidState);
+        }
+        if let Some(incumbent) = record.binding.incumbent {
+            let current = Incumbent::capture(&directory.parent, plan)?;
+            if current.as_ref().map(|current| current.identity) != Some(incumbent) {
+                return Err(NativeError::InvalidState);
+            }
+        }
+        match (&record.reader, reader) {
+            (Some(old), Some(new)) if !old.closed && old.session == new.session => {}
+            (None, None) => {}
+            _ => return Err(NativeError::InvalidState),
+        }
+        let data = workspace.open(DATA, libc::O_RDONLY, 0, Phase::Acquire)?;
+        let metadata = data
+            .metadata()
+            .map_err(|cause| NativeError::io(Phase::Acquire, cause))?;
+        Role::Data.check(&metadata)?;
+        if Identity::of(&metadata) != record.binding.data || metadata.nlink() != 1 {
+            return Err(NativeError::InvalidState);
+        }
+        // Do not infer settled extents from length or hash unknown bytes. The old record is retained
+        // verbatim, including any unconfirmed write extent; the new attempt starts at zero.
+        Ok(Self {
+            _workspace: workspace,
+            _lock: lock,
+            _data: data,
+        })
     }
 }
 
@@ -885,6 +1072,30 @@ impl DirectoryLease {
 struct Directory(File);
 
 impl Directory {
+    /// Atomic replacement under the already-held cooperating directory lease. Validation immediately
+    /// before this call is not an inode CAS against noncooperating filesystem writers.
+    fn replace(
+        &self,
+        source: &Self,
+        source_name: &CStr,
+        destination: &CStr,
+    ) -> Result<(), NativeError> {
+        // SAFETY: both directory descriptors and names are owned through the syscall.
+        if unsafe {
+            libc::renameat(
+                source.0.as_raw_fd(),
+                source_name.as_ptr(),
+                self.0.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        } != 0
+        {
+            // Intent was persisted already. Even an error is not permission to try replacing again.
+            return Err(NativeError::PublicationUnknown(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     /// Atomic no-replace publication, deliberately below cooperating-writer admission so its race
     /// semantics can be exercised by two independently sealed stages.
     fn publish(
@@ -1423,6 +1634,9 @@ impl Gate {
     }
 }
 
+#[cfg(test)]
+#[path = "native_authority_tests.rs"]
+mod authority_tests;
 #[cfg(test)]
 #[path = "native_tests.rs"]
 mod tests;

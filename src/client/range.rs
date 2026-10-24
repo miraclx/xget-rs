@@ -52,7 +52,7 @@ impl Mode {
     }
 }
 
-// Borrowed observation remains on the caller task, separate from native operation ownership.
+// The one-task pipeline keeps its borrowed observation separate from native operation ownership.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run<O: crate::transfer::observation::Observer>(
     http: &Http,
@@ -62,6 +62,8 @@ pub(super) async fn run<O: crate::transfer::observation::Observer>(
     measurement: Measurement,
     owned: &mut Owned,
     index: usize,
+    authority: super::Authority,
+    targets: std::sync::Arc<[std::path::PathBuf]>,
     observer: &mut O,
 ) -> Result<ReaderReceipt, Error> {
     let Length::Known(size) = file.length() else {
@@ -85,13 +87,26 @@ pub(super) async fn run<O: crate::transfer::observation::Observer>(
             transfer = transfer.require(requirement.digest, provenance);
         }
     }
-    if let Some(state) = owned.reader_state(index) {
+    let restart = match authority.attempt {
+        super::AttemptPolicy::Continue => None,
+        super::AttemptPolicy::Restart => owned.restart_state(index)?,
+    };
+    if matches!(authority.attempt, super::AttemptPolicy::Continue)
+        && let Some(state) = owned.reader_state(index)
+    {
         // Only native resume authority can decide whether this locator still describes an owned,
         // anchored receiving prefix. A refusal never falls back to refetch or a writable sealed file.
         transfer = transfer.resume_from(state);
     }
-    let pending = transfer.to_file(destination).map_err(Error::RangeRequest)?;
-    owned.submit_reader(index, pending.state()).await?;
+    let pending = transfer
+        .to_file(destination)
+        .map_err(Error::RangeRequest)?
+        .authorized(authority.publication, restart)
+        .protect_targets(targets);
+    match authority.attempt {
+        super::AttemptPolicy::Continue => owned.submit_reader(index, pending.state()).await?,
+        super::AttemptPolicy::Restart => owned.submit(index, pending.state()).await?,
+    }
     match pending
         .run_registered_observed(Some(owned.registration()), observer)
         .await

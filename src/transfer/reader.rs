@@ -428,6 +428,21 @@ pub struct PendingReader<'read, R> {
 }
 
 impl<'read, R: RangeReader<'read>> PendingReader<'read, R> {
+    pub(crate) fn protect_targets(mut self, targets: std::sync::Arc<[std::path::PathBuf]>) -> Self {
+        self.plan.targets = targets;
+        self
+    }
+
+    pub(crate) fn authorized(
+        mut self,
+        publication: super::Publication,
+        restart: Option<StateRef>,
+    ) -> Self {
+        self.plan.publication = publication;
+        self.plan.restart = restart;
+        self
+    }
+
     /// Advisory retained-state location; possession is not ownership or reopening authority.
     pub fn state(&self) -> &StateRef {
         self.plan.state()

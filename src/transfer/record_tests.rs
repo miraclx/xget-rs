@@ -21,6 +21,44 @@ fn bounded_versioned_state_roundtrips_each_lifecycle_status() {
 }
 
 #[test]
+fn v4_preserves_receiving_authority_incumbent_and_closed_intent_without_reinterpreting_v2() {
+    for status in [
+        Status::NeedsBody,
+        Status::Closed,
+        Status::Sealed,
+        Status::Publishing,
+        Status::Published,
+    ] {
+        for incumbent in [
+            None,
+            Some(Identity {
+                device: DeviceId(1),
+                inode: InodeId(9),
+            }),
+        ] {
+            let mut record = sample(status);
+            record.binding.receiving_authority = true;
+            record.binding.incumbent = incumbent;
+            if matches!(status, Status::NeedsBody | Status::Closed) {
+                record.partial = Partial::default();
+            }
+            let bytes = record.encode();
+            assert_eq!(&bytes[..8], b"XGETNF04");
+            let decoded = Record::decode(&bytes).unwrap();
+            assert_eq!(decoded.status, status);
+            assert_eq!(decoded.binding, record.binding);
+            assert_eq!(decoded.partial, record.partial);
+            for end in 0..bytes.len() {
+                assert!(Record::decode(&bytes[..end]).is_err());
+            }
+        }
+    }
+    let v2 = Record::decode(&sample(Status::NeedsBody).encode()).unwrap();
+    assert!(!v2.binding.receiving_authority);
+    assert_eq!(v2.binding.incumbent, None);
+}
+
+#[test]
 fn every_truncated_record_is_refused_without_partial_adoption() {
     let bytes = sample(Status::Publishing).encode();
     for end in 0..bytes.len() {
@@ -31,7 +69,7 @@ fn every_truncated_record_is_refused_without_partial_adoption() {
 #[test]
 fn a_future_storage_version_is_not_interpreted_as_current_state() {
     let mut bytes = sample(Status::Publishing).encode();
-    bytes[7] = b'4';
+    bytes[7] = b'5';
     assert!(matches!(Record::decode(&bytes), Err(InvalidRecord)));
 }
 
@@ -98,6 +136,8 @@ fn sample(status: Status) -> Record {
                 device: DeviceId(1),
                 inode: InodeId(4),
             },
+            incumbent: None,
+            receiving_authority: false,
             destination: b"output".to_vec(),
             checks: requirement(b"abc").into(),
         },
@@ -242,6 +282,7 @@ fn v2_rejects_invalid_provenance_duplicate_algorithms_and_unrequested_measuremen
 fn v1_fixture(status: Status, partial: Partial) -> Vec<u8> {
     let mut bytes = b"XGETNF01".to_vec();
     bytes.push(match status {
+        Status::Closed => panic!("v1 has no closed lifecycle representation"),
         Status::NeedsBody => 0,
         Status::Sealed => 1,
         Status::Publishing => 2,

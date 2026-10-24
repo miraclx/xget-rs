@@ -273,6 +273,7 @@ pub struct Resume<'a> {
     bindings: Vec<Option<Input>>,
     error: Option<SavedError>,
     retained_bytes: usize,
+    authority: super::Authority,
 }
 
 impl<'a> Resume<'a> {
@@ -284,7 +285,28 @@ impl<'a> Resume<'a> {
             bindings,
             error: None,
             retained_bytes: 0,
+            authority: super::Authority::default(),
         }
+    }
+
+    pub(super) fn authorized(mut self, authority: super::Authority) -> Self {
+        self.authority = authority;
+        self
+    }
+
+    /// Starts a new owned attempt for pending receiving members of this frozen run.
+    /// Old artifacts and completed outputs are retained; closed, foreign and uncertain state refuses.
+    /// No discovery, selector evaluation or new version selection occurs.
+    pub fn restart(mut self, _authority: super::Restart) -> Self {
+        self.authority.attempt = super::AttemptPolicy::Restart;
+        self
+    }
+
+    /// Explicitly permits checked replacement under the native cooperating destination lease.
+    /// Saved records never grant this permission by themselves; supply it again for a continuation.
+    pub fn overwrite(mut self, _authority: super::Overwrite) -> Self {
+        self.authority.publication = crate::transfer::Publication::Replace;
+        self
     }
 
     /// Supplies the exact original reference intent for one frozen member, including its namespace
@@ -369,6 +391,7 @@ impl<'a> Resume<'a> {
             bindings,
             error,
             retained_bytes: _,
+            authority,
         } = self;
         let path = PathBuf::clone(&saved.path);
         if error.is_none() {
@@ -398,7 +421,7 @@ impl<'a> Resume<'a> {
         }
         .await;
         match result {
-            Ok((owned, plan)) => client.execute_owned(plan, owned, observer).await,
+            Ok((owned, plan)) => client.execute_owned(plan, owned, authority, observer).await,
             Err(error) => Err(Box::new(RunFailure {
                 error: Error::Saved(error),
                 report: Report {
@@ -420,6 +443,14 @@ impl fmt::Debug for Resume<'_> {
 /// Safe typed inspection/continuation failures. Arbitrary foreign errors and references are not stored.
 #[derive(Debug, thiserror::Error)]
 pub enum SavedError {
+    /// Fresh cannot be combined with Restart, and restart is execution rather than preview authority.
+    #[error(
+        "recovery authority conflicts; run restart without fresh or preview a separate request"
+    )]
+    Authority,
+    /// Restart does not authorize discovering new work when no frozen unfinished request matches.
+    #[error("no unfinished run matches restart; inspect a saved run or start without restart")]
+    RestartMissing,
     /// No owned run record exists at the requested workspace.
     #[error("saved run is missing; inspect the actual run workspace path")]
     Missing,
@@ -1027,6 +1058,31 @@ impl Owned {
             Reconciliation::NotRevalidatable(_) => Err(SavedError::NotRevalidatable),
         }
     }
+    pub(super) fn restart_state(&self, index: usize) -> Result<Option<StateRef>, SavedError> {
+        let member = &self.saved.record.members[index];
+        let Some(attempt) = member.attempts.last() else {
+            return Ok(None);
+        };
+        if attempt.status == AttemptStatus::Complete {
+            return Err(SavedError::Uncertain);
+        }
+        // A frozen unknown version cannot silently become latest on explicit restart. A strong
+        // required whole digest may instead bind the new attempt; optional measurement cannot.
+        if member.etag.is_none()
+            && !member.requirements.iter().any(|requirement| {
+                matches!(
+                    requirement.digest.algorithm(),
+                    crate::transfer::Algorithm::Sha256
+                        | crate::transfer::Algorithm::Sha512
+                        | crate::transfer::Algorithm::Blake3
+                )
+            })
+        {
+            return Err(SavedError::NotRevalidatable);
+        }
+        Ok(Some(StateRef::clone(&attempt.state)))
+    }
+
     pub(super) fn reader_state(&self, index: usize) -> Option<StateRef> {
         let member = &self.saved.record.members[index];
         if member.mode != super::range::Mode::Ranges {

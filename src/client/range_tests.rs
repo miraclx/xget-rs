@@ -922,3 +922,100 @@ fn only_a_known_nonzero_size_and_bounded_pin_can_select_reader_mode() {
     ));
     assert!(Mode::supports(Length::Known(ByteCount(1)), Some("\"v1\"")));
 }
+
+#[tokio::test]
+async fn explicit_restart_of_a_receiving_reader_fetches_all_frozen_windows_without_resetting_old_data()
+ {
+    const SIZE: usize = 256 * 1024;
+    let server = Fixture::new(SIZE, Fault::HeldHead).await;
+    let root = Directory::new();
+    let client = Client::new().unwrap();
+    let mut run = Box::pin(
+        client
+            .download(server.reference.as_str())
+            .to_directory(root.path())
+            .run(),
+    );
+    tokio::select! {
+        result = &mut run => panic!("head must remain held: {result:?}"),
+        _ = server.tails.wait() => {}
+    }
+    let (aggregate, native) = native_state(root.path()).await;
+    drop(run);
+    settled(root.path()).await;
+    let old_control = fs::read(native.join("state")).unwrap();
+    let old_data = fs::read(native.join("data")).unwrap();
+    let old_reads = server.reads().len();
+    server.resumed.store(true, Ordering::Release);
+    let report = client
+        .download(server.reference.as_str())
+        .restart(crate::client::Restart)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(report.saved_run(), Some(aggregate.as_path()));
+    let published = report.completed().next().unwrap();
+    assert_ne!(published.receipt().state().path(), native.as_path());
+    assert_eq!(published.range_stats().unwrap().restored, ByteCount(0));
+    assert_eq!(
+        published.range_stats().unwrap().source,
+        ByteCount(SIZE as u64)
+    );
+    assert_eq!(fs::read(native.join("state")).unwrap(), old_control);
+    assert_eq!(fs::read(native.join("data")).unwrap(), old_data);
+    assert_eq!(
+        server.reads()[old_reads..]
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum::<u64>(),
+        SIZE as u64
+    );
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.starts_with("head "))
+            .count(),
+        1
+    );
+    server.head.notify_one();
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn explicit_restart_refuses_a_changed_reader_data_inode_without_any_refetch_fallback() {
+    let server = Fixture::new(256 * 1024, Fault::HeldHead).await;
+    let root = Directory::new();
+    let client = Client::new().unwrap();
+    let mut run = Box::pin(
+        client
+            .download(server.reference.as_str())
+            .to_directory(root.path())
+            .run(),
+    );
+    tokio::select! {
+        result = &mut run => panic!("head must remain held: {result:?}"),
+        _ = server.tails.wait() => {}
+    }
+    let (_, native) = native_state(root.path()).await;
+    drop(run);
+    settled(root.path()).await;
+    fs::rename(native.join("data"), native.join("old-data")).unwrap();
+    fs::write(native.join("data"), b"foreign").unwrap();
+    let old_reads = server.reads().len();
+    server.resumed.store(true, Ordering::Release);
+    let failure = client
+        .download(server.reference.as_str())
+        .restart(crate::client::Restart)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::Saved(SavedError::Native(_))));
+    assert_eq!(server.reads().len(), old_reads);
+    assert!(!root.path().join("payload").exists());
+    assert_eq!(fs::read(native.join("data")).unwrap(), b"foreign");
+    server.head.notify_one();
+    server.finish().await;
+}

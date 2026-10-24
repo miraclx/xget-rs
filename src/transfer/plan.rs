@@ -32,6 +32,9 @@ pub(super) struct Plan {
     pub(super) workspace: OsString,
     pub(super) checks: CheckPolicy,
     pub(super) state: StateRef,
+    pub(super) publication: super::Publication,
+    pub(super) restart: Option<StateRef>,
+    pub(super) targets: std::sync::Arc<[std::path::PathBuf]>,
 }
 
 impl Plan {
@@ -77,6 +80,9 @@ impl Plan {
             workspace,
             checks: checks.into(),
             state,
+            publication: super::Publication::Absent,
+            restart: None,
+            targets: std::sync::Arc::from([]),
         })
     }
 

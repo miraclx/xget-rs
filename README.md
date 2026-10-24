@@ -233,7 +233,7 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 }
 ```
 
-The destination must be absent in a suitable existing caller-owned parent directory. Supply a digest
+By default the destination must be absent in a suitable existing caller-owned parent directory. Supply a digest
 with `.expect(digest)` when the caller has a whole-file requirement; optional SHA-256 measurement alone
 is not an expected-content check. `download_all(inputs).to_directory(path)` plans multiple exact inputs,
 and `.plan().await` exposes frozen read-only assignments before `client.execute(plan).await`. Planning
@@ -244,8 +244,7 @@ files and owned frozen-run continuation. Exact HTTP uses up to four parallel win
 explicitly advertises byte ranges, a known nonzero size and a strong ETag of at most 256 bytes.
 Otherwise it keeps ordered whole-response execution. Every range must repeat the frozen pin and match
 its complete requested window and total; ignored ranges or changed pins fail without fallback.
-`Client::open` and SwissTransfer remain ordered whole responses. Other trees/catalogues, restart and
-overwrite remain unsupported. Unsupported inputs fail explicitly. Redirects,
+`Client::open` and SwissTransfer remain ordered whole responses. Unsupported inputs fail explicitly. Redirects,
 automatic retries, content decompression and ambient proxies are disabled. Clones share request/body
 admission and connection reuse. Each request has a fixed 15-second deadline for admission waiting,
 connection and headers together, but no payload/inactivity timeout. Retained open bodies can exhaust
@@ -497,8 +496,58 @@ Aggregate ownership excludes cooperating same-root aggregate runs while active a
 a waiter is dropped. Drop is not rollback: publication can finish without a returned receipt. Retain the
 actual run path and inspect/continue it rather than starting a blind replacement. State is flushed and
 atomically replaced, not fsynced; process-interruption recovery is not power-loss durability. The store
-is bounded and has no automatic cleanup. Restart, overwrite and legacy import remain separate work.
+is bounded and has no automatic cleanup. Explicit Restart and Overwrite are described below; legacy
+import remains unsupported.
 See [`client::SavedRun`](src/client/saved.rs) for the precise binding/error contracts.
+
+### Guarded Restart and Overwrite (library)
+
+These are separate execution permissions in `xget::client`, not new CLI behavior:
+
+```rust,no_run
+use xget::{Client, client::{Overwrite, Restart}};
+
+# async fn example() -> Result<(), Box<dyn core::error::Error>> {
+let client = Client::new()?;
+// Requires one matching unfinished frozen run. It never discovers a replacement request.
+let report = client.download("https://example.org/file.bin")
+    .to_file("file.bin").restart(Restart).overwrite(Overwrite).run().await?;
+# Ok(())
+# }
+```
+
+`Download::restart(Restart)` and `Resume::restart(Restart)` create new native attempts for pending
+receiving work. Old data, control records, unconfirmed extents and attempt history remain intact.
+The old receiving witness must match the frozen destination, check policy, filesystem identities and,
+for ranges, the exact nonclosed session. Restart does not reuse bytes or require a proper-prefix
+anchor. Restarting an existing attempt still needs a frozen strong version or required strong digest
+rather than optional measurement. Closed, sealed, publication-intent, foreign and older one-shot states without recorded
+receiving authority refuse. Completed members are strongly revalidated, not refetched; nohash or
+weak-only completion still returns `NotRevalidatable`.
+
+A Download restart with no unique unfinished match fails without HEAD or discovery. Combining Fresh
+and Restart is a sticky request error in either order, and Restart preview is refused. Fresh is new
+intent, not cleanup, restart or overwrite. An ordinary preview Plan carries no replacement authority;
+`Client::execute`/`execute_with` and public advanced Transfer entrances remain absent-only.
+
+`Download::overwrite(Overwrite)` and `Resume::overwrite(Overwrite)` explicitly allow replacement only
+for the consumed execution. Native acquisition captures a nonsymlink regular incumbent descriptor
+under the destination-directory lease and checks its identity and the complete frozen run target
+set again at commit. Inode aliases of another frozen target refuse. Other hardlinks can remain as
+older native witnesses; replacing one destination name does not rewrite those witnesses. If capture
+found no destination, a later foreign file is not silently upgraded into replacement permission.
+
+Clean EOF, declared length, settled writes, sealing and all requirements still precede publication.
+Wrong checks, late body errors and a stop observed before commit preserve the incumbent. Replacement
+atomically renames a private link to the checked new inode and retains the native data witness. This
+is a cooperating-writer guarantee, not arbitrary-writer inode CAS or an all-file transaction. Dropped
+submitted work retains descriptors and leases through settlement and may finish without a receipt.
+Lost acknowledgement stays explicit; reconciliation still needs recorded strong content and exact
+new-inode evidence, never equal foreign bytes or a hidden hash. Supply Overwrite again for continuation;
+a saved incumbent is evidence, not permission. Native V4 records persist receiving and Closed intent
+before sealing can take effect, while preserving older native readers. These native records are
+separate from the existing aggregate V4 provider format. No cleanup, fsync, successful pause or
+power-loss durability is added.
 
 ### Existing parallel/resumable API
 

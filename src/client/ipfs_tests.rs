@@ -1,9 +1,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[cfg(unix)]
 use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt as _;
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use cid::Cid;
@@ -12,7 +15,9 @@ use futures::StreamExt as _;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::client::{BodyError, Client, SavedRun, VersionConsistency};
+#[cfg(unix)]
+use crate::client::SavedRun;
+use crate::client::{BodyError, Client, VersionConsistency};
 use crate::input::Input;
 use crate::transfer::Measurement;
 

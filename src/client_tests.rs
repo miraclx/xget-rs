@@ -18,7 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{BodyError, BodyFailure, Client, Error, FinishError, VersionConsistency};
 use crate::input::Input;
-use crate::transfer::{Algorithm, Digest, Measurement};
+use crate::transfer::{Algorithm, Digest, Measurement, Provenance};
 
 #[tokio::test]
 async fn filtering_remote_http_ancestors_does_not_grant_them_local_filename_roles() {
@@ -264,8 +264,8 @@ async fn conflicting_pending_requirements_stay_sticky_before_metadata_requests()
     let result = client
         .download(reference.as_str())
         .expect(first)
-        .expect(other)
-        .expect(first)
+        .require(other, Provenance::Sidecar)
+        .require(first, Provenance::Source)
         .measurement(Measurement::None)
         .to_file("unused.bin")
         .plan()
@@ -593,6 +593,11 @@ async fn live_completion_separates_streaming_checks_from_publication_and_rejects
         .expect("opened")
         .expect(ABC_SHA256.parse::<Digest>().expect("digest"))
         .expect("required check")
+        .require(
+            ABC_SHA256.parse::<Digest>().expect("digest"),
+            Provenance::Sidecar,
+        )
+        .expect("agreeing sidecar check")
         .measurement(Measurement::None)
         .into_body();
     let mut received = Vec::new();
@@ -601,7 +606,16 @@ async fn live_completion_separates_streaming_checks_from_publication_and_rejects
     }
     assert_eq!(received, b"abc");
     let receipt = body.finish().expect("clean EOF");
-    assert_eq!(receipt.body().checks().matched_requirements().count(), 1);
+    let matched = receipt
+        .body()
+        .checks()
+        .matched_requirements()
+        .collect::<Vec<_>>();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(
+        matched[0].origins.iter().collect::<Vec<_>>(),
+        [Provenance::Caller, Provenance::Sidecar]
+    );
     assert_eq!(receipt.body().checks().measured(), None);
     assert_eq!(receipt.version(), VersionConsistency::StrongEtagMatched);
 
@@ -625,7 +639,7 @@ async fn required_live_mismatch_arrives_before_clean_eof_even_with_measurement_n
         .open(reference.as_str())
         .await
         .expect("opened")
-        .expect(wrong)
+        .require(wrong, Provenance::Sidecar)
         .expect("requirement")
         .measurement(Measurement::None)
         .into_body();
@@ -658,6 +672,10 @@ async fn exact_http_publishes_expected_bytes_once_with_required_and_measured_fac
     let report = client
         .download(reference.as_str())
         .expect(ABC_SHA256.parse::<Digest>().expect("digest"))
+        .require(
+            ABC_SHA256.parse::<Digest>().expect("digest"),
+            Provenance::Sidecar,
+        )
         .measurement(Measurement::None)
         .to_file(&destination)
         .run()
@@ -669,6 +687,16 @@ async fn exact_http_publishes_expected_bytes_once_with_required_and_measured_fac
     assert_eq!(
         published.receipt().checks().matched_requirements().count(),
         1
+    );
+    let matched = published
+        .receipt()
+        .checks()
+        .matched_requirements()
+        .next()
+        .expect("matched digest");
+    assert_eq!(
+        matched.origins.iter().collect::<Vec<_>>(),
+        [Provenance::Caller, Provenance::Sidecar]
     );
     assert_eq!(published.version(), VersionConsistency::StrongEtagMatched);
     assert!(published.receipt().state().path().exists());

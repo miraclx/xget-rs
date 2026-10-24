@@ -814,9 +814,16 @@ impl Download<'_> {
     }
 
     /// Requires a caller digest for exactly one selected file; conflicts stay sticky.
-    pub fn expect(mut self, digest: impl Into<Digest>) -> Self {
+    pub fn expect(self, digest: impl Into<Digest>) -> Self {
+        self.require(digest, Provenance::Caller)
+    }
+
+    /// Requires a digest for exactly one selected file with its declared origin.
+    /// Agreeing values merge origins; a conflict remains sticky before discovery or output effects.
+    /// Provenance records the caller's attribution, not authentication of the digest.
+    pub fn require(mut self, digest: impl Into<Digest>, provenance: Provenance) -> Self {
         self.requirements = self.requirements.and_then(|mut requirements| {
-            requirements.insert(digest.into(), Provenance::Caller)?;
+            requirements.insert(digest.into(), provenance)?;
             Ok(requirements)
         });
         self

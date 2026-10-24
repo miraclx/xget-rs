@@ -1,17 +1,24 @@
 # xget
 
-A fast, resumable, **verified** file downloader. It splits a download into parallel chunks, writes each
-straight to its place on disk, and hashes the result as it goes, so the digest it prints certifies the
-bytes you actually got. Ships as a command-line tool (`xget`) and a Rust library.
+A resumable file downloader with parallel fetching and concurrent checksum measurement. Chunks go
+straight to their offsets on disk; when hashing is enabled, the reported digest covers the bytes
+written, not just the network response.
+
+The workspace contains two packages:
+
+- **`xget`**, the reusable Rust library at the repository root.
+- **`xget-cli`**, the command-line package in [`cli/`](cli/), which installs the **`xget`** executable.
+
+Library-only consumers do not need the CLI's argument parser, terminal renderer or dotenv setup.
 
 ![xget downloading a file in parallel chunks](media/download.gif)
 
 ## Why xget
 
-- **Verified by construction.** A source that ignores a range, or serves the wrong length, is a hard
-  error, never a silent bad file. The reported hash is of the bytes on disk.
-- **Parallel and resumable.** Chunks download at once; an interrupted download resumes from exactly where
-  it stopped, and the resumed file is still fully verified.
+- **Checks during transfer.** Length and transport range checks reject inconsistent responses. Enabled
+  checksums measure the file bytes; matching a trusted expected digest is a separate integrity check.
+- **Parallel and resumable.** Chunks download at once. An interrupted file download resumes from saved
+  ranges and re-verifies the retained prefix.
 - **More than HTTP.** The same engine reads from HTTP, S3 (and S3-compatible stores), and IPFS.
 
 This is a Rust rewrite of the Node.js [`libxget`](https://github.com/miraclx/libxget-js); see
@@ -27,19 +34,24 @@ curl -L https://github.com/miraclx/xget-rs/releases/latest/download/xget-aarch64
 ./xget --version
 ```
 
-**With cargo**, from the repository:
+**With Cargo**, from a checkout of this workspace:
 
 ```console
-cargo install --git https://github.com/miraclx/xget-rs --features "s3 ipfs"
+cargo install --path cli --features "s3 ipfs"
 ```
 
-**From source:**
+**Build without installing:**
 
 ```console
-cargo build --release --bin xget --features "s3 ipfs"
+cargo build --release --package xget-cli --bin xget --features "s3 ipfs"
 ```
 
-The `s3` and `ipfs` sources are optional features, off by default; drop them for an HTTP-only build.
+Source builds use Rust 1.97.1, matching the pinned and exercised toolchain. The former Rust 1.85
+metadata was not a verified compatibility promise.
+
+The `s3` and `ipfs` features are optional and off by default. The CLI forwards them to the library;
+omit them for an HTTP-only build. The executable name remains `xget`, but its Cargo package is now
+`xget-cli`. Existing library imports remain `xget`.
 
 ## Quick start
 
@@ -57,8 +69,12 @@ xget https://example.com/big.iso --expect sha256:9f86d081884c7d659a2feaa0c55ad01
 xget https://example.com/big.iso --expect https://example.com/big.iso.sha256sum
 ```
 
-`--expect` verifies a download, not a file already on disk. To check an existing file, use a checksum
+`--expect` checks a download, not a file already on disk. To check an existing file, use a checksum
 utility such as `shasum -a 256 big.iso`.
+
+The current CLI compares the expected digest after the legacy engine finishes. A mismatch returns a
+non-zero status but does not roll back an already published output file. The library's separate
+checked native-file entrance, described below, performs its required check before publication.
 
 ![a checksum mismatch fails loudly and exits non-zero](media/expect.gif)
 
@@ -149,7 +165,8 @@ is milliseconds. `--bits` and `--raw-sizes` affect human output only and do not 
 
 ## Library usage
 
-Start with `get(url)` and finish with `.write(output)`:
+Depend on the root `xget` package; `xget-cli` is not needed for library use. The existing
+`get(url)` / `from(source)` API remains available. Start with `get(url)` and finish with `.write(output)`:
 
 ```rust
 use std::path::Path;
@@ -174,10 +191,23 @@ with `.write(output)`. `Output` is `file(path)` (the only resumable sink), `writ
 `Discard`, or `tee(file, w)` to keep a file and stream at once. To reuse a configuration across
 downloads, wrap the chain in a small function: `let dl = |u| xget::get(u)?.chunks(8); dl(a)?.write(...)`.
 
+### Checked native-file publication
+
+[`Transfer`](src/transfer.rs) accepts an already-open ordered body and a required whole-file SHA-256.
+It requires clean EOF, settled writes, the declared length when known, and a matching digest before
+atomically publishing an absent destination. This is separate from the legacy `get`/`from` pipeline;
+the current CLI has not switched to it.
+
+The native entrance requires a caller-owned Tokio runtime, an existing caller-owned parent without
+group/other write permission, and Unix hardlink support. It retains private staging for reconciliation,
+not automatic reopening of a one-shot source, and promises process-interruption recovery rather than
+power-loss durability. See the [external API test](tests/transfer.rs) for a complete executable call.
+
 ## How it works
 
-Chunks are written straight to their offsets in a sparse `<file>.xget`; one verifier reads it back in
-order, hashing the contiguous prefix and gating on the exact length, then it is renamed into place. That
+The legacy engine writes chunks straight to their offsets in a sparse `<file>.xget`. One verifier
+reads the contiguous prefix in order, hashes it when enabled, and gates on the exact length before
+renaming it into place. That
 same `.xget` is the resume control: it records the ranges already written, so a re-run picks up each
 chunk where it stopped and folds the existing bytes into the same verify pass. Before resuming, xget
 compares the saved and current resource validators (`ETag`, `Last-Modified`, or an IPFS CID); a mismatch
@@ -186,14 +216,16 @@ falls back to the length alone, which cannot detect a same-length resource chang
 
 ## Differences from libxget-js
 
-xget keeps the shape of the original but changes some behavior on purpose. Verification is structural,
-not a cache you size: where libxget-js buffered chunks in memory (`--cache-size`, `--show-cache`), xget
-writes each chunk straight to its offset and reads the file back once to hash it, trading that for
-unbounded parallelism. Every download is hashed and length-gated, and a source that ignores a range is a
-hard error. Resume is range-based and validated against the resource, rather than blindly appending. And
-there is no `--start-pos` or `--force-append`, because both would produce bytes that cannot be verified
-against the whole-resource checksum. Everything else from libxget-js is here: parallel chunks, retries,
-mirrors, custom headers, and pluggable sources (with S3 and IPFS added).
+xget keeps the shape of the original but changes some behavior on purpose. Where libxget-js buffered
+chunks in memory (`--cache-size`, `--show-cache`), the legacy Rust engine writes chunks to their offsets
+in a sparse file and reads the contiguous prefix for enabled hashing. Downloads are length-gated;
+checksums are optional unless selected by a requirement or source metadata. This trades memory
+buffering for file I/O, not a claim of unlimited parallelism.
+
+Resume uses saved ranges and compares resource validators when available, rather than blindly
+appending. There is no `--start-pos` or `--force-append`, because those operations do not preserve the
+whole-resource checking model. Other supported features include parallel chunks, retries, mirrors,
+custom headers and pluggable sources, with S3 and IPFS added.
 
 ## License
 

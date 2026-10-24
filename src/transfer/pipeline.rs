@@ -100,10 +100,10 @@ impl Run {
                     .checked_add(chunk.len() as u64)
                     .ok_or(FailureKind::LengthOverflow)?,
             );
-            if let Length::Known(expected) = self.length {
-                if partial.received > expected {
-                    return Err(FailureKind::LengthMismatch);
-                }
+            if let Length::Known(expected) = self.length
+                && partial.received > expected
+            {
+                return Err(FailureKind::LengthMismatch);
             }
             let mut offset = 0;
             while offset < chunk.len() {
@@ -140,10 +140,10 @@ impl Run {
                 offset = end;
             }
         }
-        if let Length::Known(expected) = self.length {
-            if partial.received != expected {
-                return Err(FailureKind::LengthMismatch);
-            }
+        if let Length::Known(expected) = self.length
+            && partial.received != expected
+        {
+            return Err(FailureKind::LengthMismatch);
         }
         let actual = Sha256Digest(hasher.finish());
         partial.actual = Some(actual);

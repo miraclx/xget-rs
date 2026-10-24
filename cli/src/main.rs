@@ -15,7 +15,7 @@ use xbytes::{ByteSize, Mode};
 use xget::{ByteRange, ByteStream, Checksum, Error, HttpSource, Mirrors, Probe, Source};
 
 use crate::expect::{Expect, parse_expect, resolve_expect};
-use crate::progress::{DIM, Reporter};
+use crate::progress::Reporter;
 
 /// Download a URL in parallel chunks, verify it, and print its SHA-256.
 #[derive(Parser)]
@@ -235,10 +235,11 @@ async fn run() -> eyre::Result<()> {
             .and_then(|probe| Option::clone(&probe.checksum))
     {
         if mode != ProgressMode::Json {
+            let dim = Reporter::diagnostic_style();
             eprintln!(
                 "{}Verifying against the source's stored {algo} checksum{}",
-                DIM.render(),
-                DIM.render_reset()
+                dim.render(),
+                dim.render_reset()
             );
         }
         expected = Some((Some(algo), hex));
@@ -493,50 +494,51 @@ fn preamble(
     resume: bool,
     format: DisplayFormat,
 ) {
-    eprintln!("{}URL:{} {}", DIM.render(), DIM.render_reset(), cli.url);
+    let dim = Reporter::diagnostic_style();
+    eprintln!("{}URL:{} {}", dim.render(), dim.render_reset(), cli.url);
     let chunks = match probe {
         Some(probe) if probe.supports_ranges => xget::plan(probe.length, cli.chunks).len().max(1),
         Some(_) => 1,
         None => cli.chunks as usize,
     };
-    eprintln!("{}Chunks:{} {chunks}", DIM.render(), DIM.render_reset());
+    eprintln!("{}Chunks:{} {chunks}", dim.render(), dim.render_reset());
     match probe {
         Some(probe) => {
             let size = format.size(probe.length);
             match &probe.content_type {
                 Some(kind) => eprintln!(
                     "{}Length:{} {size} [{kind}]",
-                    DIM.render(),
-                    DIM.render_reset()
+                    dim.render(),
+                    dim.render_reset()
                 ),
-                None => eprintln!("{}Length:{} {size}", DIM.render(), DIM.render_reset()),
+                None => eprintln!("{}Length:{} {size}", dim.render(), dim.render_reset()),
             }
         }
-        None => eprintln!("{}Length:{} unknown", DIM.render(), DIM.render_reset()),
+        None => eprintln!("{}Length:{} unknown", dim.render(), dim.render_reset()),
     }
     match (sink, output) {
         (Sink::File, Some(output)) => eprintln!(
             "{}Saving:{} '{}'",
-            DIM.render(),
-            DIM.render_reset(),
+            dim.render(),
+            dim.render_reset(),
             output.display()
         ),
         (Sink::Stream, Some(output)) => eprintln!(
             "{}Saving:{} '{}' <stream>",
-            DIM.render(),
-            DIM.render_reset(),
+            dim.render(),
+            dim.render_reset(),
             output.display()
         ),
-        (Sink::Stdout, _) => eprintln!("{}Saving:{} <stdout>", DIM.render(), DIM.render_reset()),
+        (Sink::Stdout, _) => eprintln!("{}Saving:{} <stdout>", dim.render(), dim.render_reset()),
         (Sink::Discard, _) | (Sink::File, None) | (Sink::Stream, None) => {
-            eprintln!("{}Saving:{} <discarded>", DIM.render(), DIM.render_reset())
+            eprintln!("{}Saving:{} <discarded>", dim.render(), dim.render_reset())
         }
     }
     if resume {
         eprintln!(
             "{}Resuming a previous download{}",
-            DIM.render(),
-            DIM.render_reset()
+            dim.render(),
+            dim.render_reset()
         );
     }
 }
@@ -777,7 +779,8 @@ fn choose_sequential(cli: &Cli, probe: Option<&Probe>, sink: Sink, mode: Progres
     }
     let note = |message: &str| {
         if mode != ProgressMode::Json {
-            eprintln!("{}{message}{}", DIM.render(), DIM.render_reset());
+            let dim = Reporter::diagnostic_style();
+            eprintln!("{}{message}{}", dim.render(), dim.render_reset());
         }
     };
     if probe.length > BUFFER_CAP {

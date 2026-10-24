@@ -136,8 +136,9 @@ is a later common-library adapter, not a feature of this workspace boundary.
   required-check ordering but has not replaced this flow.
 - Retry JSON quotes and escapes all U+0000..U+001F control characters; the child callback regression
   parses one complete event with an independent JSON parser. This does not version the schema.
-- Non-TTY Plain still uses updating carriage-return/ANSI controls. The Ctrl-C newline fix does not
-  close that inherited carry.
+- Plain updates in place only on terminal stderr. Captured stderr uses complete newline-delimited
+  snapshots, no cursor-control prefix or diagnostic styling, and escaped retry-cause controls.
+  The JSON-control and non-TTY Plain carries have separate callback and executable evidence.
 
 ## Harness and protected work
 

@@ -47,9 +47,7 @@ fn main() {
             }
             let format = if json { Format::Json } else { Format::Plain };
             let output = Output::new(RunId::fresh(), format, Channel::Diagnostic);
-            let failure = failure::Failure::request(
-                "invalid command or value; use xget --help and explicit -o/-D output",
-            );
+            let failure = args::Cli::parse_failure(&error);
             let _ = output.failure(&failure);
             std::process::exit(2);
         }

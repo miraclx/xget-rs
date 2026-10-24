@@ -18,6 +18,35 @@ pub(super) struct Layout {
 }
 
 impl Layout {
+    // Recovery validates stored assignments using exactly the same managed-role/collision policy,
+    // without deriving names again or changing frozen assignments.
+    #[cfg(unix)]
+    pub(super) fn frozen_paths<'a>(
+        root: &Path,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<(), Error> {
+        let mut layout = Self {
+            files: BTreeSet::new(),
+            directories: BTreeMap::new(),
+        };
+        for path in paths {
+            crate::transfer::validate_file_spelling(path).map_err(|_| Error::InvalidName)?;
+            let relative = path.strip_prefix(root).map_err(|_| Error::InvalidName)?;
+            let components = relative
+                .components()
+                .map(|component| match component {
+                    Component::Normal(name) => name.to_str().ok_or(Error::InvalidName),
+                    _ => Err(Error::InvalidName),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if components.is_empty() || components.len() > 64 {
+                return Err(Error::LayoutLimit);
+            }
+            layout.claim(&components)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn freeze(
         files: Vec<File>,
         target: Target,
@@ -119,19 +148,12 @@ impl Layout {
         Ok(requirements)
     }
 
-    fn explicit_file(path: &Path) -> Result<(), Error> {
+    pub(super) fn explicit_file(path: &Path) -> Result<(), Error> {
         let raw = path.as_os_str().as_encoded_bytes();
         if raw.len() > 4096 {
             return Err(Error::LayoutLimit);
         }
-        if raw
-            .last()
-            .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
-            || raw.ends_with(b"/.")
-            || raw.ends_with(b"\\.")
-        {
-            return Err(Error::InvalidName);
-        }
+        crate::transfer::validate_file_spelling(path).map_err(|_| Error::InvalidName)?;
         let Some(Component::Normal(name)) = path.components().next_back() else {
             return Err(Error::InvalidName);
         };

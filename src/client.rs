@@ -2,7 +2,8 @@
 //!
 //! Files run serially through the native Transfer implementation. Client clones share only reusable
 //! HTTP connections and bounded request/body admission. This is not the legacy parallel range engine,
-//! a recovery database, or a provider catalogue. Redirects and non-exact/non-HTTP inputs fail explicitly.
+//! a global recovery database, or a provider catalogue. Owned run metadata stays in the designated
+//! destination's `.xget-runs` store. Redirects and non-exact/non-HTTP inputs fail explicitly.
 //!
 //! ```no_run
 //! use xget::Client;
@@ -49,10 +50,12 @@ use crate::transfer::{Conflict, Digest, Measurement, Provenance, Receipt, Requir
 mod http;
 mod layout;
 mod live;
+mod saved;
 
 use http::Http;
 pub use http::{HttpError, HttpErrorKind, RequestStage};
 pub use live::{CheckedBody, LiveReceipt, OpenedFile};
+pub use saved::{BindingKey, Fresh, Resume, SavedError, SavedMember, SavedRun, SavedStatus};
 
 #[cfg(test)]
 #[path = "client_tests.rs"]
@@ -85,6 +88,12 @@ impl Client {
         ClientBuilder::default()
     }
 
+    /// Starts consumed continuation of an offline-inspected frozen run. Supply each member binding
+    /// with [`Resume::input`]; credentials/reopen references are never loaded from saved metadata.
+    pub fn resume(&self, saved: SavedRun) -> Resume<'_> {
+        Resume::new(self, saved)
+    }
+
     /// Starts one pending input. Conversion failures remain sticky until plan/run is awaited.
     pub fn download<T>(&self, input: T) -> Download<'_>
     where
@@ -111,6 +120,7 @@ impl Client {
             target: Target::Default,
             requirements: Ok(Requirements::default()),
             measurement: Measurement::default(),
+            reentry: Reentry::Continue,
         }
     }
 
@@ -214,11 +224,24 @@ impl Client {
     /// must be nonsymlink directories owned by the effective user, with owner rwx and no group/other
     /// write bits. New directories request mode 0700. The caller must control the hierarchy against
     /// concurrent replacement; these static checks are not a same-user sandbox. Publication is absent-only;
-    /// no overwrite, automatic source reopening or SavedRun persistence is implemented by this client.
+    /// no overwrite is granted. Execution accounts frozen members and advisory native attempts in an
+    /// owned aggregate SavedRun before native effects. Continuation uses fresh full ordered bodies,
+    /// not retained partial bytes. Checkpoint replacement is atomic but not fsync-durable.
     /// Dropping during directory preparation can leave empty directories and submitted Tokio filesystem
     /// work settling after drop; there is no high-level pause or directory-settlement receipt.
+    /// See [`Resume`'s ownership and cancellation contract](Resume#ownership-and-cancellation) for
+    /// same-root aggregate exclusion and native/manifest ownership through submitted-work settlement.
     pub async fn execute(&self, plan: Plan) -> Result<Report, Box<RunFailure>> {
-        let mut report = Report::default();
+        self.execute_with_request(plan, None, Reentry::Fresh).await
+    }
+
+    async fn execute_with_request(
+        &self,
+        mut plan: Plan,
+        request: Option<saved::Fingerprint>,
+        reentry: Reentry,
+    ) -> Result<Report, Box<RunFailure>> {
+        let report = Report::default();
         if let Err(error) = Http::runtime() {
             return Err(Box::new(RunFailure {
                 error,
@@ -240,13 +263,82 @@ impl Client {
                 failed: None,
             }));
         }
-        for PlannedFile {
-            file,
-            destination,
-            requirements,
-            measurement,
-        } in plan.files
+        let owned = saved::Owned::create(&plan, request, reentry)
+            .await
+            .map_err(|error| {
+                let report = Report {
+                    completed: Vec::new(),
+                    saved_run: error.saved_run().map(Path::to_path_buf),
+                };
+                Box::new(RunFailure {
+                    error: Error::Saved(error),
+                    report,
+                    failed: None,
+                })
+            })?;
+        // Persistence freezes canonical absolute assignments, so later cwd changes cannot redirect
+        // either native work or inspection. This does not repeat remote discovery or local layout.
+        for (file, member) in plan.files.iter_mut().zip(owned.destinations()) {
+            file.destination = member.to_path_buf();
+        }
+        self.execute_owned(plan, owned).await
+    }
+
+    async fn execute_owned(
+        &self,
+        plan: Plan,
+        mut owned: saved::Owned,
+    ) -> Result<Report, Box<RunFailure>> {
+        let mut report = Report {
+            completed: Vec::new(),
+            saved_run: Some(owned.path().to_path_buf()),
+        };
+        for (
+            index,
+            PlannedFile {
+                file,
+                destination,
+                requirements,
+                measurement,
+            },
+        ) in plan.files.into_iter().enumerate()
         {
+            match owned.previous(index).await {
+                Ok(Some(receipt)) => {
+                    let version = if file.selected.description.etag.is_some() {
+                        VersionConsistency::StrongEtagMatched
+                    } else {
+                        VersionConsistency::Unpinned
+                    };
+                    report.completed.push(PublishedFile {
+                        file,
+                        destination,
+                        version,
+                        receipt,
+                    });
+                    if let Err(error) = owned.completed(index).await {
+                        return Err(Box::new(RunFailure {
+                            error: Error::Saved(error),
+                            report,
+                            failed: None,
+                        }));
+                    }
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(Box::new(RunFailure {
+                        error: Error::Saved(error),
+                        report,
+                        failed: Some(PlannedFile {
+                            file,
+                            destination,
+                            requirements,
+                            measurement,
+                        }),
+                    }));
+                }
+            }
             let opened = match self.http.open(&file).await {
                 Ok(opened) => opened,
                 Err(error) => {
@@ -285,14 +377,50 @@ impl Client {
                     }));
                 }
             };
-            match pending.run().await {
-                Ok(receipt) => report.completed.push(PublishedFile {
-                    file,
-                    destination,
-                    version,
-                    receipt,
-                }),
+            if let Err(error) = owned.submit(index, pending.state()).await {
+                return Err(Box::new(RunFailure {
+                    error: Error::Saved(error),
+                    report,
+                    failed: Some(PlannedFile {
+                        file,
+                        destination,
+                        requirements,
+                        measurement,
+                    }),
+                }));
+            }
+            match pending.run_registered(owned.registration()).await {
+                Ok(receipt) => {
+                    report.completed.push(PublishedFile {
+                        file,
+                        destination,
+                        version,
+                        receipt,
+                    });
+                    if let Err(error) = owned.completed(index).await {
+                        return Err(Box::new(RunFailure {
+                            error: Error::Saved(error),
+                            report,
+                            failed: None,
+                        }));
+                    }
+                }
                 Err(failure) => {
+                    if let Err(error) = owned.retained(index).await {
+                        return Err(Box::new(RunFailure {
+                            error: Error::RunCheckpoint {
+                                transfer: failure,
+                                checkpoint: error,
+                            },
+                            report,
+                            failed: Some(PlannedFile {
+                                file,
+                                destination,
+                                requirements,
+                                measurement,
+                            }),
+                        }));
+                    }
                     return Err(Box::new(RunFailure {
                         error: Error::Transfer(failure),
                         report,
@@ -305,6 +433,13 @@ impl Client {
                     }));
                 }
             }
+        }
+        if let Err(error) = owned.finish().await {
+            return Err(Box::new(RunFailure {
+                error: Error::Saved(error),
+                report,
+                failed: None,
+            }));
         }
         Ok(report)
     }
@@ -450,10 +585,26 @@ pub struct Download<'a> {
     target: Target,
     requirements: Result<Requirements, Box<Conflict>>,
     measurement: Measurement,
+    reentry: Reentry,
+}
+
+#[derive(Clone, Copy)]
+enum Reentry {
+    Continue,
+    Fresh,
 }
 
 impl Download<'_> {
+    /// Intentionally discovers new work instead of matching unfinished owned runs. Old run artifacts
+    /// remain untouched; Fresh does not grant overwrite or restart any existing attempt.
+    pub fn fresh(mut self, _policy: Fresh) -> Self {
+        self.reentry = Reentry::Fresh;
+        self
+    }
+
     /// Asserts exactly one selected file and explicit native output name.
+    /// Aggregate execution refuses parent (`..`) components; supply a resolved parent path instead
+    /// of relying on lexical collapse across symlinks. Directory-shaped file spellings are invalid.
     pub fn to_file(mut self, destination: impl AsRef<Path>) -> Self {
         self.target = Target::File(destination.as_ref().to_path_buf());
         self
@@ -489,6 +640,7 @@ impl Download<'_> {
             target,
             requirements,
             measurement,
+            reentry: _,
         } = self;
         let inputs = inputs?;
         let requirements = requirements.map_err(Error::ConflictingRequirements)?;
@@ -515,17 +667,80 @@ impl Download<'_> {
         layout::Layout::freeze(files, target, requirements, measurement)
     }
 
-    /// Executes this request through its frozen plan and the common native Transfer pipeline.
+    /// Continues uniquely matching unfinished owned work before mutable HEAD/discovery. No match
+    /// discovers a new frozen plan. Fully completed prior runs are never unfinished matches.
+    /// See [`Resume`'s ownership and cancellation contract](Resume#ownership-and-cancellation): drop
+    /// can leave Busy until submitted work settles, and is neither rollback nor a pause receipt.
     pub async fn run(self) -> Result<Report, Box<RunFailure>> {
         let client = self.client;
-        let plan = self.plan().await.map_err(|error| {
-            Box::new(RunFailure {
-                error,
-                report: Report::default(),
-                failed: None,
-            })
-        })?;
-        client.execute(plan).await
+        let Self {
+            inputs,
+            target,
+            requirements,
+            measurement,
+            reentry,
+            ..
+        } = self;
+        let setup = (|| {
+            let inputs = inputs?;
+            for input in &inputs {
+                Client::supported(input)?;
+            }
+            let requirements = requirements.map_err(Error::ConflictingRequirements)?;
+            if let Target::File(path) = &target {
+                layout::Layout::explicit_file(path)?;
+            }
+            let request = saved::Fingerprint::request(&inputs, &target, requirements, measurement)
+                .map_err(Error::Saved)?;
+            let root = saved::request_root(&target).map_err(Error::Saved)?;
+            Ok::<_, Error>((inputs, requirements, request, root))
+        })();
+        let (inputs, requirements, request, root) = setup.map_err(RunFailure::before_execution)?;
+        Http::runtime().map_err(RunFailure::before_execution)?;
+        if cfg!(not(unix)) {
+            return Err(RunFailure::before_execution(Error::NativeUnsupported));
+        }
+        match tokio::fs::symlink_metadata(&root).await {
+            Ok(metadata) => {
+                Client::directory_kind(&metadata).map_err(RunFailure::before_execution)?
+            }
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => {}
+            Err(cause) => return Err(RunFailure::before_execution(Error::Directory(cause))),
+        }
+        if matches!(reentry, Reentry::Continue)
+            && let Some(saved) = saved::matching(root, request)
+                .await
+                .map_err(|error| RunFailure::before_execution(Error::Saved(error)))?
+        {
+            let keys: Vec<_> = saved.members().map(|member| member.key()).collect();
+            if keys.len() != inputs.len() {
+                return Err(RunFailure::before_execution(Error::Saved(
+                    SavedError::Binding,
+                )));
+            }
+            let mut resume = client.resume(saved);
+            // Exact HTTP inventory has one member per input occurrence. Binding compares the
+            // original intent, including namespace/query, without making a metadata request.
+            for (key, input) in keys.into_iter().zip(inputs) {
+                resume = resume.input(key, input);
+            }
+            return resume.run().await;
+        }
+        let plan = Download {
+            client,
+            inputs: Ok(inputs),
+            target,
+            requirements: Ok(requirements),
+            measurement,
+            reentry,
+        }
+        .plan()
+        .await
+        .map_err(RunFailure::before_execution)?;
+        // Fresh bypasses admission matching, but its own unfinished work remains discoverable later.
+        client
+            .execute_with_request(plan, Some(request), reentry)
+            .await
     }
 }
 
@@ -615,10 +830,17 @@ pub enum VersionConsistency {
 #[derive(Default)]
 pub struct Report {
     completed: Vec<PublishedFile>,
+    saved_run: Option<PathBuf>,
 }
 
 impl Report {
-    /// Actual native publications, with checks, version consistency and state kept separate.
+    /// Actual aggregate workspace, including on partial failure. A path grants no executable lease.
+    pub fn saved_run(&self) -> Option<&Path> {
+        self.saved_run.as_deref()
+    }
+
+    /// Acknowledged native publications, including revalidated saved completions. Checks, version
+    /// consistency and retained state remain separate; this is not a claim of current remote freshness.
     pub fn completed(&self) -> impl ExactSizeIterator<Item = &PublishedFile> {
         self.completed.iter()
     }
@@ -686,9 +908,31 @@ pub struct RunFailure {
     pub failed: Option<PlannedFile>,
 }
 
+impl RunFailure {
+    fn before_execution(error: Error) -> Box<Self> {
+        Box::new(Self {
+            error,
+            report: Report::default(),
+            failed: None,
+        })
+    }
+}
+
 /// Built-in errors expose only safe typed context, never a bearer reference or unsafe remote name.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Offline owned persistence and frozen continuation errors remain matchable.
+    #[error("saved run operation failed; inspect the typed recovery error")]
+    Saved(#[from] SavedError),
+    /// A terminal native failure and failed aggregate checkpoint both remain available.
+    #[error("native transfer and aggregate checkpoint failed; retain both state references")]
+    RunCheckpoint {
+        /// Original transfer failure, including confirmed or unconfirmed extents.
+        #[source]
+        transfer: Box<crate::transfer::Failure<HttpError>>,
+        /// Aggregate persistence failure; it is not a successful pause.
+        checkpoint: SavedError,
+    },
     /// Input conversion failed before transport effects.
     #[error("invalid input; inspect the typed input error")]
     Input(#[from] InputError),

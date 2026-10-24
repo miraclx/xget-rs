@@ -197,14 +197,46 @@ is not an expected-content check. `download_all(inputs).to_directory(path)` plan
 and `.plan().await` exposes frozen read-only assignments before `client.execute(plan).await`. Planning
 uses HEAD, never a preview payload GET, and creates no output directories.
 
-This first ordinary Client supports exact HTTP inputs and serial files, not provider collections,
-trees, parallel ranges, aggregate resume or overwrite. Unsupported inputs fail explicitly. Redirects,
+This ordinary Client supports exact HTTP inputs, serial files and owned frozen-run continuation,
+not provider collections, trees, parallel ranges, partial-byte reuse, restart or overwrite. Unsupported inputs fail explicitly. Redirects,
 automatic retries, content decompression and ambient proxies are disabled. Clones share request/body
 admission and connection reuse. Each request has a fixed 15-second deadline for admission waiting,
 connection and headers together, but no payload/inactivity timeout. Retained open bodies can exhaust
 admission; drop or consume them to release capacity. Use a caller-owned Tokio runtime with I/O and
 time enabled. See the [`client` module](src/client.rs) for selection, version and failure contracts. The CLI still uses the
 legacy engine below; its feature flags do not enable new Client provider adapters.
+
+### Owned run continuation
+
+Ordinary file runs retain bounded frozen metadata under the designated output root's `.xget-runs`
+store. A repeated matching request first looks for one unfinished run, before issuing fresh HEAD
+requests. It keeps that run's members, assignments, versions and check policy. Multiple matches return
+explicit actual resume paths rather than choosing by timestamp; a fully completed prior run is not an
+unfinished match. `download(...).fresh(xget::client::Fresh)` deliberately bypasses continuation, but
+neither overwrites existing outputs nor deletes old work.
+
+Use the actual path from `report.saved_run()` or a failure's partial report. `SavedRun::inspect(path)`
+is offline: no Client, credentials, network request, payload hashing or execution lease. Its safe
+`members()` expose run-scoped binding keys. Continue with `client.resume(saved).input(key, original_input)`
+for each frozen member, then consume `.run().await`. Exact original reference intent, including namespace,
+query and spelling, must match; cross-reference renewal is not guessed. A selected File supplied as a
+binding must also agree with the frozen version/length and cannot add or replace required checks.
+Raw references, credentials and foreign transport errors are not saved in the record. Ordinary targets
+and saved-state locators containing `..` are refused; use a resolved path rather than relying on lexical
+parent reduction across a possible symlink.
+
+Completed files are revalidated using their recorded strong content anchor and native identity, not
+filename/size/mtime or equal foreign bytes. A completion without a strong recorded anchor returns
+`NotRevalidatable`; it does not trigger a hidden hash. Pending files use fresh full HTTP responses with
+frozen strong ETag enforcement when available. This is frozen-run continuation, not partial-byte reuse
+or saved range-reader reopening. Old partials remain untouched.
+
+Aggregate ownership excludes cooperating same-root aggregate runs while active and stays with submitted physical work after
+a waiter is dropped. Drop is not rollback: publication can finish without a returned receipt. Retain the
+actual run path and inspect/continue it rather than starting a blind replacement. State is flushed and
+atomically replaced, not fsynced; process-interruption recovery is not power-loss durability. The store
+is bounded and has no automatic cleanup. Restart, overwrite and legacy import remain separate work.
+See [`client::SavedRun`](src/client/saved.rs) for the precise binding/error contracts.
 
 ### Existing parallel/resumable API
 

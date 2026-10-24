@@ -256,6 +256,26 @@ group/other write permission, and Unix hardlink support. It retains private stag
 not automatic reopening of a one-shot source, and promises process-interruption recovery rather than
 power-loss durability. See the [external API test](tests/transfer.rs) for a complete executable call.
 
+### Borrowed range readers
+
+`Transfer::from_reader(&reader)` accepts repeatable, known-size access supplied by an application.
+The reader names its opening future, body and error for the actual borrow lifetime. Local/borrowed
+components are allowed; a Send helper uses explicit named lifetime-family bounds rather than requiring
+all application data to be static. See [`transfer::reader`](src/transfer/reader.rs) for a complete
+implementation and generic helper.
+
+Each opened response must match the full requested window and frozen representation/version evidence.
+An unversioned candidate requires a whole-payload SHA-256, SHA-512 or BLAKE3 expectation; size,
+measurement alone and MD5/SHA-1 do not authorize assembly. The reader implementer must uphold an
+enforced-version contract throughout each body. This is not source authenticity.
+
+Up to four ranges write bounded prefixes into the native stage. The shared in-order checker follows
+the contiguous settled-write frontier while other bodies are still running, not only after the slowest
+range finishes. Clean range EOF, exact length, settled writes and all requirements precede absent-only
+publication. Failures retain typed causes and partial facts. Retained state does not persist a source
+session pin or resume/reopen ranges automatically. This advanced entrance has not enabled parallel
+ranges in the ordinary HTTP Client or replaced the legacy CLI engine.
+
 ### Checked live output
 
 The same `Transfer::from_body` policy can release ordered bytes with `.into_body()` or drain them

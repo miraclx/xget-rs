@@ -7,7 +7,9 @@
 //! Unix filesystems; this Client does not yet implement aggregate recovery or overwrite.
 //!
 //! Use [`Transfer`] for an already-open application body, either checked native publication or
-//! [`transfer::live`] delivery to an application-owned consumer/writer. Required checks and optional
+//! [`transfer::live`] delivery to an application-owned consumer/writer. [`Transfer::from_reader`] accepts
+//! borrowed repeatable range access for checked native assembly; see [`transfer::reader`] for the
+//! session contract and lifetime-specific reader families. Required checks and optional
 //! measurement are separate. Irreversible streamed prefixes are not whole-payload expectation evidence.
 //!
 //! # Legacy engine

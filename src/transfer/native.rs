@@ -113,8 +113,8 @@ impl Native {
         })
     }
 
-    /// Writes are serialized by the consuming pipeline, bounded before submission, and never issued
-    /// after sealing. In particular a published witness is never reopened for writable recovery.
+    /// Callers submit disjoint settled-prefix writes, bounded before submission, and settle every
+    /// submission before sealing. A published witness is never reopened for writable recovery.
     pub(super) async fn write(
         &self,
         offset: ByteCount,
@@ -193,6 +193,35 @@ impl Native {
                 accepted: None,
                 error: NativeError::io(Phase::Write, io::Error::other(cause)),
             })?
+    }
+
+    /// Read only an already-settled contiguous stage prefix. The range coordinator supplies this
+    /// authority after write acknowledgement, never from received-byte counters or sparse file size.
+    /// The registration owns the descriptor and both leases through queued/running reads and drop.
+    pub(super) async fn read_prefix(
+        &self,
+        start: ByteCount,
+        end: ByteCount,
+    ) -> Result<Vec<u8>, NativeError> {
+        self.submit(Phase::ReadStage, move |lease| {
+            #[cfg(test)]
+            lease.hooks.read.enter();
+            let length = end
+                .0
+                .checked_sub(start.0)
+                .ok_or(NativeError::InvalidState)?;
+            if lease.mode.load(Ordering::Acquire) != RECEIVING || length == 0 || length > 64 * 1024
+            {
+                return Err(NativeError::InvalidState);
+            }
+            let mut bytes = vec![0; length as usize];
+            lease
+                .data
+                .read_exact_at(&mut bytes, start.0)
+                .map_err(|cause| NativeError::io(Phase::ReadStage, cause))?;
+            Ok(bytes)
+        })
+        .await
     }
 
     pub(super) async fn seal(&self, length: ByteCount) -> Result<(), NativeError> {
@@ -996,6 +1025,7 @@ impl NativeError {
 pub(super) struct Hooks {
     pub(super) released: Arc<tokio::sync::Notify>,
     pub(super) write: Gate,
+    pub(super) read: Gate,
     pub(super) seal: Gate,
     pub(super) commit: Gate,
     pub(super) lose_publish_ack: AtomicBool,

@@ -54,6 +54,7 @@ mod engine;
 pub mod input;
 pub mod inventory;
 mod plan;
+mod selection;
 mod source;
 pub mod transfer;
 

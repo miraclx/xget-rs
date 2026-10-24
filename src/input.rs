@@ -10,6 +10,9 @@ use std::sync::Arc;
 use url::Url;
 use zeroize::Zeroizing;
 
+pub use crate::selection::PatternError;
+use crate::selection::Selection;
+
 #[cfg(test)]
 #[path = "input_tests.rs"]
 mod tests;
@@ -26,6 +29,8 @@ pub struct Input {
     // Selected-file re-entry owns metadata only when present, keeping ordinary parsed inputs small.
     pub(crate) selected: Option<Box<crate::inventory::Selected>>,
     pub(crate) member: Option<MemberToken>,
+    // Parsed once at request construction and shared unchanged by every discovered member.
+    pub(crate) selection: Option<Arc<Selection>>,
     pub(crate) occurrence: InputOccurrence,
     // Advisory HEAD capability, retained with selected metadata, never inferred from a URL or digest.
     pub(crate) ranges: RangeSupport,
@@ -78,6 +83,7 @@ impl Input {
             namespace: None,
             selected: None,
             member: None,
+            selection: None,
             occurrence: InputOccurrence(0),
             ranges: RangeSupport::Unknown,
             group: Arc::new(()),
@@ -121,6 +127,43 @@ impl Input {
         Ok(self)
     }
 
+    /// Adds an include glob over ORIGINAL source-relative member paths, not output namespaces.
+    ///
+    /// Includes form a union (no includes means all), followed by exclusions. Literal member-token
+    /// intent remains independent. Matching is whole-path and case-sensitive, without decoding or
+    /// Unicode normalization: `/` separates components, `*` matches zero/many scalars within one
+    /// component, `?` matches one scalar, and complete `**` components match zero/many components.
+    ///
+    /// There are no escapes, bracket/brace classes or extglobs. Absolute paths, empty/dot/dot-dot
+    /// components, embedded `**`, backslashes, colons, controls and bracket/brace/parenthesis syntax
+    /// are rejected. Per input, includes and exclusions together allow at most 64 patterns and
+    /// 16384 UTF-8 spelling bytes; each pattern allows at most 1024 bytes and 64 components.
+    /// Patterns also count toward common retained request/discovery text limits. Repeated calls add
+    /// intent in order. A nonempty discovery filtered to none is an error; genuine empty discovery
+    /// remains empty. Selected Files keep their frozen metadata, versions and checks.
+    /// Configured matching also requires each original source path to fit 4096 UTF-8 bytes and
+    /// 64 slash-separated components; exceeding that separate path ceiling returns an inventory
+    /// limit during resolution/planning, even when an exact HTTP output name is supplied explicitly.
+    pub fn include(mut self, pattern: &str) -> Result<Self, PatternError> {
+        let selection = match &self.selection {
+            Some(selection) => selection.including(pattern)?,
+            None => Selection::default().including(pattern)?,
+        };
+        self.selection = Some(Arc::new(selection));
+        Ok(self)
+    }
+
+    /// Adds an exclusion glob, applied after include union; see [`Input::include`] for grammar,
+    /// fixed shared budgets, original-path semantics and empty-selection behavior.
+    pub fn exclude(mut self, pattern: &str) -> Result<Self, PatternError> {
+        let selection = match &self.selection {
+            Some(selection) => selection.excluding(pattern)?,
+            None => Selection::default().excluding(pattern)?,
+        };
+        self.selection = Some(Arc::new(selection));
+        Ok(self)
+    }
+
     pub(crate) fn duplicate_reference(&self) -> Result<Self, InputError> {
         Ok(Self {
             reference: Reference::parse(self.original_reference())?,
@@ -132,6 +175,7 @@ impl Input {
                 .map(|namespace| Namespace(String::clone(&namespace.0))),
             selected: None,
             member: self.member,
+            selection: self.selection.as_ref().map(Arc::clone),
             occurrence: self.occurrence,
             ranges: self.ranges,
             group: Arc::clone(&self.group),
@@ -161,6 +205,11 @@ impl Input {
                 self.namespace
                     .as_ref()
                     .map_or(0, |namespace| namespace.as_str().len()),
+            )
+            .saturating_add(
+                self.selection
+                    .as_ref()
+                    .map_or(0, |selection| selection.retained_bytes()),
             )
             .saturating_add(
                 self.selected
@@ -430,6 +479,9 @@ impl fmt::Debug for Namespace {
 /// Reference parsing failures retain only safe typed causes, never raw reference text.
 #[derive(Debug, thiserror::Error)]
 pub enum InputError {
+    /// Bounded original-path intent failed before metadata or payload effects.
+    #[error("invalid path-selection intent; inspect the typed pattern error")]
+    Pattern(#[from] PatternError),
     /// Empty, padded, control-bearing or backslash-bearing input is not silently normalized.
     #[error("invalid reference spelling; supply an unpadded url without controls or backslashes")]
     InvalidReference,

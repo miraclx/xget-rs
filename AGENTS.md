@@ -7,7 +7,7 @@
   exception. `../craft/REVIEW.md` defines review evidence, severity and closure vocabulary.
 - `notes/craft-backlog.md` tracks open work. Historical reviews are not rewritten when a later fix lands.
 - The ordinary Client implements exact HTTP and optional bounded SwissTransfer inventories, literal
-  member selection, frozen multi-input layout, serial native publication/live opening and owned frozen-run
+  member and bounded original-path selection, frozen multi-input layout, serial native publication/live opening and owned frozen-run
   continuation. Eligible pinned exact HTTP uses the common range reader and anchored-prefix recovery.
   Other provider trees/catalogues, restart/overwrite and the redesigned CLI remain unimplemented.
 
@@ -174,6 +174,28 @@ identity encoding, exact manifest-compatible length and a strong ETag. Checkpoin
 native submission; renewed access cannot silently select latest. One expired-denial renewal is bounded;
 a live denial is not renewal permission. Keep signatures/cookies/remote diagnostics out of records and
 source chains. Foreign parser temporary wiping and hard CPU deadline preemption are not promised.
+
+## Original-path selection
+
+Input-local include/exclude intent is parsed once and shared immutably across discovered members.
+Download conveniences require one original input entry; mixed requests use Input-local intent.
+Matching is case-sensitive on original Unicode scalars, with slash components, local `*`/`?`, and
+whole-component recursive `**`. No normalization, namespace matching or larger pattern language.
+Fixed per-input bounds are 64 combined patterns, 1024 UTF-8 bytes each, 64 components and 16384 combined
+spelling bytes. The iterative matcher has polynomial work, not a latency/RSS guarantee.
+
+Debit complete discovery and pattern text before filtering. Validate collection hierarchies completely,
+but do not apply local filename/device/role restrictions to exact HTTP routing ancestors. Only matcher
+bounds of 4096 UTF-8 bytes and 64 slash-separated source components apply there; exceeding them is
+an inventory-limit error. Local assignment retains its own validation. Preserve the pre-filter
+accounted metadata amount. Genuine empty discovery is no-op; a nonempty occurrence filtered to none
+is an error even when another occurrence still matches.
+
+Frame ordered include/exclude spellings in intent/bindings without changing no-pattern fingerprints.
+Match frozen work before discovery or selector reevaluation. Explicit bindings reconstruct original
+reference, namespace and pattern intent; fingerprints are not a stored recipe. Literal member tokens,
+version/requirements and stored range mode retain their separate authority. The legacy CLI has not
+adopted pattern flags.
 
 ## Transport scope
 

@@ -20,6 +20,54 @@ use super::{BodyError, BodyFailure, Client, Error, FinishError, VersionConsisten
 use crate::input::Input;
 use crate::transfer::{Algorithm, Digest, Measurement};
 
+#[tokio::test]
+async fn filtering_remote_http_ancestors_does_not_grant_them_local_filename_roles() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/con/payload"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-length", "3")
+                .insert_header("etag", "\"v1\""),
+        )
+        .mount(&server)
+        .await;
+    let reference = format!("{}/con/payload", server.uri());
+    let root = Directory::new();
+    let client = Client::new().expect("client");
+    for mode in ["include", "exclude"] {
+        let input = || {
+            let input = Input::parse(&reference).expect("fixture reference");
+            match mode {
+                "include" => input.include("**").expect("include all"),
+                _ => input.exclude("*.tmp").expect("unrelated exclusion"),
+            }
+        };
+        let inventory = client
+            .resolve(input())
+            .await
+            .expect("remote ancestors are not outputs");
+        assert_eq!(inventory.files().len(), 1);
+        assert_eq!(
+            inventory.files().next().expect("member").source_path(),
+            "con/payload"
+        );
+        let _plan = client
+            .download(input())
+            .to_file(root.path().join("safe.bin"))
+            .plan()
+            .await
+            .expect("safe explicit assignment");
+        let invalid = client
+            .download(input())
+            .to_file(root.path().join("con"))
+            .plan()
+            .await;
+        assert!(matches!(invalid, Err(Error::InvalidName)));
+    }
+    assert_eq!(get_count(&server).await, 0);
+}
+
 const ABC_SHA256: &str = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
 async fn exact(server: &MockServer, source_path: &str) -> String {
@@ -1160,6 +1208,548 @@ async fn native_late_body_error_retains_owned_state_and_never_publishes() {
     assert!(!destination.exists());
     assert_eq!(failure.report.completed().len(), 0);
     endpoint.settle().await;
+}
+
+#[tokio::test]
+async fn resolve_and_planning_share_original_path_filtering_and_keep_selected_metadata() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path("/nested/a.bin"))
+        .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"frozen\""))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let reference = format!("{}/nested/a.bin", server.uri());
+    let client = Client::new().expect("client");
+    let input = Input::parse(&reference)
+        .expect("input")
+        .under("output-group")
+        .expect("namespace")
+        .include("nested/?.bin")
+        .expect("include")
+        .exclude("output-group/**")
+        .expect("exclude uses original path");
+    let inventory = client.resolve(input).await.expect("filtered inventory");
+    let file = inventory.into_files().next().expect("one member");
+    assert_eq!(file.source_path(), "nested/a.bin");
+    let id = crate::inventory::FileId::clone(file.id());
+    let plan = client
+        .download(file)
+        .to_directory("uncreated-root")
+        .plan()
+        .await
+        .expect("selected metadata without another HEAD");
+    let planned = plan.files().next().expect("one planned member");
+    assert_eq!(planned.file().id(), &id);
+    assert_eq!(
+        planned.file().version(),
+        crate::inventory::VersionEvidence::StrongEtag
+    );
+    assert_eq!(
+        planned.destination(),
+        Path::new("uncreated-root/output-group/a.bin")
+    );
+    let plan = client
+        .download(reference.as_str())
+        .include("nested/*.bin")
+        .exclude("*.bin")
+        .to_file("uncreated.bin")
+        .plan()
+        .await
+        .expect("same matching seam");
+    assert_eq!(plan.files().len(), 1);
+    assert_eq!(get_count(&server).await, 0);
+}
+
+#[tokio::test]
+async fn nonmatching_paths_are_typed_and_pattern_errors_and_global_scope_remain_sticky() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let reference = format!("{}/payload", server.uri());
+    let client = Client::new().expect("client");
+    let input = Input::parse(&reference)
+        .expect("input")
+        .include("other")
+        .expect("include");
+    assert!(matches!(
+        client.resolve(input).await,
+        Err(Error::PathSelection)
+    ));
+    assert!(matches!(
+        client
+            .download(reference.as_str())
+            .include("**")
+            .exclude("payload")
+            .plan()
+            .await,
+        Err(Error::PathSelection)
+    ));
+    assert!(matches!(
+        client
+            .download(reference.as_str())
+            .include("**bad")
+            .include("**")
+            .plan()
+            .await,
+        Err(Error::Input(crate::input::InputError::Pattern(
+            crate::input::PatternError::Syntax
+        )))
+    ));
+    assert!(matches!(
+        client
+            .download_all([reference.as_str(), reference.as_str()])
+            .exclude("*.tmp")
+            .include("**")
+            .plan()
+            .await,
+        Err(Error::SelectionScope)
+    ));
+    assert_eq!(get_count(&server).await, 0);
+}
+
+#[tokio::test]
+async fn mixed_exact_inputs_keep_local_patterns_instead_of_a_global_selector() {
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(4)
+        .mount(&server)
+        .await;
+    let first = format!("{}/one.bin", server.uri());
+    let second = format!("{}/two.txt", server.uri());
+    let client = Client::new().expect("client");
+    let plan = client
+        .download_all([
+            Input::parse(&first)
+                .expect("first")
+                .include("*.bin")
+                .expect("first intent"),
+            Input::parse(&second)
+                .expect("second")
+                .exclude("*.bin")
+                .expect("second intent"),
+        ])
+        .to_directory("uncreated-root")
+        .plan()
+        .await
+        .expect("mixed local intent");
+    assert_eq!(plan.files().len(), 2);
+    assert!(matches!(
+        client
+            .download_all([
+                Input::parse(&first)
+                    .expect("first")
+                    .include("*.bin")
+                    .expect("first intent"),
+                Input::parse(&second)
+                    .expect("second")
+                    .include("*.bin")
+                    .expect("no second match"),
+            ])
+            .to_directory("uncreated-root")
+            .plan()
+            .await,
+        Err(Error::PathSelection)
+    ));
+    assert_eq!(get_count(&server).await, 0);
+}
+
+#[tokio::test]
+async fn pattern_spellings_share_request_text_admission_before_any_discovery() {
+    let server = MockServer::start().await;
+    let reference = format!("{}/payload", server.uri());
+    let mut inputs = Vec::new();
+    let spelling = "x".repeat(1024);
+    for _ in 0..128 {
+        let mut input = Input::parse(&reference).expect("reference");
+        for _ in 0..16 {
+            input = input
+                .exclude(&spelling)
+                .expect("within per-input spelling budget");
+        }
+        inputs.push(input);
+    }
+    let client = Client::new().expect("client");
+    assert!(matches!(
+        client.download_all(inputs).plan().await,
+        Err(Error::Inventory(crate::inventory::InventoryError::Limit))
+    ));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("no metadata requests")
+            .is_empty()
+    );
+}
+
+#[cfg(feature = "swisstransfer")]
+const PATH_SHARE: &str = "aaaaaaaa-1111-2222-3333-444444444444";
+#[cfg(feature = "swisstransfer")]
+const PATH_MEMBER_A: &str = "11111111-1111-2222-3333-444444444444";
+#[cfg(feature = "swisstransfer")]
+const PATH_MEMBER_B: &str = "22222222-1111-2222-3333-444444444444";
+
+#[cfg(feature = "swisstransfer")]
+fn path_share_input() -> Input {
+    Input::parse(&format!("https://www.swisstransfer.com/dl/{PATH_SHARE}")).expect("share")
+}
+
+#[cfg(feature = "swisstransfer")]
+fn path_share_client(server: &MockServer) -> Client {
+    Client {
+        http: std::sync::Arc::new(super::http::Http::fixture(&server.uri(), NonZeroUsize::MIN)),
+    }
+}
+
+#[cfg(feature = "swisstransfer")]
+async fn path_share_manifest(server: &MockServer, members: &[(&str, &str, u64)], requests: u64) {
+    let files: Vec<_> = members
+        .iter()
+        .map(|(id, path, size)| serde_json::json!({"id":id,"path":path,"size":size}))
+        .collect();
+    let page = format!(
+        "<script data-page=app type=application/json>{}</script>",
+        serde_json::json!({"component":"link/show","props":{
+            "link":{"id":PATH_SHARE},"transfer":{"files":files}
+        }})
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/dl/{PATH_SHARE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(page))
+        .expect(requests)
+        .mount(server)
+        .await;
+}
+
+#[cfg(feature = "swisstransfer")]
+#[tokio::test]
+async fn collection_path_filters_preserve_singleton_context_multi_union_and_literal_token_intent() {
+    let server = MockServer::start().await;
+    path_share_manifest(
+        &server,
+        &[
+            (PATH_MEMBER_A, "docs/a.txt", 0),
+            (PATH_MEMBER_B, "images/b.bin", 3),
+        ],
+        5,
+    )
+    .await;
+    let client = path_share_client(&server);
+    let inventory = client
+        .resolve(path_share_input().include("docs/**").expect("include"))
+        .await
+        .expect("one selected");
+    assert_eq!(inventory.files().len(), 1);
+    let accounted = inventory.metadata_bytes();
+    let file = inventory.into_files().next().expect("member");
+    assert!(
+        accounted > file.retained_bytes(),
+        "discarded discovery remains charged"
+    );
+    assert_eq!(file.input.scope(), crate::input::InputScope::Collection);
+    assert_eq!(
+        file.member_token().expect("literal token").as_str(),
+        PATH_MEMBER_A
+    );
+    let plan = client
+        .download(file)
+        .plan()
+        .await
+        .expect("no manifest rediscovery");
+    assert_eq!(
+        plan.files()
+            .next()
+            .expect("singleton grouping")
+            .destination(),
+        Path::new("./SwissTransfer/docs/a.txt")
+    );
+    let plan = client
+        .download(path_share_input())
+        .include("docs/**")
+        .include("images/**")
+        .exclude("images/*.tmp")
+        .to_directory("uncreated-root")
+        .plan()
+        .await
+        .expect("include union");
+    assert_eq!(plan.files().len(), 2);
+    let input = path_share_input()
+        .select_id(PATH_MEMBER_B)
+        .expect("literal token")
+        .include("docs/**")
+        .expect("independent path intent");
+    assert!(matches!(
+        client.resolve(input).await,
+        Err(Error::PathSelection)
+    ));
+    let input = path_share_input()
+        .select_id("33333333-1111-2222-3333-444444444444")
+        .expect("stale literal token")
+        .include("**")
+        .expect("all paths");
+    assert!(matches!(client.resolve(input).await, Err(Error::Selection)));
+    let input = path_share_input().exclude("**").expect("exclude all");
+    assert!(matches!(
+        client.resolve(input).await,
+        Err(Error::PathSelection)
+    ));
+    assert_eq!(server.received_requests().await.expect("requests").len(), 5);
+}
+
+#[cfg(feature = "swisstransfer")]
+#[tokio::test]
+async fn mixed_exact_and_collection_inputs_keep_independent_original_path_intent_and_grouping() {
+    let server = MockServer::start().await;
+    path_share_manifest(
+        &server,
+        &[
+            (PATH_MEMBER_A, "nested/a.bin", 3),
+            (PATH_MEMBER_B, "nested/b.txt", 0),
+        ],
+        1,
+    )
+    .await;
+    Mock::given(method("HEAD"))
+        .and(path("/exact.txt"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = path_share_client(&server);
+    let share = path_share_input()
+        .under("share-output")
+        .expect("share namespace")
+        .include("nested/**")
+        .expect("include")
+        .exclude("**/*.txt")
+        .expect("exclude");
+    let exact = Input::parse(&format!("{}/exact.txt", server.uri()))
+        .expect("exact")
+        .under("exact-output")
+        .expect("exact namespace")
+        .include("*.txt")
+        .expect("exact include");
+    let plan = client
+        .download_all([share, exact])
+        .to_directory("uncreated-root")
+        .plan()
+        .await
+        .expect("mixed plan");
+    let assignments: Vec<_> = plan.files().map(|file| file.destination()).collect();
+    assert_eq!(
+        assignments,
+        [
+            Path::new("uncreated-root/share-output/nested/a.bin"),
+            Path::new("uncreated-root/exact-output/exact.txt")
+        ]
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("metadata only")
+            .len(),
+        2
+    );
+}
+
+#[cfg(feature = "swisstransfer")]
+#[tokio::test]
+async fn genuinely_empty_collection_with_patterns_remains_a_noop() {
+    let server = MockServer::start().await;
+    path_share_manifest(&server, &[], 2).await;
+    let client = path_share_client(&server);
+    let inventory = client
+        .resolve(path_share_input().include("nothing/**").expect("include"))
+        .await
+        .expect("genuinely empty inventory");
+    assert_eq!(inventory.files().len(), 0);
+    let plan = client
+        .download(path_share_input())
+        .exclude("**")
+        .to_directory("uncreated-root")
+        .plan()
+        .await
+        .expect("empty plan");
+    assert_eq!(plan.files().len(), 0);
+}
+
+#[cfg(all(unix, feature = "swisstransfer"))]
+#[tokio::test]
+async fn genuinely_empty_pattern_run_creates_no_owned_store_or_payload_outputs() {
+    let server = MockServer::start().await;
+    path_share_manifest(&server, &[], 1).await;
+    let root = Directory::new();
+    let report = path_share_client(&server)
+        .download(path_share_input())
+        .include("missing/**")
+        .exclude("**")
+        .to_directory(root.path())
+        .run()
+        .await
+        .expect("genuine empty no-op");
+    assert_eq!(report.completed().len(), 0);
+    assert!(report.saved_run().is_none());
+    assert_eq!(
+        fs::read_dir(root.path())
+            .expect("empty output root")
+            .count(),
+        0
+    );
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("manifest only")
+            .len(),
+        1
+    );
+}
+
+#[cfg(feature = "swisstransfer")]
+#[tokio::test]
+async fn all_collection_metadata_is_bounded_and_validated_before_path_filtering() {
+    let server = MockServer::start().await;
+    let ids: Vec<_> = (0..129)
+        .map(|index| format!("{index:08x}-1111-2222-3333-444444444444"))
+        .collect();
+    let names: Vec<_> = (0..129)
+        .map(|index| format!("member-{index}.bin"))
+        .collect();
+    let members: Vec<_> = ids
+        .iter()
+        .zip(&names)
+        .map(|(id, name)| (id.as_str(), name.as_str(), 0))
+        .collect();
+    path_share_manifest(&server, &members, 1).await;
+    let client = path_share_client(&server);
+    assert!(matches!(
+        client
+            .resolve(
+                path_share_input()
+                    .include("member-0.bin")
+                    .expect("one path")
+            )
+            .await,
+        Err(Error::Inventory(crate::inventory::InventoryError::Limit))
+    ));
+    server.reset().await;
+    path_share_manifest(&server, &members[..128], 1).await;
+    let mut input = path_share_input().include("**").expect("include");
+    // Shared immutable spellings are conservatively charged per discovered input reference too.
+    for _ in 0..15 {
+        input = input
+            .exclude(&"x".repeat(1024))
+            .expect("bounded local pattern");
+    }
+    input = input
+        .exclude("**")
+        .expect("exclude all cannot hide discovery text overflow");
+    assert!(matches!(
+        client.resolve(input).await,
+        Err(Error::Inventory(crate::inventory::InventoryError::Limit))
+    ));
+    server.reset().await;
+    path_share_manifest(
+        &server,
+        &[(PATH_MEMBER_A, "safe", 0), (PATH_MEMBER_B, "../unsafe", 0)],
+        1,
+    )
+    .await;
+    assert!(matches!(
+        client
+            .resolve(path_share_input().include("safe").expect("include"))
+            .await,
+        Err(Error::InvalidName)
+    ));
+}
+
+#[cfg(all(unix, feature = "swisstransfer"))]
+#[tokio::test]
+async fn frozen_pattern_request_reentry_uses_recorded_members_without_changed_manifest_discovery() {
+    let server = MockServer::start().await;
+    path_share_manifest(&server, &[(PATH_MEMBER_A, "docs/old.bin", 3)], 1).await;
+    let access_path = format!("/api/1/links/{PATH_SHARE}/files/{PATH_MEMBER_A}");
+    Mock::given(method("GET"))
+        .and(path(access_path.as_str()))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = path_share_client(&server);
+    let root = Directory::new();
+    let failure = client
+        .download(path_share_input())
+        .include("docs/**")
+        .exclude("**/*.tmp")
+        .to_directory(root.path())
+        .run()
+        .await
+        .expect_err("access failure leaves frozen intent");
+    let saved = failure.report.saved_run().expect("saved run").to_path_buf();
+    let state = fs::read(saved.join("state")).expect("bounded saved state");
+    assert!(!String::from_utf8_lossy(&state).contains("docs/**"));
+    server.reset().await;
+    // If mutable discovery were repeated, the same glob would now select a different member.
+    path_share_manifest(&server, &[(PATH_MEMBER_B, "docs/new.bin", 3)], 0).await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let date = time::OffsetDateTime::now_utc()
+        .format(time::macros::format_description!(
+            "[year][month][day]T[hour][minute][second]Z"
+        ))
+        .expect("fixture signing date");
+    let signed = format!(
+        "https://objects.swisstransfer.infomaniak.cloud/old-object?X-Amz-Date={date}&X-Amz-Expires=3600&X-Amz-Signature=fixture-secret"
+    );
+    Mock::given(method("GET"))
+        .and(path(access_path.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data":{"url":signed}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/old-object"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"old\"")
+                .set_body_bytes(b"abc"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let report = client
+        .download(path_share_input())
+        .include("docs/**")
+        .exclude("**/*.tmp")
+        .to_directory(root.path())
+        .run()
+        .await
+        .expect("frozen continuation");
+    assert_eq!(report.saved_run(), Some(saved.as_path()));
+    assert_eq!(report.completed().len(), 1);
+    let file = report.completed().next().expect("recorded member");
+    assert_eq!(
+        file.file().member_token().expect("frozen token").as_str(),
+        PATH_MEMBER_A
+    );
+    assert_eq!(file.file().source_path(), "docs/old.bin");
+    assert_eq!(
+        fs::read(root.path().join("docs/old.bin")).expect("old assignment"),
+        b"abc"
+    );
+    assert!(!root.path().join("docs/new.bin").exists());
+    assert_eq!(server.received_requests().await.expect("requests").len(), 2);
 }
 
 struct Directory(PathBuf);

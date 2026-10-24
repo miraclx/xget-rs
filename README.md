@@ -237,8 +237,8 @@ async fn download_member(client: &Client, share: &str, token: &str, root: &Path)
 ```
 
 A token is the adapter's share-scoped file UUID, not an inventory row number, path or access URL.
-Stale IDs fail; globs and exclusions are not implemented yet. `to_file(path)` requires exactly one
-selected file. Mixed exact/share inputs use the same frozen plan and serial
+Stale IDs fail. Path includes and exclusions can further narrow the original member paths, as below.
+`to_file(path)` requires exactly one selected file. Mixed exact/share inputs use the same frozen plan and serial
 checked native execution. Singleton shares retain nested paths. Multiple unnamed shares have the
 honest readable fallback `SwissTransfer`; equal groups fail rather than merging or gaining opaque
 suffixes. Use `Input::under("share-one")` and distinct namespaces for multiple shares.
@@ -256,6 +256,50 @@ renewal, not a live denial or a healthy body's later expiry. Retained records co
 URLs or cookies. Frozen-run continuation uses original occurrence/member mappings and fresh access,
 without manifest rediscovery or partial-byte reuse. Other provider catalogues and trees remain separate
 work.
+
+### Include and exclude original paths
+
+Use Input-local intent when one request combines multiple references. Download's `include`/`exclude`
+conveniences require exactly one original input, not merely one resulting file:
+
+```rust
+use std::path::Path;
+use xget::{Client, Input};
+
+async fn download_selected(client: &Client, reference: &str, root: &Path)
+    -> Result<(), Box<dyn core::error::Error>>
+{
+    let input = Input::parse(reference)?.include("**/*.bin")?.exclude("private/**")?;
+    let report = client.download(input).to_directory(root).run().await?;
+    println!("published {} files", report.completed().len());
+    Ok(())
+}
+```
+
+Patterns match the whole ORIGINAL source-relative path, case-sensitively by Unicode scalar. `*` stays
+within one component, `?` consumes one scalar, and a complete `**` component consumes zero or more
+components. Includes form a union; no includes means all paths. Exclusions apply afterward. Namespaces,
+normalized collision keys and assigned filenames are not matching input. A remote exact-HTTP ancestor
+such as `con` is routing data, not a local filename; its spelling does not prevent an explicit safe
+output. Actual destination names still undergo the same conservative local validation. Collection
+hierarchies are validated completely even when patterns would exclude an unsafe member.
+
+This deliberately small grammar has no bracket/brace/extglob forms, escapes, absolute/dot paths,
+backslashes, colons or control characters in patterns. Fixed limits per input are 64 includes and
+exclusions combined, 1024 UTF-8 bytes per spelling, 64 components and 16384 combined spelling bytes.
+Configured matching also requires each original source path to fit 4096 UTF-8 bytes and 64
+slash-separated components. Exceeding that separate source-path ceiling is an inventory-limit error,
+even for one exact HTTP input with an explicit output name. Pattern text participates in the existing
+request/discovery metadata accounting. Discovery remains complete and bounded before filtering; exclusions cannot hide an over-limit inventory. A genuinely
+empty discovered inventory remains a no-op, but filtering a nonempty input to no files is an error,
+even if another input still matches. Literal member tokens remain separate selection intent.
+
+Automatic continuation matches the original ordered pattern intent before discovery and restores its
+frozen members without rerunning patterns against changed metadata. Explicit `resume(...).input(...)`
+bindings must reconstruct the same original pattern intent and namespace, as well as the same original
+reference. The record stores fingerprints, not a recipe from which forgotten patterns can be recovered.
+Unconfigured requests retain their existing matching behavior. This is library selection; the compiled
+legacy CLI has not adopted these flags.
 
 ### Owned run continuation
 

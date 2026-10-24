@@ -19,6 +19,16 @@ use super::ReaderError;
 use super::{Evidence, RangeReader, ReadResponse, ReaderRequestError, ReaderTransfer, Window};
 use crate::transfer::{ByteCount, Digest, FailureKind, Measurement};
 
+#[cfg(unix)]
+struct ReaderObservation<'a>(&'a Rc<RefCell<Vec<crate::transfer::observation::ProgressFacts>>>);
+
+#[cfg(unix)]
+impl super::Observer for ReaderObservation<'_> {
+    fn observe(&mut self, facts: crate::transfer::observation::ProgressFacts) {
+        self.0.borrow_mut().push(facts);
+    }
+}
+
 struct Directory(PathBuf);
 
 impl Directory {
@@ -75,9 +85,15 @@ async fn reader_stop_during_seal_settles_without_publication_or_writable_reentry
     let (installed, barrier) = tokio::sync::oneshot::channel();
     super::SEAL_TEST.with(|hook| *hook.borrow_mut() = Some(installed));
     let (stop, signal) = tokio::sync::oneshot::channel();
-    let mut future = Box::pin(pending.run_until(async {
-        let _ = signal.await;
-    }));
+    let facts = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = ReaderObservation(&facts);
+    let mut future = Box::pin(pending.run_registered_until_observed(
+        None,
+        async {
+            let _ = signal.await;
+        },
+        &mut observer,
+    ));
     let held = tokio::select! {
         result = &mut future => panic!("seal fixture was not installed: {result:?}"),
         result = barrier => result.unwrap(),
@@ -89,6 +105,10 @@ async fn reader_stop_during_seal_settles_without_publication_or_writable_reentry
     let _ = stop.send(());
     held.release();
     let failure = future.await.unwrap_err();
+    let terminal = *facts.borrow().last().unwrap();
+    assert_eq!(terminal.received(), failure.partial.received);
+    assert_eq!(terminal.written(), failure.partial.written);
+    assert_eq!(terminal.hashed(), failure.partial.hashed);
     assert!(matches!(failure.kind, FailureKind::Stopped));
     assert!(!output.exists());
     let record =
@@ -107,6 +127,79 @@ async fn reader_stop_during_seal_settles_without_publication_or_writable_reentry
     assert!(matches!(failure.kind, FailureKind::InvalidState));
     assert_eq!(reader.calls.get(), calls);
     assert!(!output.exists());
+}
+
+#[test]
+fn a_send_but_not_sync_observer_preserves_one_borrows_send_reader_future() {
+    struct LocalBytes<'data>(&'data [u8]);
+    impl<'read, 'data: 'read> RangeReader<'read> for LocalBytes<'data> {
+        type Error = core::convert::Infallible;
+        type Body = Iter<core::array::IntoIter<Result<Bytes, Self::Error>, 1>>;
+        type Read = Ready<Result<ReadResponse<'read, Self::Body>, Self::Error>>;
+        fn size(&self) -> ByteCount {
+            ByteCount(self.0.len() as u64)
+        }
+        fn evidence(&'read self) -> Evidence<'read> {
+            Evidence::Enforced {
+                representation: "bytes",
+                version: b"one",
+            }
+        }
+        fn read(&'read self, window: Window) -> Self::Read {
+            ready(Ok(ReadResponse {
+                window,
+                evidence: self.evidence(),
+                body: stream::iter([Ok(Bytes::copy_from_slice(
+                    &self.0[window.start.0 as usize..window.end.0 as usize],
+                ))]),
+            }))
+        }
+    }
+    struct SendObservation(Cell<ByteCount>);
+    impl super::Observer for SendObservation {
+        fn observe(&mut self, facts: crate::transfer::observation::ProgressFacts) {
+            self.0.set(facts.written());
+        }
+    }
+    fn needs_send(_: impl Send) {}
+    let directory = Directory::create();
+    let data = vec![1, 2, 3];
+    let reader = LocalBytes(&data);
+    let mut observer = SendObservation(Cell::new(ByteCount(0)));
+    let pending = ReaderTransfer::from_reader(&reader)
+        .to_file(directory.0.join("output"))
+        .unwrap();
+    needs_send(pending.run_registered_observed(None, &mut observer));
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reader_observation_without_checks_keeps_hash_work_zero() {
+    let directory = Directory::create();
+    let reader = Memory {
+        bytes: b"abc",
+        behavior: Behavior::Exact,
+        calls: Rc::new(Cell::new(0)),
+    };
+    let facts = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = ReaderObservation(&facts);
+    let receipt = ReaderTransfer::from_reader(&reader)
+        .measurement(Measurement::None)
+        .to_file(directory.0.join("output"))
+        .unwrap()
+        .run_registered_observed(None, &mut observer)
+        .await
+        .unwrap();
+    assert_eq!(receipt.native().partial().hashed, ByteCount(0));
+    let facts = facts.borrow();
+    assert!(facts.iter().all(|facts| facts.hashed() == ByteCount(0)));
+    let terminal = *facts.last().unwrap();
+    assert_eq!(terminal.received(), ByteCount(3));
+    assert_eq!(terminal.written(), ByteCount(3));
+    assert_eq!(terminal.attempt_received(), ByteCount(3));
+    assert_eq!(terminal.attempt_written(), ByteCount(3));
+    assert_eq!(terminal.restored(), ByteCount(0));
 }
 
 #[test]
@@ -359,6 +452,9 @@ async fn ready_empty_chunks_return_control_with_a_bounded_source_poll_count() {
         .unwrap();
     let native = super::Native::acquire(pending.plan).await.unwrap();
     let mut partial = crate::transfer::Partial::default();
+    let mut observer = ();
+    let mut observation =
+        super::Observation::start(&mut observer, crate::transfer::Length::Known(ByteCount(4)));
     let mut future = Box::pin(super::receive(
         &reader,
         ByteCount(4),
@@ -367,6 +463,7 @@ async fn ready_empty_chunks_return_control_with_a_bounded_source_poll_count() {
         &mut partial,
         native.policy().start(),
         core::future::pending(),
+        &mut observation,
     ));
     let mut cx = Context::from_waker(noop_waker_ref());
     assert!(future.as_mut().poll(&mut cx).is_pending());
@@ -645,6 +742,10 @@ async fn failed_physical_steps_keep_accepted_prefixes_and_mark_lost_extents_unco
                 .store(true, Ordering::Release);
         }
         let mut partial = crate::transfer::Partial::default();
+        let facts = Rc::new(RefCell::new(Vec::new()));
+        let mut observer = ReaderObservation(&facts);
+        let mut observation =
+            super::Observation::start(&mut observer, crate::transfer::Length::Known(size));
         let result = super::receive(
             reader,
             size,
@@ -653,6 +754,7 @@ async fn failed_physical_steps_keep_accepted_prefixes_and_mark_lost_extents_unco
             &mut partial,
             native.policy().start(),
             core::future::pending(),
+            &mut observation,
         )
         .await;
         assert!(matches!(
@@ -669,6 +771,11 @@ async fn failed_physical_steps_keep_accepted_prefixes_and_mark_lost_extents_unco
             assert!(partial.written.0 > 0);
             assert!(partial.written.0 <= 4);
         }
+        let observed = *facts.borrow().last().unwrap();
+        assert_eq!(observed.received(), partial.received);
+        assert_eq!(observed.written(), partial.written);
+        assert_eq!(observed.hashed(), partial.hashed);
+        assert_eq!(observed.write_extent(), partial.write_extent);
         assert!(partial.received.0 >= partial.written.0);
         assert!(!directory.0.join("output").exists());
         drop(native);
@@ -750,17 +857,35 @@ async fn tails_then_partial_head_are_hashed_before_the_head_can_finish() {
         tails_done: Notify::new(),
         frontier,
     };
+    let facts = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = ReaderObservation(&facts);
     let result = tokio::time::timeout(
         core::time::Duration::from_secs(5),
         ReaderTransfer::from_reader(&reader)
             .to_file(directory.0.join("output"))
             .unwrap()
-            .run(),
+            .run_registered_observed(None, &mut observer),
     )
     .await;
     super::FRONTIER_TEST.with(|hook| *hook.borrow_mut() = None);
     let receipt = result.unwrap().unwrap();
     assert_eq!(receipt.native().partial().hashed, ByteCount(16));
+    let facts = facts.borrow();
+    assert!(
+        facts
+            .iter()
+            .any(|facts| { facts.written() == ByteCount(12) && facts.hashed() == ByteCount(0) })
+    );
+    assert!(
+        facts
+            .iter()
+            .any(|facts| { facts.written() == ByteCount(14) && facts.hashed() == ByteCount(2) })
+    );
+    let terminal = *facts.last().unwrap();
+    assert_eq!(terminal.attempt_received(), ByteCount(16));
+    assert_eq!(terminal.attempt_written(), ByteCount(16));
+    assert_eq!(terminal.hashed(), ByteCount(16));
+    assert_eq!(terminal.restored(), ByteCount(0));
     assert_eq!(reader.tails.load(Ordering::Acquire), 3);
     assert_eq!(fs::read(directory.0.join("output")).unwrap(), [0; 16]);
 }
@@ -874,8 +999,11 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
             .to_file(&output)
             .unwrap();
         let state = crate::transfer::StateRef::clone(pending.state());
+        let initial_facts = Rc::new(RefCell::new(Vec::new()));
+        let mut initial_observer = ReaderObservation(&initial_facts);
         if abrupt {
-            let mut running = Box::pin(pending.run());
+            let mut running =
+                Box::pin(pending.run_registered_observed(None, &mut initial_observer));
             tokio::select! {
                 result = &mut running => panic!("paused source completed: {result:?}"),
                 () = reader.paused.notified() => {}
@@ -883,11 +1011,20 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
             drop(running);
         } else {
             let failure = pending
-                .run_until(reader.paused.notified())
+                .run_registered_until_observed(
+                    None,
+                    reader.paused.notified(),
+                    &mut initial_observer,
+                )
                 .await
                 .unwrap_err();
+            let terminal = *initial_facts.borrow().last().unwrap();
+            assert_eq!(terminal.received(), failure.partial.received);
+            assert_eq!(terminal.written(), failure.partial.written);
+            assert_eq!(terminal.hashed(), failure.partial.hashed);
             assert!(matches!(failure.kind, FailureKind::Stopped));
         }
+        let stopped_observations = initial_facts.borrow().len();
         assert!(!output.exists());
         let checkpoint =
             super::super::record::Record::decode(&fs::read(state.path().join("state")).unwrap())
@@ -899,6 +1036,8 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
             &data[..4]
         );
         let reader = Resumable::fixture(&data);
+        let facts = Rc::new(RefCell::new(Vec::new()));
+        let mut observer = ReaderObservation(&facts);
         let receipt = tokio::time::timeout(core::time::Duration::from_secs(5), async {
             loop {
                 let result = ReaderTransfer::from_reader(&reader)
@@ -906,7 +1045,7 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
                     .resume_from(crate::transfer::StateRef::clone(&state))
                     .to_file(&output)
                     .unwrap()
-                    .run()
+                    .run_registered_observed(None, &mut observer)
                     .await;
                 match result {
                     Err(failure) if matches!(failure.kind, FailureKind::Busy) => {
@@ -927,6 +1066,23 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
             }
         );
         assert_eq!(receipt.native().partial().hashed, ByteCount(32));
+        let facts = facts.borrow();
+        assert!(facts.iter().any(|facts| {
+            facts.restored() == ByteCount(4)
+                && facts.received() == ByteCount(4)
+                && facts.written() == ByteCount(4)
+                && facts.hashed() == ByteCount(4)
+                && facts.attempt_received() == ByteCount(0)
+                && facts.attempt_written() == ByteCount(0)
+        }));
+        let terminal = *facts.last().unwrap();
+        assert_eq!(terminal.received(), ByteCount(32));
+        assert_eq!(terminal.written(), ByteCount(32));
+        assert_eq!(terminal.hashed(), ByteCount(32));
+        assert_eq!(terminal.restored(), ByteCount(4));
+        assert_eq!(terminal.attempt_received(), ByteCount(28));
+        assert_eq!(terminal.attempt_written(), ByteCount(28));
+        assert_eq!(initial_facts.borrow().len(), stopped_observations);
         assert!(
             reader
                 .calls
@@ -1176,4 +1332,253 @@ async fn no_hash_and_weak_only_continuation_refuse_without_creating_prefix_evide
             Err(ReaderRequestError::NoResumeAnchor)
         ));
     }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observer_panic_drops_range_bodies_but_keeps_native_and_aggregate_leases_until_worker_cleanup()
+ {
+    use core::convert::Infallible;
+    use core::panic::AssertUnwindSafe;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, Waker};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    use futures::{FutureExt as _, Stream};
+    use tokio::sync::oneshot;
+
+    use crate::transfer::native::{Native, NativeError};
+    use crate::transfer::observation::{Observation, Observer, ProgressFacts};
+    use crate::transfer::{OperationOwner, Partial, StateRef};
+
+    struct Controlled {
+        opened: Cell<usize>,
+        dropped: Cell<usize>,
+        polls: Cell<usize>,
+        tails_ready: Cell<bool>,
+        tail_wakers: RefCell<Vec<Waker>>,
+    }
+    struct Body<'read> {
+        reader: &'read Controlled,
+        head: bool,
+        yielded: bool,
+    }
+    impl Stream for Body<'_> {
+        type Item = Result<Bytes, Infallible>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.reader.polls.set(self.reader.polls.get() + 1);
+            if self.yielded {
+                return Poll::Pending;
+            }
+            if !self.head && !self.reader.tails_ready.get() {
+                self.reader
+                    .tail_wakers
+                    .borrow_mut()
+                    .push(Waker::clone(cx.waker()));
+                return Poll::Pending;
+            }
+            self.yielded = true;
+            Poll::Ready(Some(Ok(Bytes::from_static(b"a"))))
+        }
+    }
+    impl Drop for Body<'_> {
+        fn drop(&mut self) {
+            self.reader.dropped.set(self.reader.dropped.get() + 1);
+        }
+    }
+    impl<'read> RangeReader<'read> for Controlled {
+        type Error = Infallible;
+        type Body = Body<'read>;
+        type Read = Ready<Result<ReadResponse<'read, Self::Body>, Self::Error>>;
+        fn size(&self) -> ByteCount {
+            ByteCount(16)
+        }
+        fn evidence(&'read self) -> Evidence<'read> {
+            Evidence::Enforced {
+                representation: "bytes",
+                version: b"one",
+            }
+        }
+        fn read(&'read self, window: Window) -> Self::Read {
+            self.opened.set(self.opened.get() + 1);
+            ready(Ok(ReadResponse {
+                window,
+                evidence: self.evidence(),
+                body: Body {
+                    reader: self,
+                    head: window.start == ByteCount(0),
+                    yielded: false,
+                },
+            }))
+        }
+    }
+    struct PanicAfterWrite<'a>(&'a Cell<usize>);
+    impl Observer for PanicAfterWrite<'_> {
+        fn observe(&mut self, facts: ProgressFacts) {
+            self.0.set(self.0.get() + 1);
+            assert_eq!(
+                facts.written(),
+                ByteCount(0),
+                "fixture observer panic after a tail write"
+            );
+        }
+    }
+    struct SettledRegistration {
+        owner: Option<OperationOwner>,
+        settled: Option<oneshot::Sender<()>>,
+    }
+    impl Drop for SettledRegistration {
+        fn drop(&mut self) {
+            // Signal actual owner destruction after its stable aggregate lease has unlocked.
+            drop(self.owner.take());
+            if let Some(settled) = self.settled.take() {
+                let _ = settled.send(());
+            }
+        }
+    }
+
+    let directory = Directory::create();
+    let store = directory.0.join(crate::transfer::OWNED_RUN_STORE);
+    fs::DirBuilder::new().mode(0o700).create(&store).unwrap();
+    let lease = Native::lease_directory(PathBuf::clone(&store))
+        .await
+        .unwrap();
+    let (settled, mut finished) = oneshot::channel();
+    let owner: OperationOwner = Arc::new(SettledRegistration {
+        owner: Some(lease),
+        settled: Some(settled),
+    });
+    let reader = Controlled {
+        opened: Cell::new(0),
+        dropped: Cell::new(0),
+        polls: Cell::new(0),
+        tails_ready: Cell::new(false),
+        tail_wakers: RefCell::new(Vec::new()),
+    };
+    let output = directory.0.join("output");
+    let pending = ReaderTransfer::from_reader(&reader)
+        .measurement(Measurement::None)
+        .to_file(&output)
+        .unwrap();
+    let state = StateRef::clone(pending.state());
+    let super::PendingReader {
+        size,
+        evidence,
+        plan,
+        session,
+        resume,
+        ..
+    } = pending;
+    let native = Native::acquire_reader(plan, session, resume, Some(owner))
+        .await
+        .unwrap();
+    let (checks, restored) = native.restore_reader().await.unwrap();
+    assert_eq!(restored, ByteCount(0));
+    // The existing single-consumer native gate holds the first head write physically running.
+    // Other bodies cannot yield until the driver has observed that barrier being entered.
+    let held = native.hooks().write.install();
+    let callbacks = Cell::new(0);
+    let mut observer = PanicAfterWrite(&callbacks);
+    let reader_ref = &reader;
+    let mut run = Box::pin(
+        AssertUnwindSafe(async move {
+            let mut partial = Partial::default();
+            let mut observation =
+                Observation::start(&mut observer, crate::transfer::Length::Known(size));
+            super::receive(
+                reader_ref,
+                size,
+                evidence,
+                &native,
+                &mut partial,
+                checks,
+                core::future::pending(),
+                &mut observation,
+            )
+            .await
+        })
+        .catch_unwind(),
+    );
+    tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        tokio::select! {
+            _ = &mut run => panic!("head write must remain physically held"),
+            () = held.entered.notified() => {}
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(reader.opened.get(), 4);
+    assert_eq!(reader.dropped.get(), 0);
+    reader.tails_ready.set(true);
+    for waker in reader.tail_wakers.borrow_mut().drain(..) {
+        waker.wake();
+    }
+    let outcome = tokio::time::timeout(core::time::Duration::from_secs(5), run.as_mut())
+        .await
+        .unwrap();
+    let Err(payload) = outcome else {
+        panic!("a settled tail write must invoke the panicking observer");
+    };
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unexpected panic payload");
+    assert!(message.contains("fixture observer panic after a tail write"));
+    drop(payload);
+    drop(run);
+    assert_eq!(
+        reader.dropped.get(),
+        4,
+        "every admitted body is destroyed on unwind"
+    );
+    let polls_after_unwind = reader.polls.get();
+    let callbacks_after_unwind = callbacks.get();
+    assert!(matches!(
+        finished.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        state.reconcile().await.unwrap_err().kind,
+        FailureKind::Busy
+    ));
+    assert!(matches!(
+        Native::lease_directory(PathBuf::clone(&store)).await,
+        Err(NativeError::Busy)
+    ));
+    let workspace_probe = fs::File::open(state.path().join("lease")).unwrap();
+    // SAFETY: this independently opened descriptor stays owned through both flock probes.
+    assert_eq!(
+        unsafe { libc::flock(workspace_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EWOULDBLOCK)
+    );
+    assert_eq!(reader.polls.get(), polls_after_unwind);
+    assert_eq!(callbacks.get(), callbacks_after_unwind);
+    assert!(!output.exists());
+    held.release();
+    tokio::time::timeout(core::time::Duration::from_secs(5), finished)
+        .await
+        .unwrap()
+        .unwrap();
+    let aggregate = Native::lease_directory(store).await.unwrap();
+    drop(aggregate);
+    // SAFETY: settlement has completed and this is still the independent probe descriptor.
+    assert_eq!(
+        unsafe { libc::flock(workspace_probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    // SAFETY: release only the probe's just-acquired lock, never a native operation's descriptor.
+    assert_eq!(
+        unsafe { libc::flock(workspace_probe.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    assert!(state.reconcile().await.is_ok());
+    assert_eq!(reader.polls.get(), polls_after_unwind);
+    assert_eq!(callbacks.get(), callbacks_after_unwind);
+    assert!(!output.exists());
 }

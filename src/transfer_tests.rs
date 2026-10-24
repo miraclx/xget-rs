@@ -20,6 +20,125 @@ use super::{
     Provenance, Reconciliation, RequestError, RequiredSha256, Sha256Digest, StateRef, Transfer,
 };
 
+struct LocalObservation<'a> {
+    latest: &'a Rc<Cell<Option<super::observation::ProgressFacts>>>,
+    calls: &'a Cell<u32>,
+}
+
+impl super::observation::Observer for LocalObservation<'_> {
+    fn observe(&mut self, facts: super::observation::ProgressFacts) {
+        self.latest.set(Some(facts));
+        self.calls.set(self.calls.get() + 1);
+    }
+}
+
+#[test]
+fn a_send_but_not_sync_borrowed_observer_preserves_send_body_execution() {
+    struct SendObservation(Cell<ByteCount>);
+    impl super::observation::Observer for SendObservation {
+        fn observe(&mut self, facts: super::observation::ProgressFacts) {
+            self.0.set(facts.written());
+        }
+    }
+    fn needs_send(_: impl Send) {}
+    let fixture = Fixture::new();
+    let mut observer = SendObservation(Cell::new(ByteCount(0)));
+    let owner: super::OperationOwner = std::sync::Arc::new(());
+    let pending = Transfer::from_body(
+        stream::empty::<Result<Bytes, Infallible>>(),
+        Length::Unknown,
+    )
+    .to_file(fixture.output())
+    .unwrap();
+    needs_send(pending.run_registered_observed(owner, &mut observer));
+    assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn body_observation_is_borrowed_exact_and_does_not_invent_hash_work() {
+    for measurement in [Measurement::None, Measurement::default()] {
+        let fixture = Fixture::new();
+        let latest = Rc::new(Cell::new(None));
+        let calls = Cell::new(0);
+        let mut observer = LocalObservation {
+            latest: &latest,
+            calls: &calls,
+        };
+        let owner: super::OperationOwner = std::sync::Arc::new(());
+        let receipt = Transfer::from_body(
+            stream::iter([Ok::<_, Infallible>(Bytes::from(vec![1; 70_000]))]),
+            Length::Known(ByteCount(70_000)),
+        )
+        .measurement(measurement)
+        .to_file(fixture.output())
+        .unwrap()
+        .run_registered_observed(owner, &mut observer)
+        .await
+        .unwrap();
+        let facts = latest.get().unwrap();
+        assert_eq!(facts.received(), ByteCount(70_000));
+        assert_eq!(facts.written(), ByteCount(70_000));
+        assert_eq!(facts.restored(), ByteCount(0));
+        assert_eq!(facts.attempt_received(), facts.received());
+        assert_eq!(facts.attempt_written(), facts.written());
+        assert_eq!(facts.hashed(), receipt.partial().hashed);
+        assert_eq!(
+            facts.hashed(),
+            if measurement == Measurement::None {
+                ByteCount(0)
+            } else {
+                ByteCount(70_000)
+            },
+        );
+        // Initial, admitted chunk, two bounded writes and terminal return.
+        assert!(calls.get() >= 5);
+    }
+}
+
+#[tokio::test]
+async fn stopped_and_overlong_body_observation_does_not_claim_publication() {
+    for stop_now in [false, true] {
+        let fixture = Fixture::new();
+        let latest = Rc::new(Cell::new(None));
+        let calls = Cell::new(0);
+        let mut observer = LocalObservation {
+            latest: &latest,
+            calls: &calls,
+        };
+        let owner: super::OperationOwner = std::sync::Arc::new(());
+        let failure = Transfer::from_body(
+            stream::iter([Ok::<_, Infallible>(Bytes::from_static(b"abc"))]),
+            Length::Known(ByteCount(2)),
+        )
+        .to_file(fixture.output())
+        .unwrap()
+        .run_registered_until_observed(
+            owner,
+            async {
+                if !stop_now {
+                    core::future::pending::<()>().await;
+                }
+            },
+            &mut observer,
+        )
+        .await
+        .unwrap_err();
+        let facts = latest.get().unwrap();
+        assert_eq!(facts.received(), failure.partial.received);
+        assert_eq!(facts.written(), ByteCount(0));
+        assert_eq!(facts.hashed(), ByteCount(0));
+        assert_eq!(
+            facts.received(),
+            if stop_now { ByteCount(0) } else { ByteCount(3) },
+        );
+        assert!(!fixture.output().exists());
+        assert!(matches!(
+            failure.kind,
+            FailureKind::Stopped | FailureKind::LengthMismatch
+        ));
+    }
+}
+
 #[test]
 fn requirements_are_parsed_not_silently_dropped() {
     assert!(matches!(

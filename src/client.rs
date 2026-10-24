@@ -39,6 +39,12 @@
 //! Explicit file parents must already be
 //! suitable caller-owned directories; directory targets create their validated hierarchy at execution.
 //! No preview GET is used when resolving metadata or planning output assignments.
+//!
+//! [`Download::run_with`], [`Client::execute_with`] and [`Resume::run_with`] borrow an [`Observer`]
+//! on the executing task. Their default counterparts use the same pipeline with a no-op observer.
+//! [`Event`] separates frozen metadata, exact [`ProgressFacts`] and terminal outcomes.
+//! Counts reaching a declared length do not establish EOF, matched requirements or publication.
+//! Reconciled publications do not invent current-attempt progress. Drop promises no terminal event.
 
 use core::convert::Infallible;
 use core::fmt;
@@ -61,6 +67,7 @@ mod builtin;
 mod http;
 mod layout;
 mod live;
+mod observation;
 mod range;
 #[cfg(feature = "s3")]
 mod s3;
@@ -74,6 +81,8 @@ pub use builtin::SourceError;
 use http::Http;
 pub use http::{HttpError, HttpErrorKind, RequestStage};
 pub use live::{CheckedBody, LiveReceipt, OpenedFile};
+use observation::FileProgress;
+pub use observation::{Event, Observer, ProgressFacts};
 #[cfg(feature = "s3")]
 use s3::S3;
 #[cfg(feature = "s3")]
@@ -525,14 +534,30 @@ impl Client {
     /// See [`Resume`'s ownership and cancellation contract](Resume#ownership-and-cancellation) for
     /// same-root aggregate exclusion and native/manifest ownership through submitted-work settlement.
     pub async fn execute(&self, plan: Plan) -> Result<Report, Box<RunFailure>> {
-        self.execute_with_request(plan, None, Reentry::Fresh).await
+        self.execute_with(plan, &mut ()).await
     }
 
-    async fn execute_with_request(
+    /// Executes frozen assignments with synchronous borrowed caller-task events.
+    /// The observer may borrow local state. Drop promises no terminal event or rollback;
+    /// see [`Observer`] and [ownership and cancellation](Resume#ownership-and-cancellation).
+    pub async fn execute_with<O: Observer>(
+        &self,
+        plan: Plan,
+        observer: &mut O,
+    ) -> Result<Report, Box<RunFailure>> {
+        let result = self
+            .execute_with_request(plan, None, Reentry::Fresh, observer)
+            .await;
+        observer.observe(Event::returned(&result));
+        result
+    }
+
+    async fn execute_with_request<O: Observer>(
         &self,
         mut plan: Plan,
         request: Option<saved::Fingerprint>,
         reentry: Reentry,
+        observer: &mut O,
     ) -> Result<Report, Box<RunFailure>> {
         let report = Report::default();
         if let Err(error) = Http::runtime() {
@@ -550,6 +575,11 @@ impl Client {
             }));
         }
         if plan.files.is_empty() {
+            observer.observe(Event::RunStarted {
+                run: None,
+                saved_run: None,
+                files: 0,
+            });
             return Ok(report);
         }
         for planned in &plan.files {
@@ -586,28 +616,43 @@ impl Client {
         for (file, member) in plan.files.iter_mut().zip(owned.destinations()) {
             file.destination = member.to_path_buf();
         }
-        self.execute_owned(plan, owned).await
+        self.execute_owned(plan, owned, observer).await
     }
 
-    async fn execute_owned(
+    async fn execute_owned<O: Observer>(
         &self,
         plan: Plan,
         mut owned: saved::Owned,
+        observer: &mut O,
     ) -> Result<Report, Box<RunFailure>> {
         let mut report = Report {
             completed: Vec::new(),
             saved_run: Some(owned.path().to_path_buf()),
         };
-        for (
-            index,
-            PlannedFile {
+        let run = RunId::for_path(owned.path());
+        observer.observe(Event::RunStarted {
+            run: Some(run),
+            saved_run: Some(owned.path()),
+            files: plan.files.len(),
+        });
+        for (index, planned) in plan.files.into_iter().enumerate() {
+            let Some(key) = BindingKey::for_run_member(run, index) else {
+                return Err(Box::new(RunFailure {
+                    error: Error::Saved(SavedError::Limit),
+                    report,
+                    failed: Some(planned),
+                }));
+            };
+            observer.observe(Event::FileStarted {
+                key,
+                planned: &planned,
+            });
+            let PlannedFile {
                 mut file,
                 destination,
                 requirements,
                 measurement,
-            },
-        ) in plan.files.into_iter().enumerate()
-        {
+            } = planned;
             match owned.previous(index).await {
                 Ok(Some(receipt)) => {
                     let version = if file.selected.description.etag.is_some() {
@@ -620,6 +665,10 @@ impl Client {
                         destination,
                         version,
                         receipt: PublicationReceipt::Whole(receipt),
+                    });
+                    observer.observe(Event::FileCompleted {
+                        key,
+                        published: &report.completed[index],
                     });
                     if let Err(error) = owned.completed(index).await {
                         return Err(Box::new(RunFailure {
@@ -653,6 +702,10 @@ impl Client {
                     measurement,
                     &mut owned,
                     index,
+                    &mut FileProgress {
+                        observer: &mut *observer,
+                        key,
+                    },
                 )
                 .await
                 {
@@ -676,6 +729,10 @@ impl Client {
                     destination,
                     version: VersionConsistency::StrongEtagMatched,
                     receipt: PublicationReceipt::Ranges(receipt),
+                });
+                observer.observe(Event::FileCompleted {
+                    key,
+                    published: &report.completed[index],
                 });
                 if let Err(error) = owned.completed(index).await {
                     return Err(Box::new(RunFailure {
@@ -750,13 +807,26 @@ impl Client {
                     }),
                 }));
             }
-            match pending.run_registered(owned.registration()).await {
+            match pending
+                .run_registered_observed(
+                    owned.registration(),
+                    &mut FileProgress {
+                        observer: &mut *observer,
+                        key,
+                    },
+                )
+                .await
+            {
                 Ok(receipt) => {
                     report.completed.push(PublishedFile {
                         file,
                         destination,
                         version,
                         receipt: PublicationReceipt::Whole(receipt),
+                    });
+                    observer.observe(Event::FileCompleted {
+                        key,
+                        published: &report.completed[index],
                     });
                     if let Err(error) = owned.completed(index).await {
                         return Err(Box::new(RunFailure {
@@ -1111,6 +1181,18 @@ impl Download<'_> {
     /// See [`Resume`'s ownership and cancellation contract](Resume#ownership-and-cancellation): drop
     /// can leave Busy until submitted work settles, and is neither rollback nor a pause receipt.
     pub async fn run(self) -> Result<Report, Box<RunFailure>> {
+        self.run_with(&mut ()).await
+    }
+
+    /// Runs with a synchronous observer borrowing caller-local state on the executing task.
+    /// Returned success or failure emits one terminal event. Drop promises none; see [`Observer`].
+    pub async fn run_with<O: Observer>(self, observer: &mut O) -> Result<Report, Box<RunFailure>> {
+        let result = self.run_observed(observer).await;
+        observer.observe(Event::returned(&result));
+        result
+    }
+
+    async fn run_observed<O: Observer>(self, observer: &mut O) -> Result<Report, Box<RunFailure>> {
         let client = self.client;
         let Self {
             inputs,
@@ -1154,7 +1236,7 @@ impl Download<'_> {
             return saved
                 .bind_request(client, inputs)
                 .map_err(|error| RunFailure::before_execution(Error::Saved(error)))?
-                .run()
+                .run_observed(observer)
                 .await;
         }
         let plan = Download {
@@ -1170,7 +1252,7 @@ impl Download<'_> {
         .map_err(RunFailure::before_execution)?;
         // Fresh bypasses admission matching, but its own unfinished work remains discoverable later.
         client
-            .execute_with_request(plan, Some(request), reentry)
+            .execute_with_request(plan, Some(request), reentry, observer)
             .await
     }
 }

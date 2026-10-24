@@ -436,7 +436,13 @@ async fn tails_before_a_partial_head_checkpoint_reenter_as_only_suffix_windows_w
                 .expect(expected(SIZE))
                 .measurement(Measurement::None);
         }
-        let mut run = Box::pin(download.to_directory(root.path()).run());
+        let initial_events = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+        let mut initial_observer = crate::client::tests::Capture(&initial_events);
+        let mut run = Box::pin(
+            download
+                .to_directory(root.path())
+                .run_with(&mut initial_observer),
+        );
         tokio::select! {
             result = &mut run => panic!("head must remain withheld: {result:?}"),
             _ = server.tails.wait() => {},
@@ -455,6 +461,12 @@ async fn tails_before_a_partial_head_checkpoint_reenter_as_only_suffix_windows_w
             }) => result.expect("contiguous head is checkpointed while its body remains open"),
         }
         drop(run);
+        assert!(!initial_events.borrow().iter().any(|event| matches!(
+            event,
+            crate::client::tests::Observed::Completed(_)
+                | crate::client::tests::Observed::Failed
+                | crate::client::tests::Observed::Published { .. }
+        )));
         settled(root.path()).await;
         let retained = crate::transfer::StateRef::from(native.to_path_buf())
             .reconcile()
@@ -473,7 +485,13 @@ async fn tails_before_a_partial_head_checkpoint_reenter_as_only_suffix_windows_w
                 .expect(expected(SIZE))
                 .measurement(Measurement::None);
         }
-        let report = download.to_directory(root.path()).run().await.unwrap();
+        let events = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+        let mut observer = crate::client::tests::Capture(&events);
+        let report = download
+            .to_directory(root.path())
+            .run_with(&mut observer)
+            .await
+            .unwrap();
         assert_eq!(report.saved_run(), Some(aggregate.as_path()));
         let published = report.completed().next().unwrap();
         let stats = published.range_stats().unwrap();
@@ -481,6 +499,37 @@ async fn tails_before_a_partial_head_checkpoint_reenter_as_only_suffix_windows_w
         assert_eq!(stats.restored, anchored);
         assert_eq!(stats.source.0 + stats.restored.0, SIZE as u64);
         assert_eq!(stats.written, stats.source);
+        assert!(events.borrow().iter().any(|event| matches!(event,
+            crate::client::tests::Observed::Progress { facts, .. }
+                if facts.restored() == anchored && facts.received() == anchored
+                    && facts.written() == anchored && facts.hashed() == anchored
+                    && facts.attempt_received() == ByteCount(0)
+                    && facts.attempt_written() == ByteCount(0))));
+        assert!(events.borrow().iter().any(|event| matches!(event,
+            crate::client::tests::Observed::Progress { facts, .. }
+                if facts.restored() == stats.restored && facts.attempt_received() == stats.source
+                    && facts.attempt_written() == stats.written
+                    && facts.hashed() == ByteCount(SIZE as u64))));
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, crate::client::tests::Observed::Started { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, crate::client::tests::Observed::Completed(1)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events.borrow().last(),
+            Some(&crate::client::tests::Observed::Completed(1))
+        );
         assert_eq!(
             published.receipt().partial().written,
             ByteCount(SIZE as u64)

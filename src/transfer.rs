@@ -61,6 +61,7 @@ mod native;
 #[cfg(not(unix))]
 #[path = "transfer/unsupported.rs"]
 mod native;
+pub(crate) mod observation;
 mod pipeline;
 mod plan;
 pub mod reader;
@@ -239,40 +240,67 @@ impl<B> PendingFile<B> {
         B: Stream<Item = Result<Bytes, E>>,
         S: Future<Output = ()>,
     {
-        self.run_owned(stop, None).await
+        self.run_owned(stop, None, &mut ()).await
     }
 
-    pub(crate) async fn run_registered<E>(
+    pub(crate) async fn run_registered_observed<E, O>(
         self,
         owner: OperationOwner,
+        observer: &mut O,
     ) -> Result<Receipt, Box<Failure<E>>>
     where
         B: Stream<Item = Result<Bytes, E>>,
+        O: observation::Observer,
     {
-        self.run_owned(pending(), Some(owner)).await
+        self.run_registered_until_observed(owner, pending(), observer)
+            .await
     }
 
-    async fn run_owned<E, S>(
+    pub(crate) async fn run_registered_until_observed<E, S, O>(
         self,
+        owner: OperationOwner,
         stop: S,
-        owner: Option<OperationOwner>,
+        observer: &mut O,
     ) -> Result<Receipt, Box<Failure<E>>>
     where
         B: Stream<Item = Result<Bytes, E>>,
         S: Future<Output = ()>,
+        O: observation::Observer,
+    {
+        self.run_owned(stop, Some(owner), observer).await
+    }
+
+    async fn run_owned<E, S, O>(
+        self,
+        stop: S,
+        owner: Option<OperationOwner>,
+        observer: &mut O,
+    ) -> Result<Receipt, Box<Failure<E>>>
+    where
+        B: Stream<Item = Result<Bytes, E>>,
+        S: Future<Output = ()>,
+        O: observation::Observer,
     {
         let Self { body, length, plan } = self;
-        let state = StateRef::clone(plan.state());
-        let native = Native::acquire_registered(plan, owner)
+        let mut observation = observation::Observation::start(observer, length);
+        let result = async {
+            let state = StateRef::clone(plan.state());
+            let native = Native::acquire_registered(plan, owner)
+                .await
+                .map_err(|failure| {
+                    Failure::native(failure.error, Partial::default(), failure.state)
+                })?;
+            pipeline::Run {
+                native,
+                state,
+                length,
+            }
+            .execute_observed(body, stop, &mut observation)
             .await
-            .map_err(|failure| Failure::native(failure.error, Partial::default(), failure.state))?;
-        pipeline::Run {
-            native,
-            state,
-            length,
         }
-        .execute(body, stop)
-        .await
+        .await;
+        observation.emit();
+        result
     }
 }
 

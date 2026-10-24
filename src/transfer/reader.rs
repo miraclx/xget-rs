@@ -133,6 +133,7 @@ use futures::{Stream, StreamExt as _};
 use tokio::sync::Notify;
 
 use super::native::Native;
+use super::observation::{Observation, Observer};
 use super::plan::Plan;
 use super::{
     Algorithm, ByteCount, Conflict, Digest, Failure, FailureKind, Measurement, Partial, Provenance,
@@ -458,17 +459,55 @@ impl<'read, R: RangeReader<'read>> PendingReader<'read, R> {
         self.run_registered::<F, B, E>(None)
     }
 
-    pub(crate) fn run_registered<F, B, E>(
+    pub(crate) async fn run_registered<F, B, E>(
         self,
         owner: Option<super::OperationOwner>,
-    ) -> impl Future<Output = Result<ReaderReceipt, Box<Failure<ReaderError<E>>>>> + 'read
+    ) -> Result<ReaderReceipt, Box<Failure<ReaderError<E>>>>
     where
         R: RangeReader<'read, Read = F, Body = B, Error = E>,
         F: Future<Output = Result<ReadResponse<'read, B>, E>> + 'read,
         B: Stream<Item = Result<Bytes, E>> + 'read,
         E: 'read,
     {
-        execute::<R, F, B, E, _>(self, core::future::pending(), owner)
+        self.run_registered_observed::<F, B, E, _>(owner, &mut ())
+            .await
+    }
+
+    pub(crate) async fn run_registered_observed<F, B, E, O>(
+        self,
+        owner: Option<super::OperationOwner>,
+        observer: &mut O,
+    ) -> Result<ReaderReceipt, Box<Failure<ReaderError<E>>>>
+    where
+        R: RangeReader<'read, Read = F, Body = B, Error = E>,
+        F: Future<Output = Result<ReadResponse<'read, B>, E>> + 'read,
+        B: Stream<Item = Result<Bytes, E>> + 'read,
+        E: 'read,
+        O: Observer,
+    {
+        self.run_registered_until_observed::<F, B, E, _, O>(
+            owner,
+            core::future::pending(),
+            observer,
+        )
+        .await
+    }
+
+    pub(crate) async fn run_registered_until_observed<F, B, E, S, O>(
+        self,
+        owner: Option<super::OperationOwner>,
+        stop: S,
+        observer: &mut O,
+    ) -> Result<ReaderReceipt, Box<Failure<ReaderError<E>>>>
+    where
+        R: RangeReader<'read, Read = F, Body = B, Error = E>,
+        F: Future<Output = Result<ReadResponse<'read, B>, E>> + 'read,
+        B: Stream<Item = Result<Bytes, E>> + 'read,
+        E: 'read,
+        S: Future<Output = ()> + 'read,
+        O: Observer,
+    {
+        execute::<R, F, B, E, S, O>(self, stop, owner, observer).await
     }
 
     /// Stop source admission when the supplied signal completes and settle submitted physical work.
@@ -488,14 +527,14 @@ impl<'read, R: RangeReader<'read>> PendingReader<'read, R> {
         E: 'read,
         S: Future<Output = ()> + 'read,
     {
-        execute::<R, F, B, E, S>(self, stop, None)
+        execute_unobserved::<R, F, B, E, S>(self, stop, None)
     }
 }
 
 // Name the three family members once at the public boundary. Carrying projections through nested
 // opaque async futures can make Send checking quantify over other source lifetimes, requiring static
 // despite the caller having proved the members for this borrow. These equalities select one family.
-async fn execute<'read, R, F, B, E, S>(
+async fn execute_unobserved<'read, R, F, B, E, S>(
     pending: PendingReader<'read, R>,
     stop: S,
     owner: Option<super::OperationOwner>,
@@ -506,6 +545,43 @@ where
     B: Stream<Item = Result<Bytes, E>> + 'read,
     E: 'read,
     S: Future<Output = ()> + 'read,
+{
+    execute::<R, F, B, E, S, _>(pending, stop, owner, &mut ()).await
+}
+
+async fn execute<'read, R, F, B, E, S, O>(
+    pending: PendingReader<'read, R>,
+    stop: S,
+    owner: Option<super::OperationOwner>,
+    observer: &mut O,
+) -> Result<ReaderReceipt, Box<Failure<ReaderError<E>>>>
+where
+    R: RangeReader<'read, Read = F, Body = B, Error = E>,
+    F: Future<Output = Result<ReadResponse<'read, B>, E>> + 'read,
+    B: Stream<Item = Result<Bytes, E>> + 'read,
+    E: 'read,
+    S: Future<Output = ()> + 'read,
+    O: Observer,
+{
+    let mut observation = Observation::start(observer, super::Length::Known(pending.size));
+    let result = execute_observed::<R, F, B, E, S, O>(pending, stop, owner, &mut observation).await;
+    observation.emit();
+    result
+}
+
+async fn execute_observed<'read, R, F, B, E, S, O>(
+    pending: PendingReader<'read, R>,
+    stop: S,
+    owner: Option<super::OperationOwner>,
+    observation: &mut Observation<'_, O>,
+) -> Result<ReaderReceipt, Box<Failure<ReaderError<E>>>>
+where
+    R: RangeReader<'read, Read = F, Body = B, Error = E>,
+    F: Future<Output = Result<ReadResponse<'read, B>, E>> + 'read,
+    B: Stream<Item = Result<Bytes, E>> + 'read,
+    E: 'read,
+    S: Future<Output = ()> + 'read,
+    O: Observer,
 {
     let PendingReader {
         reader,
@@ -536,8 +612,9 @@ where
         hashed: restored,
         ..Partial::default()
     };
+    observation.update(&partial, restored);
     let mut stop = pin!(stop);
-    let result = receive::<R, F, B, E, _>(
+    let result = receive::<R, F, B, E, _, O>(
         reader,
         size,
         evidence,
@@ -545,6 +622,7 @@ where
         &mut partial,
         checks,
         stop.as_mut(),
+        observation,
     )
     .await;
     let result = match result {
@@ -603,7 +681,9 @@ where
     })
 }
 
-async fn receive<'read, R, F, B, E, S>(
+// This one-task private pipeline threads its borrowed checker and observation explicitly.
+#[allow(clippy::too_many_arguments)]
+async fn receive<'read, R, F, B, E, S, O>(
     reader: &'read R,
     size: ByteCount,
     evidence: Evidence<'read>,
@@ -611,6 +691,7 @@ async fn receive<'read, R, F, B, E, S>(
     partial: &mut Partial,
     mut checks: crate::checks::Checks,
     stop: S,
+    observation: &mut Observation<'_, O>,
 ) -> Result<crate::checks::Checks, FailureKind<ReaderError<E>>>
 where
     R: RangeReader<'read, Read = F, Body = B, Error = E>,
@@ -618,6 +699,7 @@ where
     B: Stream<Item = Result<Bytes, E>> + 'read,
     E: 'read,
     S: Future<Output = ()>,
+    O: Observer,
 {
     let cancellation = Cancellation::default();
     let restored = partial.written.0;
@@ -679,6 +761,7 @@ where
         if extent == WriteExtent::Unconfirmed {
             partial.write_extent = extent;
         }
+        observation.update(partial, ByteCount(restored));
         settled[task.index] = task.offset;
         if let Some(error) = error {
             failure.get_or_insert(error);
@@ -712,6 +795,7 @@ where
                             checks.update(&bytes);
                             frontier = end;
                             partial.hashed = ByteCount(frontier);
+                            observation.update(partial, ByteCount(restored));
                             if frontier < size.0
                                 && let Some(anchor) = checks.prefix_anchor()
                                 && let Err(error) = native

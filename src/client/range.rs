@@ -52,7 +52,9 @@ impl Mode {
     }
 }
 
-pub(super) async fn run(
+// Borrowed observation remains on the caller task, separate from native operation ownership.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run<O: crate::transfer::observation::Observer>(
     http: &Http,
     file: &File,
     destination: &Path,
@@ -60,6 +62,7 @@ pub(super) async fn run(
     measurement: Measurement,
     owned: &mut Owned,
     index: usize,
+    observer: &mut O,
 ) -> Result<ReaderReceipt, Error> {
     let Length::Known(size) = file.length() else {
         return Err(Error::InvalidMetadata);
@@ -89,7 +92,10 @@ pub(super) async fn run(
     }
     let pending = transfer.to_file(destination).map_err(Error::RangeRequest)?;
     owned.submit_reader(index, pending.state()).await?;
-    match pending.run_registered(Some(owned.registration())).await {
+    match pending
+        .run_registered_observed(Some(owned.registration()), observer)
+        .await
+    {
         Ok(receipt) => Ok(receipt),
         Err(transfer) => {
             if let Err(checkpoint) = owned.retained(index).await {

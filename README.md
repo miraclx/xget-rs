@@ -1,187 +1,523 @@
 # xget
 
-A fast, resumable, **verified** file downloader. It splits a download into parallel chunks, writes each
-straight to its place on disk, and hashes the result as it goes, so the digest it prints certifies the
-bytes you actually got. Ships as a command-line tool (`xget`) and a Rust library.
+xget is a Rust fetch library and command-line tool. It resolves bounded source metadata, freezes the
+local output plan, fetches and checks file bytes, and by default publishes only to an absent
+destination. Explicit replacement requires `-f` and the native ownership checks.
 
-![xget downloading a file in parallel chunks](media/download.gif)
+The workspace contains two packages:
 
-## Why xget
+- **`xget`**, the reusable Rust library at the repository root.
+- **`xget-cli`**, the command-line package in [`cli/`](cli/), which installs the **`xget`** executable.
 
-- **Verified by construction.** A source that ignores a range, or serves the wrong length, is a hard
-  error, never a silent bad file. The reported hash is of the bytes on disk.
-- **Parallel and resumable.** Chunks download at once; an interrupted download resumes from exactly where
-  it stopped, and the resumed file is still fully verified.
-- **More than HTTP.** The same engine reads from HTTP, S3 (and S3-compatible stores), and IPFS.
+The library does not include the CLI's argument parser, terminal renderer or dotenv setup. Rust and CLI
+callers use the same Client coordinator for discovery, selection, checks, publication and continuation.
+Files execute serially; eligible exact HTTP uses up to four pinned ranges within one file. Live output
+uses a checked stream without native publication.
 
-This is a Rust rewrite of the Node.js [`libxget`](https://github.com/miraclx/libxget-js); see
-[what is intentionally different](#differences-from-libxget-js).
+This README describes the current working tree, not a tagged release. The compiled product uses the
+Client and Transfer entrances documented below, with no legacy CLI command or compatibility mode.
+Retired engine sources remain physically intact but are excluded from compilation and packaging,
+pending cleanup. Modern native V1/V2/V3/V4 state readers remain supported; old XGETCTL1 partials are
+not imported. Native publication requires Unix support; whole portable-engine Wasm support has not
+been established.
 
 ## Install
 
-**Prebuilt binary** (Linux and macOS, x86-64 and arm64) from the
-[latest release](https://github.com/miraclx/xget-rs/releases/latest). For example, on Apple silicon:
+Install from a source checkout of this workspace:
 
 ```console
-curl -L https://github.com/miraclx/xget-rs/releases/latest/download/xget-aarch64-apple-darwin.tar.gz | tar xz
-./xget --version
+cargo install --path cli
 ```
 
-**With cargo**, from the repository:
+Provider features are off by default. Forward the features you need:
 
 ```console
-cargo install --git https://github.com/miraclx/xget-rs --features "s3 ipfs"
+cargo install --path cli --features s3
+cargo install --path cli --features "s3 swisstransfer webdav github"
 ```
 
-**From source:**
+Include `ipfs` to use exact `ipfs://CID[/path]` references through the common Client and default command.
+
+Build without installing:
 
 ```console
-cargo build --release --bin xget --features "s3 ipfs"
+cargo build --release --package xget-cli --bin xget
 ```
 
-The `s3` and `ipfs` sources are optional features, off by default; drop them for an HTTP-only build.
+Rust 1.97.1 is the pinned and exercised toolchain. Older compilers are not claimed. The executable is
+named `xget`; the Cargo package is `xget-cli`, and library imports remain `xget`.
 
 ## Quick start
 
-Download a file. It is fetched in parallel chunks and the SHA-256 is printed at the end:
+Replace the example URLs and expected digests with those for a resource you are authorized to fetch.
+
+Download one exact HTTP file to the current directory:
 
 ```console
 xget https://example.com/big.iso
 ```
 
-Verify against a known checksum. `--expect` takes an inline `algo:hex`, a bare hex digest, or a URL to a
-checksum file, and exits non-zero on mismatch:
+This writes `big.iso` and reports the measured SHA-256 in its published record. The name comes from the
+final percent-decoded component of the URL path. A `Content-Disposition` filename is not used. If the
+URL has no usable final component, name the output explicitly.
+
+Choose an output file or a destination directory:
 
 ```console
-xget https://example.com/big.iso --expect sha256:9f86d0818...
-xget https://example.com/big.iso --expect https://example.com/big.iso.sha256sum
+xget https://example.com/big.iso -o big.iso
+xget https://example.com/big.iso -D downloads
 ```
 
-![a checksum mismatch fails loudly and exits non-zero](media/expect.gif)
+`-o` and `-D` are mutually exclusive. There is no positional output: `xget URL OUTPUT` is not the
+current syntax. Native publication in this command is absent-only, so an existing destination is an
+error and is left untouched. Choose a new path, move the old file, or explicitly request guarded
+replacement with `-f`. The replacement still requires clean EOF, length and required-check success;
+`-f` never permits two members of one run to target the same file or inode.
 
-Bad networks are the normal case, and xget is built for them. Within a run, a dropped chunk retries from
-the byte it reached, and the retry is reported above the bar so a stall explains itself instead of a
-silently frozen bar:
-
-![chunks dropping and retrying, reported above the bar](media/retry.gif)
-
-Across runs it is just as forgiving. Interrupt it and run it again: it resumes from where it stopped,
-re-verifying the bytes already on disk from the start as it goes (a checksum cannot be resumed
-mid-stream, so the guarantee is worth the reread), no flag needed. You can also point xget straight at
-the leftover control file and it finishes the job, no URL to retype:
+Stream to stdout instead of publishing a file:
 
 ```console
-xget big.iso.xget
+set -o pipefail
+xget https://example.com/big.iso -o - | sha256sum
 ```
 
-To see what a leftover `.xget` is without touching the network, ask:
+Live output is checked while it runs, but bytes already written to stdout cannot be retracted. A late
+source error, length mismatch or required-check failure still exits non-zero. `pipefail` makes the
+pipeline report that failure. No file is published, and the final record reports `published_files: 0`.
+Live output creates no owned run or native destination, so `--fresh`, `--restart` and `--overwrite`
+are rejected for `-o -`, including live previews.
+
+### Require an exact digest
+
+Pass a complete `algorithm:hex` value with `--expect`:
 
 ```console
-xget --info big.iso.xget
+xget https://example.com/big.iso -o big.iso \
+  --expect sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 ```
 
-![xget interrupted and auto-resuming](media/resume.gif)
+The digest above is a complete example value, not a claim about the example URL. The default command
+accepts only `ALGORITHM:HEX`; it does not accept a bare digest or a checksum URL. Supported algorithms
+are `md5`, `sha1`, `sha256`, `sha512` and `blake3`. A required check must match before native
+publication, and `--expect` needs exactly one selected file.
 
-Stream to stdout with `-`, or to a pipe or process substitution, and it streams instead of saving:
+`-s` is optional measurement, not a requirement. The default is `sha256`; `-s none` disables
+measurement, but any `--expect` requirement is still computed and enforced. Conflicts between
+requirements for the same algorithm fail before payload opening. MD5 and SHA-1 are compatibility
+checks, not strong content anchors.
+
+### Use a local checksum sidecar
+
+`--expect-file` reads a bounded local checksum file:
 
 ```console
-xget https://example.com/big.iso - | sha256sum
-xget https://example.com/big.iso >(tar xz)
+printf '%s  big.iso\n' '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08' > big.iso.sha256
+xget https://example.com/big.iso -o big.iso --expect-file big.iso.sha256 --fresh
 ```
 
-A piped download that would not fit in the temp dir, or is simply huge, streams straight through in one
-ordered pass rather than buffering to a scratch file first, so you can pipe an arbitrarily large file to a
-consumer. Pass `--sequential` to force that single-stream mode for any download.
+Records are `algorithm:hex`, or bare hex with `--expect-file-algorithm` (SHA-256 when omitted).
+A record may be followed by two spaces, or a space and an asterisk, and the exact original member
+path. The path is the `source_path` printed by `xget list`, not the local output name or a basename.
+A sidecar with one unlabelled record applies to the selected file; a multi-record sidecar must label
+every record.
+Duplicate or conflicting records are rejected. The sidecar must be a regular non-symlink local file,
+at most 65536 bytes and 256 records, with paths at most 4096 UTF-8 bytes. Stdin and remote sidecars are
+unsupported. Bounded sidecar opening is Unix-only; elsewhere use an inline `--expect`.
 
-Download from S3 (with the `s3` feature). It signs when credentials resolve and goes anonymous when they
-do not, and verifies against the object's stored checksum if it has one:
+Use exactly one selected file with a sidecar, including a labelled multi-entry document. A native file
+target additionally requires `--fresh` and exactly one original input. This prevents a sidecar from
+silently changing a collection selection or matching old work. `--fresh` only bypasses continuation;
+it does not authorize overwrite, deletion or cleanup. `-o -` with a sidecar does not require
+`--fresh`.
+
+### Select among alternatives
+
+A catalogue such as a GitHub release, with the `github` feature, can contain several assets. Inspect
+it first:
 
 ```console
-xget s3://my-bucket/big.iso
-xget s3://my-bucket/big.iso --endpoint-url https://s3.example.com   # R2, MinIO, Backblaze, ...
+xget list https://github.com/owner/repo/releases/tag/v1.2.3
+xget https://github.com/owner/repo/releases/tag/v1.2.3 \
+  --select '*linux*x86_64*' -D downloads
+xget https://github.com/owner/repo/releases/tag/v1.2.3 --all -D downloads
 ```
 
-![an S3 object verified automatically against its stored checksum](media/s3.gif)
+`xget list` reports every alternative and needs no selector. An acquisition request for a GitHub
+release catalogue requires an explicit choice in the current CLI: `--all`, `--select-id`, or a
+positive `--select` with one original input. `--all` chooses every alternative, including a singleton
+catalogue, and still honors `--select`, `--exclude` and `--select-id` criteria. It grants no overwrite
+authority. The library's `.all()` expresses the same policy.
 
-Download from IPFS through a gateway (with the `ipfs` feature). A CID that addresses raw bytes verifies
-against its own hash for free:
+`--select` and `--exclude` match the original source-relative path, case-sensitively by Unicode scalar.
+`*` stays within one path component, `?` consumes one scalar, and a complete `**` component consumes
+zero or more components. Each positive include must match at least one file in its complete original
+input scope before exclusions. Matching includes form a union; no includes means every path, and
+exclusions apply afterward. A positive include on an empty file scope is an error; an exclusion-only
+genuine empty scope remains a no-op. A literal `--select-id` uses the `selector_token` from `list`: a
+SwissTransfer file UUID, a
+full S3 key, a WebDAV absolute URI path, or a GitHub numeric asset ID, depending on the source.
+
+The CLI selection flags require exactly one original input, even if several inputs would filter down
+to one file. Use separate invocations for mixed selections; unfiltered multi-input acquisition remains
+supported. Patterns are bounded at
+64 includes and exclusions combined, 1024 UTF-8 bytes per spelling, 64 components and 16384 combined
+spelling bytes.
+
+## Default command
 
 ```console
-xget ipfs://bafybeih... --ipfs-gateway http://127.0.0.1:8080
+xget [OPTIONS] [URL]...
+xget list [OPTIONS] [URL]...
+xget info <STATE> [--json]
+xget resume <STATE> --input KEY=REFERENCE [--input KEY=REFERENCE] [OPTIONS]
 ```
 
-## Common options
+The default command and `list` accept one or more positional references and an explicit `--tree URL`.
+Inputs can be exact HTTP URLs, S3 or IPFS references, SwissTransfer share references, GitHub release
+catalogues and, with `--tree`, supported directory services. Unsupported shapes fail explicitly.
+
+The table describes the acquisition command. `list` shares input, selection, access, gateway and
+`--json` options; `info` is offline with `<STATE>` and `--json`; `resume` uses `<STATE>`, repeatable
+`--input`, access, gateway, authority and presentation options.
+
+| flag | behavior |
+| --- | --- |
+| `-o, --output FILE` | exact one-file target; `-` means checked live stdout |
+| `-D, --directory DIR` | directory root; conflicts with `-o` |
+| `--dry-run` | resolve and freeze the real plan; no payload or native work |
+| `--fresh` | discover anew instead of continuing matching unfinished work; no overwrite or cleanup |
+| `--restart` | a new attempt for pending receiving work in an existing matching frozen run; retains old attempts |
+| `-f, --overwrite` | guarded replacement of a captured incumbent after checks; no intra-run aliases |
+| `-s, --checksum ALGO` | optional measurement: `none`, `md5`, `sha1`, `sha256`, `sha512`, `blake3` |
+| `--expect ALGORITHM:HEX` | required whole-file digest, checked before publication |
+| `--expect-file FILE` | local bounded checksum sidecar |
+| `--expect-file-algorithm ALGO` | algorithm for bare sidecar hex; requires `--expect-file` |
+| `--tree URL` | explicit tree input; repeatable, alternative to positional references |
+| `--select PATTERN` | include original-path pattern; repeatable |
+| `--exclude PATTERN` | exclude original-path pattern; repeatable |
+| `--select-id TOKEN` | exact literal member token; one per invocation |
+| `--all` | explicitly choose every alternative in one catalogue; requires one original input |
+| `-H, --header 'NAME: VALUE'` | transient access for one original HTTP/WebDAV input; transport-owned headers are rejected |
+| `--ipfs-gateway URL` | HTTP(S) gateway access for exact IPFS inputs; requires `ipfs` |
+| `--progress MODE` | `auto`, `bar`, `plain`, `json` or `none`; conflicts with `--json` |
+| `--json` | versioned records instead of plain lines |
+| `--bits` | human speed in bits; byte counts remain bytes |
+| `--raw-sizes` | raw byte sizes in human output |
+
+`--progress` defaults to `auto`. Bars use terminal stderr only; captured stderr falls back to complete
+plain snapshots without cursor control. `--progress none` suppresses progress, not final result or
+failure records. Download and resume diagnostics go to stderr. Metadata commands write to stdout.
+JSON records include `schema_version: 1`; this README does not define a separate compatibility policy
+for that envelope.
+
+There is no `--sequential` flag or `--chunks` counter. The common coordinator selects eligible pinned
+ranges; `--restart` and `-f` are the separate guarded policies described below.
+
+### Output planning and native publication
+
+With no target flag, files land under `.` using their planned names. `-D DIR` groups collection
+members under the destination root and preserves source-relative paths and namespaces where needed.
+`-o FILE` requires exactly one selected file with no namespace. A request that resolves to several
+files needs `-D`, the default directory target, or a narrower selection.
+
+Native publication in the default command is absent-only unless `-f` is supplied. It requires Unix
+hardlink support and a suitable caller-owned parent directory. An existing parent must be owned by the caller, must have
+owner read, write and execute permission, and must not be group- or other-writable; missing directory
+roots are created with a requested mode of `0700`. Without `-f`, a present destination is an error even
+when its contents match. Clean EOF, the declared length when known, settled writes, sealing and every
+required digest precede publication. Non-Unix hosts get a typed unsupported result for native file
+publication; `-o -` does not create a native file.
+
+`-f` captures a regular incumbent's device/inode under the cooperating destination lease and checks
+that identity again before replacement. A symlink, changed incumbent or alias of another frozen target
+is refused. If the destination was absent at capture, a file that appears later is not replaced.
+Replacement is an atomic rename under cooperating ownership, not an inode compare-and-swap against
+arbitrary noncooperating writers. A failure before commit preserves the incumbent; dropping a waiter
+is not rollback once a physical operation has been submitted. An overwrite preview reports requested
+replacement but has no execution authority.
+
+### Metadata-only inspection
+
+`--dry-run` performs the real resolution and planning work, then stops. It emits one `Planned` record
+per file with the source path, destination, length, required digests and measurement policy. For
+`-o -`, it emits `PlannedLive` with the live target and check proposals. It opens no payload, creates no
+output directory, starts no native stage and touches no run store. It still makes source metadata
+requests, so it is not an offline mode.
+
+`xget list` (alias `xget ls`) resolves complete bounded metadata and prints member facts without
+opening payloads or creating outputs. Records include the original `source_path`, `namespace`, length,
+`selector_token` when ID selection is available, version evidence and any required digests. Directories
+are shown as inspection-only and are never materialized as empty outputs. `list` does not assign local
+destination names; use `--dry-run` for the frozen plan. `--json` writes the same records as versioned
+lines on stdout.
+
+### Inspect and continue unfinished work
+
+Owned file runs keep bounded frozen metadata under the designated output root's `.xget-runs` store.
+Repeating a matching request looks for one unfinished run before fresh discovery or HEAD requests. It
+reuses that run's members, assignments, versions and check policy. Multiple matches return the actual
+candidate paths instead of choosing one; a fully completed prior run is not an unfinished match.
+Completed members are revalidated rather than refetched, including when `--restart` or `-f` is supplied.
+
+`xget info <STATE>` is offline. It opens the owned aggregate state path without a Client, transport,
+credential discovery, payload hashing or execution lease. It reports each member's binding key,
+destination, length, status, measurement and required digests, with
+`content_revalidated: false` and no execution authority. The state is an owned run record, not an
+incomplete payload. Old `.xget` partials are not imported, migrated or cleaned automatically.
+
+Usually, repeat the original download request for automatic matching. To choose a particular saved run,
+use explicit resume; rebinding is not rediscovery:
 
 ```console
-xget [OPTIONS] <URL> [OUTPUT]
+xget info downloads/.xget-runs/RUN_ID
+xget resume downloads/.xget-runs/RUN_ID \
+  --input KEY=https://example.com/big.iso
 ```
 
-`<URL>` is `http(s)://`, `s3://`, or `ipfs://`. `OUTPUT` is where to write; if omitted or a directory, the
-name comes from the server (`Content-Disposition`) or the URL. The full list is `xget --help`.
+Replace `RUN_ID` and `KEY` with the values printed by `info`. Supply every member key exactly once.
+Keys come from `info`; they are not row numbers or selectors. Duplicate, unknown or missing bindings
+are request errors. The supplied reference must reconstruct the
+frozen original intent, including namespace, spelling and any selection patterns. `resume` does not
+search for a newer version, choose a latest asset, or change the destination. `--input` splits at the
+first `=`, so a reference may contain further `=` characters.
 
-| flag | what it does |
-| ---- | ------------ |
-| `-n, --chunks <N>` | number of parallel chunks (default 5) |
-| `-t, --tries <N>` | retries per chunk, each resuming from its offset; `inf` for unlimited |
-| `-s, --checksum <ALGO>` | hash to report: `none`, `md5`, `sha1`, `sha256`, `sha512`, `blake3` |
-| `--expect <[ALGO:]HEX>` | require a known checksum: inline, bare hex, or a URL to a checksum file |
-| `--restart` | ignore a resumable partial and download from scratch (partials resume automatically) |
-| `--sequential` | fetch as one ordered stream, no scratch (auto-selected for a huge or won't-fit pipe) |
-| `-f, --overwrite` | permit replacing an existing complete file |
-| `--mirror <URL>` | another source for the same file, tried when a chunk fails (repeatable) |
-| `--endpoint-url <URL>` | endpoint for an `s3://` URL |
-| `--ipfs-gateway <URL>` | gateway for an `ipfs://` URL |
-| `-H, --header <H>` | set a request header (repeatable) |
-| `--timeout <SECS>` | fail a chunk if no data arrives for this long, so its retry can resume it |
-| `--progress <MODE>` | `auto`, `bar`, `plain`, `json`, or `none` |
-| `-v, -vv` | verbose diagnostics on stderr |
+`--restart` asks the common coordinator to start a distinct attempt only for pending receiving work in
+a matching frozen run. It keeps old payloads, control bytes and uncertainty records; it does not reset
+or delete them. A missing match is an error before discovery, not permission to fetch latest. Closed,
+foreign attempts, missing recorded native state and publication uncertainty are not bypassed by this
+flag. Restart
+still uses the frozen members, versions, assignments and check policy. It grants no overwrite authority;
+add `-f` only when guarded replacement of a pending member's incumbent is intended. The same two flags
+are available on explicit `resume`.
 
-## Library usage
+`--restart` conflicts with `--fresh`, `--dry-run` and local sidecars. Native local sidecars retain their
+separate Fresh/one-original/one-selected-file restriction. `--fresh` and `-f` can be combined for a
+freshly discovered checked replacement, but neither implies the other or grants cleanup permission.
 
-Start with `get(url)` and finish with `.write(output)`:
+State is flushed and atomically replaced, but not fsynced. This covers process interruption, not
+power-loss durability. The store is bounded and has no automatic cleanup. A dropped waiter is not a
+rollback: submitted physical work may still finish without a returned receipt. Retain the printed state
+path and inspect it rather than starting a blind replacement.
+
+Exit status is `0` for success and `130` for an interrupt. Rejected usage, request, selection and layout
+errors use `2`; runtime, I/O and library failures generally use `1`.
+
+## Optional providers
+
+All provider features are off by default. The common Client resolves only what its enabled adapters
+support and fails unsupported inputs rather than falling back to HTTP.
+
+| feature | input | current limits |
+| --- | --- | --- |
+| none | exact `http(s)://` | fixed metadata deadline; no automatic redirect, retry, decompression or ambient proxy |
+| `s3` | `s3://bucket/key`, `--tree s3://bucket/prefix` | ordered whole objects; no partial-byte range resume |
+| `swisstransfer` | SwissTransfer share reference | bounded collection; ordered whole member responses |
+| `webdav` | `--tree https://host/path/` | slash-ending DAV root without query or fragment; never website crawling |
+| `github` | GitHub release catalogue | explicit `--all`, member or path selection |
+| `ipfs` | exact `ipfs://CID[/path]` | ordered whole gateway responses; raw-block CID checks, no UnixFS DAG verification |
+
+For S3, the CLI constructs the AWS SDK from the default configuration when an S3 input is present. The
+library by itself performs no credential, profile or instance-metadata discovery. Standard SDK
+configuration controls endpoints; the common command has no `--endpoint-url` flag. Credentials and
+access policy are the caller's and the SDK's responsibility, not an added xget authentication layer.
+S3 metadata is bounded and is not a bucket snapshot.
+
+SwissTransfer, WebDAV and GitHub support are compiled in through their feature flags. They do not add
+provider-specific commands: inputs and selections use the same `list`, `--select`, `--exclude` and
+`--select-id` surface. No provider-owned scheduler exists.
+
+IPFS uses the same Client and CLI flow. The library's `Client::builder().ipfs_gateway("https://gateway.example")`
+and the CLI's `--ipfs-gateway https://gateway.example` select access; the default is `https://ipfs.io`.
+The library does not discover gateways from the environment or a local Kubo configuration. A selector
+is the canonical CID plus preserved encoded exact path, without `ipfs://`, and must agree with the
+original reference. Raw blocks require the CID's supported complete digest even with `-s none`.
+DAG-PB/UnixFS file responses are gateway-trusted: a root node's digest is not a flat-file checksum,
+and xget does not reconstruct or verify the DAG. Supply a separate whole-file expectation when needed.
+Trees and directory paths are unsupported; gateway redirects are not followed. Saved state records
+CID/path identity and frozen checks, not the gateway URL, so a later Client can renew gateway access.
+
+The common Client has fixed admission limits: 128 original inputs and 128 combined file and directory
+entries per resolution, 1 MiB of accounted retained metadata, and a 15-second deadline for admission
+waiting, connection and headers together. It uses up to four active requests or bodies by default.
+Retained open bodies consume admission until consumed or dropped. There is no payload or inactivity
+timeout. Automatic redirects, retries, content decompression and ambient proxies are disabled for
+ordinary HTTP. Unsupported capabilities fail explicitly; no alternate engine is selected.
+
+Exact HTTP planning uses HEAD, never a preview GET. When HEAD explicitly advertises byte ranges, a
+known nonzero size and a strong ETag of at most 256 bytes, the common Client may reuse up to four
+pinned ranges for an eligible continuation. Every response must repeat the frozen pin and match its
+complete requested window and total. A changed pin or ignored range fails without an HTTP fallback.
+Other inputs use ordered whole responses. S3 and SwissTransfer do not promise partial-byte resume.
+
+## Library
+
+Depend on the root `xget` package; `xget-cli` is not needed for library use.
+
+### Common Client
+
+Start with the [crate-level guide](src/lib.rs) for the authoritative rustdoc recipe combining a
+required digest, optional measurement, input-scoped headers, metadata inspection, zero-file handling,
+exactly-one selection and consuming the selected `File`. It also links the deeper contracts and shows
+how an application supplies its configured S3 SDK client. The guide uses `no_run` examples so doctests
+compile them without contacting example URLs; the convenience call below omits required checks deliberately.
 
 ```rust
-use std::path::Path;
-use xget::{Checksum, Output};
+use xget::Client;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let report = xget::get("https://example.com/big.iso")?
-        .chunks(8)
-        .checksum(Checksum::Sha256)
-        .write(Output::file(Path::new("big.iso")))
-        .await?;
-
-    println!("{} bytes, hash {:?}", report.length, report.hash);
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn core::error::Error>> {
+    let client = Client::new()?;
+    let report = client.download("https://example.org/file.bin")
+        .to_file("file.bin")
+        .run().await?;
+    assert_eq!(report.completed().len(), 1);
     Ok(())
 }
 ```
 
-`get(url)` is the HTTP entry; `from(source)` starts from any `Source` (S3, IPFS, a `Mirrors` set, or your
-own). Both chain `.chunks`, `.tries`, `.checksum`, `.timeout`, `.resume`, and `.progress`, then finish
-with `.write(output)`. `Output` is `file(path)` (the only resumable sink), `writer(w)` to stream,
-`Discard`, or `tee(file, w)` to keep a file and stream at once. To reuse a configuration across
-downloads, wrap the chain in a small function: `let dl = |u| xget::get(u)?.chunks(8); dl(a)?.write(...)`.
+`Client::new()` performs no network, dotenv, proxy or credential discovery. `download` accepts an
+`Input`, and `download_all` accepts several. By default, `.to_file(path)` requires one selected file
+and an absent destination; `.to_directory(path)` preserves collection structure.
+`.measurement(...)` selects optional hashing, while `.expect(digest)` and
+`.require(digest, provenance)` add required checks. `.plan()` returns the frozen assignments without
+executing them.
+
+`client.resolve(input)` and `client.resolve_all(inputs)` return bounded metadata inventories.
+`inventory.files()` preserves original source paths, member tokens, versions and requirements. Pass a
+consumed `File` or `inventory.into_files()` back to `download`/`download_all` to retain collection
+context. When inspecting first, handle an inventory with zero files before constructing a new
+`download_all` request: an empty original-input iterator is invalid, whereas a genuine empty scope
+resolved from an original input is a successful no-op. Directory metadata does not become a file job.
+`Input::parse(reference)` recognizes supported references; `Input::tree(reference)` is the explicit
+tree form. With `webdav` enabled, use a slash-ending HTTP(S) root without query or fragment, such as
+`Input::tree("https://host.example/dav/files/")?`. This is DAV listing, not website crawling.
+`Input::include`, `Input::exclude`, `Input::select_id` and `Input::all` are the
+library selection entrances. `Download::all()` explicitly accepts a complete catalogue of alternatives.
+
+The Client clones share request and body admission and connection reuse. Use a caller-owned Tokio
+runtime with I/O and time enabled. See the [`client` module](src/client.rs) for the full resolution,
+layout and failure contracts.
+
+### Borrowed execution observers
+
+`client::Download::run_with`, `Client::execute_with` and `client::Resume::run_with` borrow an observer
+on the executing task. It can hold local state without `Send`, `Sync`, `Clone` or `'static` bounds:
+
+```rust
+use xget::{Client, client::{Event, Observer}};
+
+struct CountFiles<'a>(&'a mut usize);
+
+impl Observer for CountFiles<'_> {
+    fn observe(&mut self, event: Event<'_>) {
+        if let Event::FileCompleted { .. } = event {
+            *self.0 += 1;
+        }
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn core::error::Error>> {
+    let client = Client::new()?;
+    let mut completed = 0;
+    let mut observer = CountFiles(&mut completed);
+    let report = client.download("https://example.org/file.bin")
+        .to_file("file.bin").run_with(&mut observer).await?;
+    assert_eq!(completed, report.completed().len());
+    Ok(())
+}
+```
+
+Events distinguish frozen metadata, byte-work facts, individual publications and the returned run
+outcome. `ProgressFacts` separates logical totals, validated restored bytes and current-attempt work.
+Hash counts are zero when no checks are active. Reaching a length proves neither EOF nor matched
+checks. Reconciled publications emit no invented attempt progress; a file completion can precede an
+aggregate checkpoint failure, so use the returned terminal result to judge the whole run.
+
+Callbacks must return promptly. Drop or callback panic promises no terminal callback, rollback or
+successful pause; submitted physical work retains its ownership until settlement. Names and paths
+need the caller's escaping/redaction policy. Ordinary `run` and `execute` use the same path with a no-op
+observer; the CLI builds its native progress reporting on these events.
+
+### Owned runs
+
+`SavedRun::inspect(path)` is offline and exposes safe member binding keys. Continue with
+`client.resume(saved)` plus one `.input(key, original_input)` per member, then `.run()`. References must
+match frozen intent. Completed files are revalidated by recorded strong content and native identity, not
+by name, size, modification time, or equal foreign bytes. A completion without a strong recorded anchor
+returns `NotRevalidatable` rather than inventing a fingerprint. Weak-only and no-hash policy cannot
+create a recovery fingerprint. Use `.fresh(Fresh)` for deliberately new work; it is not overwrite or
+cleanup. The ordinary `Download` and `Resume` builders separately accept `.restart(Restart)` for a new
+owned receiving attempt and `.overwrite(Overwrite)` for guarded replacement. Neither marker can grant
+reconciliation authority to a no-hash completion or turn a closed attempt back into receiving work.
+`Client::execute(plan)` and the public advanced transfer entrances keep their absent-only defaults.
+
+See [`client::SavedRun`](src/client/saved.rs) for saved-state formats, binding errors and the precise
+revalidation rules.
+
+### Pre-release API migration
+
+`MemberToken` is no longer `Copy`. Borrow its selector text with `as_str`, or make an explicit cheap
+clone when retaining it. Its meaning remains provider-scoped; it is not an occurrence-local `FileId`,
+a credential or proof that remote bytes are immutable.
+
+Ordinary whole-body failures now use `client::SourceError` around the concrete built-in transport
+causes. Code explicitly naming `Failure<HttpError>` or the corresponding live-body failure must use
+the ordinary source-error family instead. Exact-HTTP range-reader errors retain their separate HTTP
+family. Earlier root `Source`, `get`, `from`, `Download`, `Output`, `Report`, `Probe`, `Progress`,
+`ByteRange`, `ByteStream`, `Error` and control-inspection APIs are no longer compiled or exported.
+Use `Client` for remote references and `Transfer` for application-owned bodies or repeatable readers;
+plans and reports belong to those operations. `Checksum` parsing remains available for CLI and caller
+measurement selection. The old engine and test sources remain physically unchanged, excluded from the
+package and automatic test discovery rather than deleted or exposed as a compatibility feature.
+
+Textual `BindingKey` and `RunId` values are versioned workspace correlation, not execution authority.
+A parsed key still needs an inspected matching run and original input binding. Moving a workspace does
+not promise to preserve its identifier. Older records stay readable but may lack a reconstructable
+selection recipe or receiving authority; inspection does not invent either. No active legacy partial
+is migrated, overwritten or imported automatically.
+
+### Advanced transfer entrances
+
+[`Transfer`](src/transfer.rs) is the checked native publication layer used by the common Client. It
+accepts an already-open ordered body, zero or more whole-file requirements, and an optional separate
+measurement. Required checks, clean EOF, settled writes and the declared length precede default
+absent-only publication. Ordinary Client builders expose separate guarded replacement authority; the
+public advanced entrance does not inherit that permission.
+`Transfer::from_reader` supports borrowed repeatable range sessions, and
+`Transfer::from_body` supports checked live output. Deep contracts and runnable examples live with the
+modules:
+
+- [`transfer::reader`](src/transfer/reader.rs) for borrowed range readers and resumed prefixes.
+- [`transfer::live`](src/transfer/live.rs) for released prefixes, receipts and writer settlement.
+- [`tests/transfer.rs`](tests/transfer.rs) for a complete native publication call.
+- [`tests/transfer_live.rs`](tests/transfer_live.rs) for live output and backpressure cases.
+
+These entrances do not add a scheduler, source reopening, automatic cleanup, fsync, or a universal
+filesystem promise. Native publication and local sidecar opening require Unix support.
 
 ## How it works
 
-Chunks are written straight to their offsets in a sparse `<file>.xget`; one verifier reads it back in
-order, hashing the contiguous prefix and gating on the exact length, then it is renamed into place. That
-same `.xget` is the resume control: it records the ranges already written, so a re-run picks up each
-chunk where it stopped and folds the existing bytes into the same verify pass. Before resuming, xget
-checks the resource has not changed (via its `ETag`/`Last-Modified`, or an IPFS CID); if it has, the
-partial is discarded rather than stitched.
+### Common Client
 
-## Differences from libxget-js
+Resolution debits bounded metadata budgets before selection, then freezes each member, its namespace,
+version evidence, requirements and destination. Execution handles files serially. For eligible exact
+HTTP, a range reader follows the contiguous settled-write frontier while bodies run; the verifier does
+not wait for the slowest range before checking earlier bytes. Eligible continuation revalidates a
+recorded strong prefix and fetches only the suffix. Other inputs use ordered whole responses.
 
-xget keeps the shape of the original but changes some behavior on purpose. Verification is structural,
-not a cache you size: where libxget-js buffered chunks in memory (`--cache-size`, `--show-cache`), xget
-writes each chunk straight to its offset and reads the file back once to hash it, trading that for
-unbounded parallelism. Every download is hashed and length-gated, and a source that ignores a range is a
-hard error. Resume is range-based and validated against the resource, rather than blindly appending. And
-there is no `--start-pos` or `--force-append`, because both would produce bytes that cannot be verified
-against the whole-resource checksum. Everything else from libxget-js is here: parallel chunks, retries,
-mirrors, custom headers, and pluggable sources (with S3 and IPFS added).
+The native stage writes private partial data, enforces checks and length, seals the result, and only
+then publishes. Publication is absent-only unless guarded replacement is explicitly requested with `-f`.
+A required-check failure therefore
+leaves no newly published file. The destination's parent must already satisfy the ownership and mode
+rules, except for missing directory roots created during execution.
+
+## Historical harness and media
+
+The retained [fault harness](harness/README.md), GIFs and [`media/download.tape`](media/download.tape)
+describe the retired command surface. They are historical artifacts, not runnable modern CLI examples,
+a current reproducibility recipe or evidence for the current Client path. Do not run the old scenario
+suite or regenerate the recording against the modern executable; no flag-compatibility mode exists.
 
 ## License
 

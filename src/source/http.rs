@@ -108,17 +108,20 @@ impl Source for HttpSource {
 
         match range {
             Some(range) => {
-                // A 200 here means the server ignored the range and is sending the whole body: reject it
-                // rather than splice whole-file bytes into the middle of a chunk.
-                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-                    return Err(Error::RangeNotHonored { requested: range });
-                }
-                let start = response
+                // A matching start alone would accept a shorter or larger window at the right offset.
+                // Validate the entire window and its reported total before the engine scatters any bytes;
+                // the engine still gates the actual streamed length when Content-Length is absent.
+                let served = response
                     .headers()
                     .get(CONTENT_RANGE)
                     .and_then(|value| value.to_str().ok())
-                    .and_then(content_range_start);
-                if start != Some(range.start) {
+                    .and_then(content_range);
+                if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+                    || served != Some(range)
+                    || response
+                        .content_length()
+                        .is_some_and(|length| length != range.len())
+                {
                     return Err(Error::RangeNotHonored { requested: range });
                 }
             }
@@ -138,6 +141,23 @@ impl Source for HttpSource {
                 .map(|chunk| chunk.map_err(Error::transport)),
         ))
     }
+}
+
+/// Parse a satisfied Content-Range into an exclusive byte window. A known total must contain the
+/// entire window; `*` is allowed when a fetch response does not know the complete resource length.
+pub(super) fn content_range(value: &str) -> Option<ByteRange> {
+    let (span, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (_, last) = span.split_once('-')?;
+    let start = content_range_start(value)?;
+    let end = last.trim().parse::<u64>().ok()?.checked_add(1)?;
+    if start >= end {
+        return None;
+    }
+    let total = total.trim();
+    if total != "*" && total.parse::<u64>().ok()? < end {
+        return None;
+    }
+    Some(ByteRange { start, end })
 }
 
 /// Parse the total length from a `Content-Range` value like `bytes 0-0/1234`.

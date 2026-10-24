@@ -1,12 +1,15 @@
-//! The checksum computed over the downloaded bytes.
+//! Algorithm selection for optional checksum measurement, separate from required checks.
 
 use core::fmt;
 use core::str::FromStr;
 
-/// Which checksum to compute over the resource as it streams. `None` skips hashing.
+/// Which optional checksum to measure over the resource as it streams.
+///
+/// This selection does not disable required checks. See [`crate::transfer::Measurement`] for the
+/// transfer policy: hashing is skipped only when measurement is disabled and no checks are required.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Checksum {
-    /// Skip hashing.
+    /// Disable optional measurement; required checks still hash and must match.
     None,
     /// MD5.
     Md5,
@@ -33,50 +36,22 @@ impl Checksum {
             Checksum::Blake3 => "blake3",
         }
     }
-
-    /// A fresh boxed hasher, or `None` for [`Checksum::None`].
-    pub(crate) fn hasher(self) -> Option<Box<dyn Hasher>> {
-        match self {
-            Checksum::None => Option::None,
-            Checksum::Md5 => Some(Box::new(Digest(Box::new(md5::Md5::default())))),
-            Checksum::Sha1 => Some(Box::new(Digest(Box::new(sha1::Sha1::default())))),
-            Checksum::Sha256 => Some(Box::new(Digest(Box::new(sha2::Sha256::default())))),
-            Checksum::Sha512 => Some(Box::new(Digest(Box::new(sha2::Sha512::default())))),
-            Checksum::Blake3 => Some(Box::new(blake3::Hasher::new())),
-        }
-    }
 }
 
-/// A streaming hasher the engine feeds bytes and finalizes to a lowercase hex digest. This abstracts
-/// over the RustCrypto `digest` families and BLAKE3 (whose own API sidesteps a `digest` version clash),
-/// so the engine never names either.
-pub(crate) trait Hasher {
-    /// Fold `bytes` into the running digest.
-    fn update(&mut self, bytes: &[u8]);
-    /// Consume the hasher and return its lowercase hex digest.
-    fn finalize_hex(self: Box<Self>) -> String;
-}
+/// A concrete incremental owner for checked native transfers, preserving conditional Send.
+/// No hasher internals are persisted.
+#[derive(Clone, Default)]
+pub(crate) struct OwnedSha256(sha2::Sha256);
 
-/// Adapts any boxed RustCrypto [`digest::DynDigest`] to [`Hasher`].
-struct Digest(Box<dyn digest::DynDigest>);
-
-impl Hasher for Digest {
-    fn update(&mut self, bytes: &[u8]) {
+impl OwnedSha256 {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        use sha2::Digest as _;
         self.0.update(bytes);
     }
 
-    fn finalize_hex(self: Box<Self>) -> String {
-        hex::encode(self.0.finalize())
-    }
-}
-
-impl Hasher for blake3::Hasher {
-    fn update(&mut self, bytes: &[u8]) {
-        blake3::Hasher::update(self, bytes);
-    }
-
-    fn finalize_hex(self: Box<Self>) -> String {
-        self.finalize().to_hex().to_string()
+    pub(crate) fn finish(self) -> [u8; 32] {
+        use sha2::Digest as _;
+        self.0.finalize().into()
     }
 }
 

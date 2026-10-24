@@ -26,9 +26,13 @@ use xbytes::ByteSize;
 use xbytes::sizes::MEBI_BYTE;
 
 use crate::checksum::Hasher;
-use crate::control::Writer;
+use crate::control::{Control, Writer};
 use crate::plan::{plan_range, plan_resume};
-use crate::{ByteRange, Checksum, Error, Options, Output, Probe, Progress, Source, control};
+use crate::{ByteRange, Checksum, Error, Options, Output, Probe, Progress, Source};
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod engine_tests;
 
 /// Bumped for each temp scratch a `Writer`/`Discard` download needs, so concurrent downloads in one
 /// process never collide on the same `.xget` scratch name.
@@ -134,7 +138,6 @@ async fn scatter_download<S: Source, P: Progress + ?Sized>(
     let writer = if plan.resumed {
         Writer::open(part, probe.length).await?
     } else {
-        allocate_fresh(part, probe.length).await?;
         Writer::create(
             part,
             probe.length,
@@ -317,11 +320,11 @@ async fn resume_plan(
     if !options.resume {
         return Ok(fresh());
     }
-    if let Some(control) = control::read(part).await {
+    if let Some(control) = Control::read(part).await {
         // We wrote this control, so the partial is ours to reason about. Resume it only if it is still
         // the same resource: same length, and a validator that either matches or is absent on one side
         // (nothing to compare, so fall back to the length alone). A changed resource is discarded, not
-        // stitched: the fresh plan's `allocate_fresh` truncates the stale bytes away. We never splice
+        // stitched: `Writer::create` truncates the stale bytes away. We never splice
         // old and new bytes into one file.
         if control.total == total && validators_agree(control.validator.as_deref(), validator) {
             let (ranges, received) = plan_resume(total, options.parts, &control.done);
@@ -364,15 +367,6 @@ async fn file_len(part: &Path) -> u64 {
         .await
         .map(|meta| meta.len())
         .unwrap_or(0)
-}
-
-/// Create `part` and preallocate it to `total` bytes as a sparse file, so every chunk offset exists to
-/// be written. Only for a fresh download: a resume keeps its existing file (data and control trailer)
-/// untouched, since truncating here would strip the trailer.
-async fn allocate_fresh(part: &Path, total: u64) -> Result<(), Error> {
-    let file = File::create(part).await.map_err(Error::transport)?;
-    file.set_len(total).await.map_err(Error::transport)?;
-    Ok(())
 }
 
 /// Fetch `[start, total)` as parallel chunks scattered into `part`, verified continuously. The fetchers

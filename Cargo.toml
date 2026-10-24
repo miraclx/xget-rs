@@ -3,54 +3,113 @@ name = "xget"
 version = "0.1.0"
 authors = ["Miraculous Owonubi <omiraculous@gmail.com>"]
 edition = "2024"
-rust-version = "1.85"
-description = "A chunked, parallel, resumable, verified fetch engine over a pluggable byte source"
+rust-version = "1.97.1"
+description = "Checked fetches, bounded discovery and owned continuation through a common client"
 repository = "https://github.com/miraclx/xget-rs"
 license = "MIT OR Apache-2.0"
 keywords = ["download", "http", "range", "resume", "parallel"]
 categories = ["network-programming", "asynchronous"]
+# cli/Cargo.toml owns binary targets. Preserved provisional files under src/bin must not reappear as a
+# second executable through Cargo's automatic discovery.
+autobins = false
+# Old integration sources remain intact but are not compiled as product test targets.
+autotests = false
+# Private review/harness material and the separately packaged CLI do not belong in the library.
+# Retired engine sources stay physically intact pending cleanup, not compiled or packaged as a mode.
+exclude = [
+    "notes",
+    "harness",
+    "AGENTS.md",
+    ".claude",
+    "src/bin",
+    "cli",
+    "src/builder.rs",
+    "src/control.rs",
+    "src/control_tests.rs",
+    "src/engine.rs",
+    "src/engine_tests.rs",
+    "src/plan.rs",
+    "src/plan_tests.rs",
+    "src/source.rs",
+    "src/source/**",
+    "tests/engine.rs",
+    "tests/http_source.rs",
+]
+
+[workspace]
+# The root package is the reusable library; `cli` is the consumer that owns the `xget` executable.
+members = [".", "cli"]
+default-members = [".", "cli"]
+resolver = "3"
 
 [features]
-s3 = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sdk-s3", "dep:aws-smithy-types", "dep:tokio-util"]
-ipfs = ["dep:cid"]
+s3 = [
+    "dep:aws-config",
+    "dep:aws-credential-types",
+    "dep:aws-sdk-s3",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+    "dep:http-body-04",
+    "dep:tokio-util",
+]
+github = ["dep:serde", "dep:serde_json"]
+ipfs = []
+swisstransfer = ["dep:scraper", "dep:serde", "dep:serde_json", "dep:time"]
+webdav = ["dep:roxmltree"]
 aws-credential-types = ["dep:aws-credential-types"]
 aws-smithy-types = ["dep:aws-smithy-types"]
 
 [dependencies]
-anstyle = "1"
 aws-config = { version = "1.8", optional = true }
 aws-credential-types = { version = "1.2.10", optional = true }
 aws-sdk-s3 = { version = "1.96", optional = true }
-aws-smithy-types = { version = "1.3.4", optional = true }
+# Bound metadata response bodies before the real SDK collector and deserializer.
+aws-smithy-runtime-api = { version = "1.9.2", optional = true, features = ["client"] }
+aws-smithy-types = { version = "1.3.4", optional = true, features = ["http-body-0-4-x"] }
 blake3 = "1.8.7"
 bytes = "1"
-cid = { version = "0.11", optional = true }
-clap = { version = "4", features = ["derive"] }
+# Offline saved-member inspection validates content addresses without enabling IPFS transport.
+cid = "0.11"
 digest = "0.10"
-dotenvy = "0.15.7"
-eyre = "0.6"
 futures = "0.3"
 hex = "0.4"
+# Wrap the SDK response body without replacing its XML parser or transport.
+http-body-04 = { package = "http-body", version = "0.4.6", optional = true }
 md-5 = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# Decode remote filename hints without treating their spelling as a local path.
+percent-encoding = "2"
+# The ordinary Client explicitly disables the retry policy introduced in this release.
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+# Namespace-aware bounded DAV multistatus parsing without external entities.
+roxmltree = { version = "0.21", optional = true }
+# Parse the bounded service HTML bootstrap without string-based HTML heuristics.
+scraper = { version = "0.24", optional = true }
+# Typed external metadata stays separate from internal and stored representations.
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_json = { version = "1", optional = true }
 sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+# Validate bounded signature dates and lifetimes; fixtures also format those dates.
+time = { version = "0.3", optional = true, features = ["formatting", "macros", "parsing"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", optional = true, features = ["io"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "ansi", "env-filter"] }
+# Conservative output collision checks compare Unicode normalization and full case folding.
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+# Parse access references separately from local output paths.
+url = "2"
 
-# Sibling crates from the same rewrite effort. Git dependencies so the crate builds standalone (and in
-# CI); a gitignored .cargo/config.toml overrides these with the neighbouring working copies for local
-# co-development, so edits across the three repos are picked up without a push.
+# Sibling crate from the same rewrite effort. Git dependency so the crate builds standalone (and in CI);
+# a gitignored .cargo/config.toml overrides it with the neighbouring working copy for local
+# co-development, so edits across the repos are picked up without a push.
 xbytes = { git = "https://github.com/miraclx/xbytes-rs" }
-xprogress = { git = "https://github.com/miraclx/xprogress-rs" }
+# Wipe retained access-reference and validator allocations when their owners are dropped.
+zeroize = "1"
 
-# Only for the startup sweep of orphaned temp scratches: a process-liveness check so a partial left by a
-# since-dead process is cleaned up while a live download's scratch is never touched. Unix uses
-# `kill(pid, 0)`; Windows uses `OpenProcess`. These target sections must come after all [dependencies]
-# entries above, or a following key would be parsed into the target table instead of [dependencies].
+# Unix native ownership, leases and descriptor-relative publication use libc directly. Keep target
+# sections after all shared dependencies so following entries do not inherit the target table.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -58,11 +117,26 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
-# An in-process mock HTTP server for the HttpSource integration tests: it lets a test answer a range
-# request with a real 206 and Content-Range (or deliberately ignore the range) so the source's own
-# validation is exercised over a real loopback socket, with no live network. The engine's own paths
-# are covered by a fake Source and need no server.
+# Cancellation and bounded loopback HTTP fixtures choose their own runtime and sockets.
+tokio = { version = "1", features = ["net", "rt-multi-thread"] }
+# Exercise common Client discovery, checked payloads and frozen continuation over real loopback HTTP.
 wiremock = "0.6"
+
+[[test]]
+name = "client_saved"
+path = "tests/client_saved.rs"
+
+[[test]]
+name = "transfer"
+path = "tests/transfer.rs"
+
+[[test]]
+name = "transfer_live"
+path = "tests/transfer_live.rs"
+
+[[test]]
+name = "transfer_reader"
+path = "tests/transfer_reader.rs"
 
 [lints.rust]
 unused_must_use = "deny"

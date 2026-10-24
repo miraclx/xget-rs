@@ -80,7 +80,7 @@ impl Source for S3Source {
         let length = head
             .content_length()
             .and_then(|value| u64::try_from(value).ok())
-            .ok_or_else(|| Error::detail("HeadObject response has no content length"))?;
+            .ok_or_else(|| Error::detail("s3 head object response has no content length"))?;
         let supports_ranges = head
             .accept_ranges()
             .is_some_and(|value| value.eq_ignore_ascii_case("bytes"));
@@ -168,3 +168,7 @@ fn stored_checksum(
     }
     None
 }
+
+#[cfg(test)]
+#[path = "s3_tests.rs"]
+mod s3_tests;

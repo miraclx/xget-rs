@@ -6,6 +6,7 @@
 //! answers `200` to a range request must be rejected as [`Error::RangeNotHonored`]. No live network is
 //! touched.
 
+use futures::StreamExt as _;
 use sha2::{Digest as _, Sha256};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -115,6 +116,63 @@ async fn a_clean_parallel_http_download_verifies_to_the_right_hash() {
         "every ranged chunk landed at its offset"
     );
     let _ = std::fs::remove_file(&dir);
+}
+
+#[tokio::test]
+async fn a_range_with_the_right_start_but_the_wrong_window_or_total_is_rejected() {
+    for (header, length) in [
+        ("bytes 100-198/1000", 100),
+        ("bytes 100-200/1000", 100),
+        ("bytes 100-199/199", 100),
+        ("bytes 100-199/1000", 99),
+        ("bytes 100-199/not-a-total", 100),
+        ("bytes 100-99/1000", 100),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", header)
+                    .set_body_bytes(sample_body(length)),
+            )
+            .mount(&server)
+            .await;
+        let range = xget::ByteRange {
+            start: 100,
+            end: 200,
+        };
+        match source(&server).fetch(Some(range)).await {
+            Err(Error::RangeNotHonored { requested }) => assert_eq!(requested, range),
+            Err(error) => panic!("expected RangeNotHonored for {header}, got {error:?}"),
+            Ok(_) => panic!("invalid range metadata was accepted: {header}, length {length}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_matching_range_with_an_unknown_total_still_delivers_its_bytes() {
+    let body = sample_body(100);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 100-199/*")
+                .set_body_bytes(Vec::clone(&body)),
+        )
+        .mount(&server)
+        .await;
+    let mut stream = source(&server)
+        .fetch(Some(xget::ByteRange {
+            start: 100,
+            end: 200,
+        }))
+        .await
+        .unwrap_or_else(|error| panic!("a valid window is accepted: {error:?}"));
+    let mut received = Vec::new();
+    while let Some(bytes) = stream.next().await {
+        received.extend_from_slice(&bytes.expect("readable body"));
+    }
+    assert_eq!(received, body);
 }
 
 #[tokio::test]

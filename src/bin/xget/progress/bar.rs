@@ -8,7 +8,7 @@ use xget::Progress;
 use xprogress::{AnsiColor, Bar, DrawTarget, Style};
 
 use super::{DIM, Meter};
-use crate::{fmt_size, fmt_speed};
+use crate::DisplayFormat;
 
 /// The bar takes at most this fraction of the terminal width, so it scales with the screen instead of
 /// stretching across it. Capped by [`BAR_MAX`] and floored so it never vanishes.
@@ -37,8 +37,7 @@ const YELLOW: anstyle::Style = anstyle::Style::new()
 /// shaded gap between them is the buffered-ahead window. Drawn in place and throttled.
 pub(crate) struct BarProgress {
     inner: RefCell<Option<Live>>,
-    raw: bool,
-    bits: bool,
+    format: DisplayFormat,
 }
 
 struct Live {
@@ -51,10 +50,7 @@ struct Live {
     multi: bool,
     prev_lines: usize,
     meter: Meter,
-    raw: bool,
-    /// Render the speed in bits per second (`--bits`) rather than the default bytes per second. A pure
-    /// render-site concern, so it rides alongside `raw` here rather than in the meter.
-    bits: bool,
+    format: DisplayFormat,
     /// The chunk count, for a retry line's `chunk N/total`.
     chunks: usize,
     /// Whether the terminal renders unicode, so a retry line's marker and separators match the bar.
@@ -66,11 +62,10 @@ struct Live {
 }
 
 impl BarProgress {
-    pub(super) fn new(raw: bool, bits: bool) -> Self {
+    pub(super) fn new(format: DisplayFormat) -> Self {
         Self {
             inner: RefCell::new(None),
-            raw,
-            bits,
+            format,
         }
     }
 }
@@ -102,7 +97,8 @@ impl Progress for BarProgress {
             .with_blank_color(AnsiColor::BrightBlack);
         let total: u64 = chunks.iter().sum();
         let bar = Bar::new(chunks.iter().copied()).with_style(style);
-        let target = DrawTarget::from_env();
+        // A library demo override must never redirect progress into xget's payload stream.
+        let target = DrawTarget::stderr();
         // Fill the space beside the stats, but never past a fraction of the screen, so the bar scales
         // with the terminal up to a cap and only shrinks past that when the stats would clip.
         let columns = target.columns().unwrap_or(80);
@@ -117,8 +113,7 @@ impl Progress for BarProgress {
             multi,
             prev_lines: 0,
             meter: Meter::new(total),
-            raw: self.raw,
-            bits: self.bits,
+            format: self.format,
             chunks: chunks.len(),
             unicode,
             notices: Vec::new(),
@@ -201,7 +196,7 @@ fn retry_line(
 ) -> String {
     let marker = if live.unicode { '▸' } else { '>' };
     let sep = if live.unicode { '·' } else { '-' };
-    let size = fmt_size(resume_from, live.raw);
+    let size = live.format.size(resume_from);
     let chunks = live.chunks;
     let chunk = index + 1;
     format!(
@@ -241,17 +236,16 @@ fn frame(live: &mut Live) -> String {
 /// single aggregate bar. The readout (percent, speed, eta, sizes) is written here; the `xprogress`
 /// crate only renders the bars.
 fn bar_frame(live: &mut Live) -> String {
-    let raw = live.raw;
-    let bits = live.bits;
+    let format = live.format;
     // Read the meter behind a scoped `&mut` borrow: `rate`/`eta` now age the window to now, so they
     // mutate. The borrow is confined to this block so the bar fields below can be read afterward.
     let (rate, size) = {
         let meter = &mut live.meter;
         let pct = meter.percent();
-        let speed = fmt_speed(meter.rate(), raw, bits);
+        let speed = format.speed(meter.rate());
         let eta = format_eta(meter.eta());
-        let done = fmt_size(meter.done, raw);
-        let total = fmt_size(meter.total, raw);
+        let done = format.size(meter.done);
+        let total = format.size(meter.total);
         let rate = format!(
             "{}{pct:>3}%{}  {}{speed}{}  {}{eta}{}",
             GREEN.render(),

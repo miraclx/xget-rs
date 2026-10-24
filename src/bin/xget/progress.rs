@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use xget::Progress;
 
-use crate::ProgressMode;
+use crate::{DisplayFormat, ProgressMode};
 
 mod bar;
 mod json;
@@ -28,10 +28,10 @@ pub(crate) const DIM: anstyle::Style = anstyle::Style::new().dimmed();
 pub(crate) struct Reporter(Box<dyn Progress>);
 
 impl Reporter {
-    pub(crate) fn new(mode: ProgressMode, raw: bool, bits: bool) -> Self {
+    pub(crate) fn new(mode: ProgressMode, format: DisplayFormat) -> Self {
         Reporter(match mode {
-            ProgressMode::Bar | ProgressMode::Auto => Box::new(BarProgress::new(raw, bits)),
-            ProgressMode::Plain => Box::new(PlainProgress::new(raw, bits)),
+            ProgressMode::Bar | ProgressMode::Auto => Box::new(BarProgress::new(format)),
+            ProgressMode::Plain => Box::new(PlainProgress::new(format)),
             ProgressMode::Json => Box::new(JsonProgress::new()),
             // The crate's no-op reporter: renders nothing.
             ProgressMode::None => Box::new(()),

@@ -9,7 +9,9 @@ use super::Meter;
 
 /// One JSON event per update, to stderr: throttled `progress` events, a `retry` on a dropped chunk, and
 /// a final `end`; `main` adds a `verified` event with the checksum. Byte counts are raw so a consumer can
-/// format them itself; `done` is the cumulative confirmed bytes, `total` the resource length.
+/// format them itself; `done` is the cumulative downloaded bytes, `total` the resource length.
+/// `speed` is bytes per second, `eta` is seconds, and `end.elapsed` is milliseconds. Human display
+/// flags (`--bits`, `--raw-sizes`) never change these machine-readable units.
 pub(crate) struct JsonProgress {
     meter: RefCell<Option<Meter>>,
 }

@@ -707,15 +707,10 @@ impl Client {
             } = planned;
             match owned.previous(index).await {
                 Ok(Some(receipt)) => {
-                    let version = if file.selected.description.etag.is_some() {
-                        VersionConsistency::StrongEtagMatched
-                    } else {
-                        VersionConsistency::Unpinned
-                    };
                     report.completed.push(PublishedFile {
                         file,
                         destination,
-                        version,
+                        version: VersionConsistency::LocallyRevalidated,
                         receipt: PublicationReceipt::Whole(receipt),
                     });
                     observer.observe(Event::FileCompleted {
@@ -1556,7 +1551,7 @@ impl fmt::Debug for PlannedFile {
     }
 }
 
-/// Observed response version consistency, not authenticity or a content hash.
+/// Response version consistency or local publication revalidation, not authenticity or a content hash.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VersionConsistency {
     /// The first actual provider response established a strong pin before body/native effects.
@@ -1566,6 +1561,10 @@ pub enum VersionConsistency {
     /// Conditional GET and its returned strong ETag agreed with the frozen pin, whether that pin
     /// came from HEAD metadata or an earlier actual provider response.
     StrongEtagMatched,
+    /// An existing publication's recorded strong content anchor and filesystem identity were
+    /// revalidated locally. No current response was opened and no remote version check was performed.
+    /// Historical source version evidence remains available through [`File::version`].
+    LocallyRevalidated,
 }
 
 /// Completed files only. A run failure retains this report plus the failing file's native state.
@@ -1641,7 +1640,8 @@ impl PublishedFile {
         }
     }
 
-    /// GET consistency, independent of matched requirements and measured hashes.
+    /// Response version consistency or local revalidation, independent of matched requirements
+    /// and measured hashes. Local revalidation does not check current remote freshness.
     pub fn version(&self) -> VersionConsistency {
         self.version
     }

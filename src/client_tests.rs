@@ -225,7 +225,6 @@ async fn no_inputs_is_not_a_genuine_complete_empty_inventory() {
 async fn unsupported_providers_and_trees_fail_without_fake_inventory_success() {
     let client = Client::new().expect("client");
     for input in [
-        Input::parse("ipfs://bafyexample/path").expect("ipfs intent"),
         #[cfg(not(feature = "swisstransfer"))]
         Input::parse("https://swisstransfer.com/dl/aaaaaaaa-1111-2222-3333-444444444444")
             .expect("share intent"),
@@ -235,7 +234,7 @@ async fn unsupported_providers_and_trees_fail_without_fake_inventory_success() {
         Input::tree("https://example.test/dav/").expect("tree intent"),
     ] {
         assert!(matches!(
-            client.resolve(input).await,
+            client.resolve::<Input>(input).await,
             Err(Error::UnsupportedInput { .. })
         ));
     }
@@ -2388,4 +2387,14 @@ async fn renewed_access_headers_bind_frozen_work_without_repeating_discovery() {
                 .any(|bytes| bytes == secret.as_bytes())
         );
     }
+}
+
+#[cfg(not(feature = "ipfs"))]
+#[tokio::test]
+async fn ipfs_transport_disabled_is_a_capability_error_not_an_http_fallback() {
+    let client = Client::new().expect("client");
+    assert!(matches!(
+        client.resolve("ipfs://bafyexample/path").await,
+        Err(Error::IpfsUnavailable)
+    ));
 }

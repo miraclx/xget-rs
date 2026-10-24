@@ -67,6 +67,8 @@ mod builtin;
 #[cfg(feature = "github")]
 mod github;
 mod http;
+#[cfg(feature = "ipfs")]
+mod ipfs;
 mod layout;
 mod live;
 mod observation;
@@ -86,6 +88,10 @@ use github::Github;
 pub use github::GithubError;
 use http::Http;
 pub use http::{HttpError, HttpErrorKind, RequestStage};
+#[cfg(feature = "ipfs")]
+use ipfs::Ipfs;
+#[cfg(feature = "ipfs")]
+pub use ipfs::IpfsError;
 pub use live::{CheckedBody, LiveReceipt, OpenedFile};
 use observation::FileProgress;
 pub use observation::{Event, Observer, ProgressFacts};
@@ -344,8 +350,10 @@ impl Client {
                 .as_ref()
                 .is_some_and(|selection| selection.is_configured())
             {
-                if matches!(file.input.kind(), InputKind::Http | InputKind::S3)
-                    && file.input.scope() == InputScope::Exact
+                if matches!(
+                    file.input.kind(),
+                    InputKind::Http | InputKind::S3 | InputKind::Ipfs
+                ) && file.input.scope() == InputScope::Exact
                 {
                     // Exact remote ancestors are routing data, not local destination components.
                     if !crate::selection::Selection::path_is_bounded(file.source_path()) {
@@ -423,6 +431,11 @@ impl Client {
                 .await
                 .map(Into::into);
         }
+        #[cfg(feature = "ipfs")]
+        if input.kind() == InputKind::Ipfs {
+            let ipfs = self.http.ipfs.as_ref().ok_or(Error::IpfsUnavailable)?;
+            return ipfs.resolve(&self.http, input, budget).await;
+        }
         if input.kind() == InputKind::S3 {
             #[cfg(feature = "s3")]
             {
@@ -449,6 +462,13 @@ impl Client {
     }
 
     fn capability(&self, input: &Input) -> Result<(), Error> {
+        if input.kind() == InputKind::Ipfs {
+            #[cfg(feature = "ipfs")]
+            if self.http.ipfs.is_some() {
+                return Ok(());
+            }
+            return Err(Error::IpfsUnavailable);
+        }
         if input.kind() != InputKind::S3 {
             return Ok(());
         }
@@ -464,7 +484,7 @@ impl Client {
         if input.kind() == InputKind::GithubRelease && input.scope() == InputScope::Catalogue {
             return Ok(());
         }
-        if input.kind() == InputKind::S3 {
+        if matches!(input.kind(), InputKind::S3 | InputKind::Ipfs) {
             return Ok(());
         }
         #[cfg(feature = "swisstransfer")]
@@ -509,6 +529,17 @@ impl Client {
         #[cfg(feature = "github")]
         if file.input.kind() == InputKind::GithubRelease {
             return Github::open(&self.http, file).await.map(Into::into);
+        }
+        #[cfg(feature = "ipfs")]
+        if file.input.kind() == InputKind::Ipfs {
+            return self
+                .http
+                .ipfs
+                .as_ref()
+                .ok_or(Error::IpfsUnavailable)?
+                .open(&self.http, file)
+                .await
+                .map(Into::into);
         }
         if file.input.kind() == InputKind::S3 {
             #[cfg(feature = "s3")]
@@ -1026,6 +1057,8 @@ pub struct ClientBuilder {
     max_requests: NonZeroUsize,
     #[cfg(feature = "s3")]
     s3: Option<S3>,
+    #[cfg(feature = "ipfs")]
+    ipfs: Option<Ipfs>,
 }
 
 impl Default for ClientBuilder {
@@ -1034,6 +1067,8 @@ impl Default for ClientBuilder {
             max_requests: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
             #[cfg(feature = "s3")]
             s3: None,
+            #[cfg(feature = "ipfs")]
+            ipfs: None,
         }
     }
 }
@@ -1067,13 +1102,30 @@ impl ClientBuilder {
         self
     }
 
+    /// Sets the exact-IPFS HTTP gateway without reading environment or local daemon configuration.
+    /// Gateway access is independent of content identity. Redirects and IPFS tree traversal are not
+    /// enabled; raw CID requirements remain mandatory even with measurement disabled.
+    #[cfg(feature = "ipfs")]
+    pub fn ipfs_gateway(mut self, gateway: &str) -> Result<Self, IpfsError> {
+        self.ipfs = Some(Ipfs::new(gateway)?);
+        Ok(self)
+    }
+
     /// Builds reusable transports without network or filesystem effects.
     pub fn build(self) -> Result<Client, Error> {
-        #[allow(unused_mut)] // The optional SDK is installed only when its capability is compiled.
+        #[allow(unused_mut)] // Optional source configuration is installed only with its capability.
         let mut http = Http::new(self.max_requests)?;
         #[cfg(feature = "s3")]
         {
             http.s3 = self.s3.map(Arc::new);
+        }
+        #[cfg(feature = "ipfs")]
+        {
+            let gateway = match self.ipfs {
+                Some(gateway) => gateway,
+                None => Ipfs::default_gateway()?,
+            };
+            http.ipfs = Some(Arc::new(gateway));
         }
         Ok(Client {
             http: Arc::new(http),
@@ -1631,6 +1683,13 @@ impl RunFailure {
 /// Built-in errors expose only safe typed context, never a bearer reference or unsafe remote name.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Exact IPFS gateway acquisition requires its compiled capability and configured transport.
+    #[error("ipfs capability unavailable; enable ipfs and configure an http gateway")]
+    IpfsUnavailable,
+    /// Gateway/CID failures retain safe typed categories rather than access references.
+    #[cfg(feature = "ipfs")]
+    #[error("ipfs acquisition failed; inspect the typed identity or gateway category")]
+    Ipfs(#[from] IpfsError),
     /// Per-input access headers were invalid or crossed their original authority.
     #[error("request header configuration failed; correct the input access headers")]
     RequestHeader(#[from] crate::input::HeaderError),

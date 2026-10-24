@@ -586,6 +586,9 @@ impl Fingerprint {
                 },
             );
         }
+        if input.kind() == crate::input::InputKind::Ipfs {
+            Self::field(&mut hash, b"ipfs exact content path 1");
+        }
         if input.kind() == crate::input::InputKind::Http && input.scope() == InputScope::Tree {
             Self::field(&mut hash, b"webdav tree scope 1");
         }
@@ -661,6 +664,8 @@ impl Fingerprint {
                         b"webdav scoped href 1"
                     } else if token.is_github() {
                         b"github asset id 1"
+                    } else if token.is_ipfs() {
+                        b"ipfs cid member path 1"
                     } else {
                         b"swiss member token 1"
                     },
@@ -769,6 +774,7 @@ struct FrozenIntent {
 impl FrozenIntent {
     fn capture(input: &Input) -> Result<Option<Self>, SavedError> {
         if input.kind() != crate::input::InputKind::S3
+            && input.kind() != crate::input::InputKind::Ipfs
             && input.kind() != crate::input::InputKind::GithubRelease
             && input.scope() != InputScope::Tree
             && input.namespace().is_none()
@@ -847,6 +853,9 @@ impl Member {
         }
         let provider_matches = match &self.remote {
             Some(remote) if remote.token.is_s3() => input.kind() == crate::input::InputKind::S3,
+            Some(remote) if remote.token.is_ipfs() => {
+                input.kind() == crate::input::InputKind::Ipfs && input.scope() == InputScope::Exact
+            }
             Some(remote) if remote.token.is_github() => {
                 input.kind() == crate::input::InputKind::GithubRelease
                     && input.scope() == InputScope::Catalogue
@@ -1009,11 +1018,9 @@ impl Owned {
         if member.remote.is_none() {
             return Ok(());
         }
-        if member
-            .remote
-            .as_ref()
-            .is_some_and(|remote| remote.token.is_webdav() || remote.token.is_github())
-        {
+        if member.remote.as_ref().is_some_and(|remote| {
+            remote.token.is_webdav() || remote.token.is_github() || remote.token.is_ipfs()
+        }) {
             // DAV and release assets do not invent first-open snapshot evidence. GitHub API
             // revision facts remain separate from HTTP pins; source checks are already frozen.
             // A discovered DAV strong pin is frozen before any native submission.

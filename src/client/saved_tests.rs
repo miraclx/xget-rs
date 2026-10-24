@@ -2337,3 +2337,87 @@ async fn overwrite_never_grants_intra_run_duplicate_or_hardlinked_target_authori
         assert_eq!(fs::read(root.path().join("b")).unwrap(), b"sentinel");
     }
 }
+
+#[test]
+fn ipfs_v4_identity_and_source_policy_decode_without_gateway_transport() {
+    use cid::Cid;
+    use cid::multihash::Multihash;
+    use zeroize::Zeroizing;
+
+    use crate::input::{Input, InputOccurrence, MemberToken};
+    use crate::transfer::{ByteCount, Length, Provenance};
+
+    let hash =
+        hex::decode("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad").unwrap();
+    let raw = Cid::new_v1(0x55, Multihash::<64>::wrap(0x12, &hash).unwrap());
+    let dag = Cid::new_v1(0x70, Multihash::<64>::wrap(0x12, &hash).unwrap());
+    for spelling in [raw.to_string(), format!("{dag}/a:b/file.txt")] {
+        let token = MemberToken::ipfs(&spelling).unwrap();
+        let identity = token.ipfs_identity().unwrap();
+        let expected = identity.required();
+        let source_path = Zeroizing::new(identity.source_path().to_owned());
+        let input = Input::parse(&format!("ipfs://{spelling}")).unwrap();
+        let mut requirements = crate::checks::Requirements::default();
+        if let Some(expected) = expected {
+            requirements.insert(expected, Provenance::Source).unwrap();
+        }
+        let root = super::RootIdentity {
+            device: super::RootDevice(1),
+            inode: super::RootInode(2),
+        };
+        let mut record = super::Record {
+            version: 4,
+            root: PathBuf::from("/owned"),
+            identity: root,
+            store_identity: root,
+            workspace_identity: root,
+            request: None,
+            complete: false,
+            members: vec![super::Member {
+                occurrence: InputOccurrence(0),
+                intent: super::FrozenIntent::capture(&input).unwrap(),
+                remote: Some(super::FrozenMember {
+                    token,
+                    source_path,
+                    s3_version: None,
+                    github: None,
+                }),
+                binding: Fingerprint::reference(&input),
+                destination: PathBuf::from("/owned/file.txt"),
+                length: Length::Known(ByteCount(3)),
+                etag: None,
+                requirements,
+                measurement: Measurement::None,
+                mode: crate::client::range::Mode::Whole,
+                attempts: Vec::new(),
+            }],
+        };
+        let bytes = codec::encode(&record).unwrap();
+        let decoded = codec::decode(&bytes).unwrap();
+        assert_eq!(codec::encode(&decoded).unwrap(), bytes);
+        assert_eq!(
+            decoded.members[0].remote.as_ref().unwrap().token.as_str(),
+            spelling
+        );
+        assert_eq!(
+            decoded.members[0].requirements.iter().count(),
+            usize::from(expected.is_some())
+        );
+        assert!(!bytes.windows(b"http".len()).any(|part| part == b"http"));
+        assert!(
+            decoded.members[0]
+                .intent
+                .as_ref()
+                .unwrap()
+                .input(&format!("ipfs://{spelling}"), decoded.members[0].binding)
+                .is_ok()
+        );
+        record.members[0].mode = crate::client::range::Mode::Ranges;
+        assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
+        record.members[0].mode = crate::client::range::Mode::Whole;
+        if expected.is_some() {
+            record.members[0].requirements = crate::checks::Requirements::default();
+            assert!(matches!(codec::encode(&record), Err(SavedError::Corrupt)));
+        }
+    }
+}

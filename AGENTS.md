@@ -29,10 +29,15 @@
 - No `mod.rs`. Unit tests stay in sibling `*_tests.rs` files. Private child tests use `#[path]`; do not
   widen production visibility or move their declarations to the crate root just for access.
 
-The existing `Source`, `get`, `from`, `Download`, `Output` and `Report` library APIs remain available.
-`Source` uses native async trait methods and is not object-safe; source futures need not be Send.
-The modern CLI uses the common Client, not those earlier engine APIs. Their retirement is a separate
-prefix; do not delete, move or empty protected old files.
+The compiled library exposes the common Client and advanced Transfer entrances, plus Input,
+Inventory/File, SavedRun and Checksum parsing. Earlier root Source/get/from/Download/Output/Report,
+Probe/Progress/ByteRange/ByteStream/Error families and old control helpers are no longer compiled or
+exported. The corresponding engine/source/control/builder/plan files and their old tests remain
+physically unchanged and package-excluded pending cleanup. Cargo disables automatic integration-test
+discovery and enumerates only client_saved, transfer, transfer_live and transfer_reader.
+Do not delete, move, rename or empty retained files, or reintroduce them through a legacy feature/shim.
+Modern native V1/V2/V3/V4 readers remain compiled and packaged; they are not the retired XGETCTL1 engine.
+Native publication requires Unix support. Whole portable-engine Wasm support has not been established.
 
 ## Two dependency graphs
 
@@ -66,32 +71,6 @@ and provisional provider tree from the library package.
 Rust 1.97.1 is the exercised support baseline. The previous advertised 1.85 was not proven. Do not
 claim a lower MSRV without the corresponding toolchain/dependency/feature validation.
 
-## Earlier root engine invariants
-
-These still-compiled library APIs and their archived CLI sources are separate from the modern CLI.
-The old CLI spellings below describe only that archived interface, not current commands.
-
-**Verify as bytes arrive.** The in-order verifier runs alongside fetchers on one task, chasing a
-contiguous frontier. Received progress is not verified progress. The Barrier/Notify regression in
-`tests/engine.rs` forces tails before a partial head and verifies that head before its body can finish.
-Do not replace this with a hash pass that starts only after the slowest chunk completes.
-
-**The partial is not the finished file.** `<output>.xget` contains data, a text trailer and a 32-byte
-`XGETCTL1` footer. `Writer::finish` removes trailer/footer before rename. Fresh allocation and truncation
-belong to `Writer::create`, before control writing; `Writer::open` preserves resumed data and control.
-
-**Resume is automatic.** `--restart` opts out. When both validators exist they must agree; when either
-is missing, legacy resume falls back to length and cannot detect a same-length change. Five unit cases
-pin that policy. Do not import this fallback into stronger new version/identity guarantees.
-
-**No fsync.** Flushing covers process interruption, not power-loss durability. Do not invent a stronger
-crash guarantee. The subtractive over-serve check, `len > range.end - offset`, avoids integer wrap; do
-not replace it with a comparison that admits a wrapped offset.
-
-**Scratch ownership.** Temporary stdout/pipe/discard scratches are `xget-<pid>-<counter>.xget` and are
-removed by their guard. Startup sweeping only targets that temporary naming pattern with dead PIDs.
-Persistent file partials must never be swept. Test actual CLI runs with their own empty cwd/TMPDIR.
-
 ## Advanced native-file invariants
 
 Body-based `Transfer` is the native layer used by the ordinary Client and modern CLI. Same-algorithm requirement
@@ -113,7 +92,8 @@ are never unlinked. Release notification follows guard cleanup.
 Reconciliation requires recorded strong content and inode/device evidence; equal foreign bytes are
 not adopted, and absent destinations are not republished. Matching identities without a strong recorded
 anchor return NotRevalidatable, with no hidden fingerprint. MD5/SHA-1 are compatibility checks, not
-strong guards. Bounded V2 one-shot and V3 reader records preserve the V1 reader; legacy XGETCTL1 is unchanged.
+strong guards. Bounded V1/V2 one-shot, V3 reader and V4 authority records retain their readers; retired
+XGETCTL1 files are not imported or altered.
 Keep publication uncertainty and unconfirmed write extents
 explicit. No one-shot source reopening, automatic cleanup, fsync or universal filesystem promise exists.
 Unix hardlink support, a caller-owned Tokio runtime and a suitable existing caller-owned parent are
@@ -206,7 +186,7 @@ exclusion-only scopes create no output. Nonempty slash payloads require exact ac
 explicit safe filename. Whole discovery is charged before both literal and path selection; the public
 metadata receipt retains that full charge. MemberToken is compact and non-Copy, with explicit shared
 zeroizing S3 key ownership and canonical Swiss UUID spelling. Ordinary whole-body errors now use
-SourceError; HTTP range and legacy Source/get/from/Download/Output/Report contracts remain separate.
+SourceError; HTTP range errors retain their separate concrete family.
 
 V4 aggregate records preserve genuine S3 key/version evidence and optional nonsecret binding intent:
 scope, namespace, ordered patterns and an original-reference-only fingerprint, never raw references
@@ -262,13 +242,12 @@ selection through input-local intent, with its selection conveniences restricted
 
 ## Transport scope
 
-HTTP validates the full requested response window and declared length. The legacy S3 Source policy
-instead trusts a matching Content-Range start, otherwise matching response length; the engine checks final
-chunk completion. The seven actual SDK loopback tests pin that limited policy, not strict HTTP parity
-or version continuity. Their client uses explicit fixture credentials/region/endpoint without ambient
-AWS configuration or metadata discovery. Do not substitute a handwritten response struct for SDK I/O.
+HTTP validates the full requested response window and declared length. Common S3 uses conditional
+ordered whole-object responses, not the retired S3 Source's partial-range policy. Real SDK loopback
+fixtures supply explicit credentials/region/endpoints without ambient AWS discovery; do not replace
+SDK I/O with a handwritten response struct or claim partial-byte S3 recovery.
 
-`s3` and `ipfs` gate library sources; the CLI forwards those capabilities. The root's vestigial
+`s3` and `ipfs` gate common Client adapters; the CLI forwards those capabilities. The root's vestigial
 aws-credential-types/aws-smithy-types feature aliases do not independently enable S3 code. SwissTransfer is a separate optional library
 adapter; the modern CLI forwards it along with WebDAV and GitHub. Exact IPFS uses the common
 gateway adapter, not the older IPFS Source.
@@ -326,6 +305,7 @@ API craft co-reviews contract accuracy.
 Slice reviews do not substitute for that final review. Fix findings, rerun gates and re-review before
 final acceptance. They are maintainer-inspired lenses, not endorsements by the named maintainers.
 
-Existing GIFs are historical, not new runtime evidence. Only media/download.tape is currently recorded
-as reproducible. Do not ship new media without its tape and inspected frames. Errors remain lowercase,
-without trailing punctuation, and should tell the user what to do next.
+Existing GIFs and media/download.tape are historical, not current runtime or reproducibility evidence.
+Do not regenerate the retained tape against the modern CLI. Do not ship new media without its tape and
+inspected frames. Errors remain lowercase, without trailing punctuation, and should tell the user what
+to do next.

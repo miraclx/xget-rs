@@ -10,7 +10,13 @@ description = "Command-line interface for the xget fetch engine"
 repository = "https://github.com/miraclx/xget-rs"
 license = "MIT OR Apache-2.0"
 # Archived sources stay physically intact but are neither compiled nor shipped in the CLI package.
-exclude = ["src/legacy.rs", "src/expect.rs", "src/main_tests.rs", "src/progress.rs", "src/progress/**"]
+exclude = [
+    "src/legacy.rs",
+    "src/expect.rs",
+    "src/main_tests.rs",
+    "src/progress.rs",
+    "src/progress/**",
+]
 
 # Keep the established executable name; command modules own execution and main composes dispatch.
 [[bin]]

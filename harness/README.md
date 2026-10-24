@@ -1,26 +1,34 @@
-# xget test harness
+# Historical xget fault harness
 
-A local rig for exercising xget against real network conditions, since a healthy localhost never
-fails. Three containers behind docker compose:
+This retained rig targeted the retired engine and command surface. Its scenario scripts and command
+examples are not runnable against the modern CLI, are not current Client-path evidence, and are not a
+supported suite to run from this checkout. Do not run the old scenarios against the modern executable.
+No flag-compatibility mode is provided. The scripts and fixtures remain intact for historical reference.
 
-- **httpbin** ([go-httpbin](https://github.com/mccutchen/go-httpbin)) — arbitrary bodies with range
+The historical topology used three containers behind docker compose:
+
+- **httpbin** ([go-httpbin](https://github.com/mccutchen/go-httpbin)): arbitrary bodies with range
   support (`/range/N`), a throttled trickle (`/drip`), and delays (`/delay/N`).
-- **minio** — an S3-compatible store for the `s3://` source, seeded with a public object that carries a
+- **minio**: an S3-compatible store for the `s3://` source, seeded with a public object that carries a
   stored SHA-256 and a `.sha256sum` sidecar.
-- **toxiproxy** — a fault-injecting TCP proxy in front of both, so a scenario can add bandwidth limits,
-  latency, connection resets, or stalls and take them away again.
+- **toxiproxy**: a fault-injecting TCP proxy in front of both, allowing historical scenarios to add
+  bandwidth limits, latency, connection resets, or stalls.
 
-## Use
+## Retained entry points, not current instructions
 
-```sh
-./up.sh          # start and seed everything, print the endpoints
-./scenarios.sh   # build xget (release, s3) and run the suite
-./down.sh        # stop everything
+The old entry points below are recorded only to explain the preserved files. They are not a current
+build, execution or cleanup procedure:
+
+```text
+./up.sh          # historical startup and seeding entry point
+./scenarios.sh   # historical scenario entry point; incompatible with the modern CLI
+./down.sh        # historical teardown entry point
 ```
 
-`up.sh` removes any ad-hoc `xget-minio` container, since it needs port 9000.
+The retained `up.sh` would remove an ad-hoc `xget-minio` container to take port 9000. Its presence here
+is not permission to remove an existing container or stop another service.
 
-## Endpoints
+## Historical endpoints
 
 | what | url |
 | ---- | --- |
@@ -30,28 +38,30 @@ fails. Three containers behind docker compose:
 | minio, via toxiproxy | `http://localhost:8667` |
 | toxiproxy control API | `http://localhost:8474` |
 
-## Injecting faults by hand
+## Historical fault setup
 
-Toxics are added over the control API and cleared with a reset:
+The following preserved control requests describe how that rig injected faults. They mutate a running
+proxy and are not setup or validation instructions for the modern CLI:
 
-```sh
-# throttle httpbin to 2 MB/s downstream
+```text
+# historical httpbin throttle to 2 MB/s downstream
 curl -XPOST localhost:8474/proxies/httpbin/toxics \
   -d '{"type":"bandwidth","attributes":{"rate":2048},"stream":"downstream"}'
 
-# reset connections 800ms in (forces retry/resume)
+# historical connection reset after 800ms
 curl -XPOST localhost:8474/proxies/httpbin/toxics \
   -d '{"type":"reset_peer","attributes":{"timeout":800},"stream":"downstream"}'
 
-# stall data entirely (forces --timeout)
+# historical complete data stall
 curl -XPOST localhost:8474/proxies/httpbin/toxics \
   -d '{"type":"timeout","attributes":{"timeout":0},"stream":"downstream"}'
 
-curl -XPOST localhost:8474/reset   # clear all toxics
+curl -XPOST localhost:8474/reset   # historical removal of all toxics
 ```
 
-Point xget at the toxiproxy port to feel them:
+The old payload invocation below uses retired positional-output and flag syntax. It is preserved as
+historical text only, not a modern command to copy:
 
-```sh
+```text
 xget http://localhost:8666/range/104857600 out.bin -f -n 8
 ```

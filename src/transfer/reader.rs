@@ -163,6 +163,33 @@ impl Window {
     pub fn end(self) -> ByteCount {
         self.end
     }
+
+    /// Tile the unreceived suffix into at most four nonempty windows. Earlier windows take the
+    /// remainder, keeping sizes within one byte and bounding concurrent reader work independently
+    /// of object size. Empty or inverted suffixes admit no source work.
+    fn partition(start: ByteCount, end: ByteCount) -> Vec<Self> {
+        let length = end.0.saturating_sub(start.0);
+        if length == 0 {
+            return Vec::new();
+        }
+        let count = length.min(4);
+        let base = length / count;
+        let extra = length % count;
+        // The capacity is at most four on every host, even for a u64-sized representation.
+        let mut windows = Vec::with_capacity(count as usize);
+        let mut offset = start.0;
+        for index in 0..count {
+            let size = base + u64::from(index < extra);
+            // Each size consumes only the remaining suffix, so the addition cannot exceed end.
+            let next = offset + size;
+            windows.push(Self {
+                start: ByteCount(offset),
+                end: ByteCount(next),
+            });
+            offset = next;
+        }
+        windows
+    }
 }
 
 /// The exact opened representation and the source's session consistency contract.
@@ -718,14 +745,10 @@ where
 {
     let cancellation = Cancellation::default();
     let restored = partial.written.0;
-    let ranges = crate::plan::plan_range(restored, size.0, 4);
-    let mut settled: Vec<u64> = ranges.iter().map(|range| range.start).collect();
+    let ranges = Window::partition(partial.written, size);
+    let mut settled: Vec<u64> = ranges.iter().map(|range| range.start.0).collect();
     let mut work = FuturesUnordered::new();
-    for (index, range) in ranges.iter().enumerate() {
-        let window = Window {
-            start: ByteCount(range.start),
-            end: ByteCount(range.end),
-        };
+    for (index, &window) in ranges.iter().enumerate() {
         work.push(advance::<R, F, B, E>(
             Task {
                 reader,
@@ -786,11 +809,11 @@ where
             // Only settled prefixes are visible. Tail writes never let the verifier jump a hole.
             let mut available = restored;
             for (range, end) in ranges.iter().zip(&settled) {
-                if range.start > available {
+                if range.start.0 > available {
                     break;
                 }
                 available = *end;
-                if *end != range.end {
+                if *end != range.end.0 {
                     break;
                 }
             }

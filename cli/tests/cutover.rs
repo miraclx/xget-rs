@@ -3441,6 +3441,126 @@ fn terminal_ribbon_keeps_live_binary_stdout_exact_with_both_dump_overrides() {
 
 #[test]
 #[cfg(unix)]
+fn actual_range_ribbon_keeps_received_tails_separate_from_the_available_head_prefix() {
+    use std::sync::mpsc;
+
+    let directory = Directory::fresh();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let reference = format!("http://{}/ranged.bin", listener.local_addr().unwrap());
+    let (steps, waits): (Vec<_>, Vec<_>) = (0..5).map(|_| mpsc::channel::<()>()).unzip();
+    let worker = thread::spawn(move || {
+        let mut waits: Vec<_> = waits.into_iter().map(Some).collect();
+        let mut bodies = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while bodies.len() < 4 && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("range ribbon fixture accept failed: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let request = read_request_headers(&mut stream).unwrap();
+            if request.starts_with("HEAD ") {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nAccept-Ranges: bytes\r\nETag: \"range-ribbon\"\r\nConnection: close\r\n\r\n").unwrap();
+                continue;
+            }
+            assert!(request.starts_with("GET "));
+            let range = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("range").then_some(value.trim())
+                })
+                .unwrap();
+            let (start, end) = range
+                .strip_prefix("bytes=")
+                .unwrap()
+                .split_once('-')
+                .unwrap();
+            let start = start.parse::<usize>().unwrap();
+            let end = end.parse::<usize>().unwrap();
+            assert_eq!(end, start + 1);
+            let index = start / 2;
+            let wait = waits[index].take().unwrap();
+            let last = if index == 0 { waits[4].take() } else { None };
+            write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes {start}-{end}/8\r\nETag: \"range-ribbon\"\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+            bodies.push(thread::spawn(move || {
+                if wait.recv_timeout(Duration::from_secs(5)).is_err() {
+                    return;
+                }
+                // Drive the event-based human sampler rather than adding a rendering ticker.
+                thread::sleep(Duration::from_millis(220));
+                if let Some(last) = last {
+                    stream.write_all(b"x").unwrap();
+                    stream.flush().unwrap();
+                    if last.recv_timeout(Duration::from_secs(5)).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(220));
+                    stream.write_all(b"x").unwrap();
+                } else {
+                    stream.write_all(b"xx").unwrap();
+                }
+            }));
+        }
+        assert_eq!(bodies.len(), 4, "four real requested windows must open");
+        for body in bodies {
+            body.join().unwrap();
+        }
+    });
+    let mut terminal = TerminalChild::start(
+        &directory,
+        &[&reference, "-o", "ranged.bin", "-s", "none"],
+        80,
+        &[("NO_COLOR", "1"), ("XPROGRESS_DUMP", "1")],
+    );
+    terminal.wait_for("0.0%");
+    for (index, percent) in [(3, "25.0%"), (2, "50.0%"), (1, "75.0%")] {
+        steps[index].send(()).unwrap();
+        terminal.wait_for(percent);
+    }
+    let tails = core::str::from_utf8(&terminal.captured).unwrap();
+    assert!(tails.contains("available prefix 0 B; 4 ranges, receiving"));
+    assert!(tails.contains('│'));
+    assert!(!tails.contains("saved ranged.bin"));
+    assert!(!directory.path().join("ranged.bin").exists());
+    steps[0].send(()).unwrap();
+    terminal.wait_for("87.5%");
+    terminal.wait_for("available prefix 1 B");
+    steps[4].send(()).unwrap();
+    let result = terminal.finish();
+    worker.join().unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(result.stdout.is_empty());
+    assert_eq!(
+        std::fs::read(directory.path().join("ranged.bin")).unwrap(),
+        b"xxxxxxxx"
+    );
+    let text = core::str::from_utf8(&result.stderr).unwrap();
+    assert!(text.contains("awaiting completion"));
+    assert!(text.contains("saved ranged.bin  8 B"));
+    assert!(!text.contains("verified"));
+    assert!(!text.contains("measured"));
+}
+
+#[test]
+#[cfg(unix)]
 fn ribbon_presets_leave_captured_human_and_json_contracts_unchanged() {
     let server = Server::start(Behavior::Complete);
     let reference = server.reference("/a.bin");

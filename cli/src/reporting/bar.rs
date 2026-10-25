@@ -2,6 +2,8 @@
 
 use std::io::{self, Write as _};
 
+use xget::client::ProgressFacts;
+use xget::transfer::reader::Window;
 use xget::transfer::{ByteCount, Length};
 use xprogress::{AnsiColor, Bar, DrawTarget, Style};
 
@@ -13,6 +15,7 @@ pub(super) struct TerminalBar {
     theme: Theme,
     bar: Option<Bar>,
     length: Option<u64>,
+    ranges: Option<RangeShape>,
     drawn: ByteCount,
     heading: Option<String>,
     restored: Option<String>,
@@ -41,6 +44,14 @@ pub(super) struct Row {
     pub(super) rate: Option<String>,
     pub(super) eta: Option<String>,
     pub(super) percent: Option<String>,
+    pub(super) coverage: Option<String>,
+}
+
+/// Real suffix windows only. A restored prefix occupies its own segment, never a pretend new range.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RangeShape {
+    restored: ByteCount,
+    windows: [Option<Window>; 4],
 }
 
 struct Layout {
@@ -90,6 +101,7 @@ impl TerminalBar {
             theme: Theme::from_env(preset),
             bar: None,
             length: None,
+            ranges: None,
             drawn: ByteCount(0),
             heading: None,
             restored: None,
@@ -116,30 +128,41 @@ impl TerminalBar {
         &mut self,
         length: Length,
         received: ByteCount,
+        facts: Option<ProgressFacts>,
         row: &Row,
     ) -> Result<(), Failure> {
+        let ranges = facts.and_then(RangeShape::from_facts);
         let length = match length {
             Length::Known(total) if total.0 > 0 => Some(total.0),
             _ => None,
         };
         let drawn = ByteCount(length.map_or(0, |total| received.0.min(total)));
-        if length != self.length || drawn.0 < self.drawn.0 {
+        if length != self.length || ranges != self.ranges || drawn.0 < self.drawn.0 {
             self.bar = match self.decoration {
                 Decoration::Bar => length.map(|total| {
-                    Bar::new([total])
-                        .with_target(DrawTarget::stderr())
+                    let bar = match ranges {
+                        Some(ranges) => Bar::new(ranges.sizes()),
+                        None => Bar::new([total]),
+                    };
+                    bar.with_target(DrawTarget::stderr())
                         .with_style(self.theme.style())
                 }),
                 Decoration::Plain => None,
             };
             self.length = length;
+            self.ranges = ranges;
             self.drawn = ByteCount(0);
         }
         if let Some(bar) = &mut self.bar {
-            let delta = drawn.0.saturating_sub(self.drawn.0);
-            // One received frontier, not an unlabeled received/verified two-tone picture.
-            bar.advance_lead(0, delta);
-            bar.advance(0, delta);
+            match (ranges, facts) {
+                (Some(ranges), Some(facts)) => ranges.update(bar, facts),
+                _ => {
+                    let delta = drawn.0.saturating_sub(self.drawn.0);
+                    // Received coverage, not an unlabeled received/verified two-tone picture.
+                    bar.advance_lead(0, delta);
+                    bar.advance(0, delta);
+                }
+            }
         }
         self.drawn = drawn;
         let columns = self.target.columns().unwrap_or(80);
@@ -179,7 +202,11 @@ impl TerminalBar {
         {
             block.push_str(&format!(
                 "  {}  {:>6}\n",
-                bar.render_aggregate(layout.bar_cells),
+                if ranges.is_some() {
+                    bar.render(layout.bar_cells)
+                } else {
+                    bar.render_aggregate(layout.bar_cells)
+                },
                 row.percent.as_deref().unwrap_or("")
             ));
         }
@@ -219,6 +246,7 @@ impl TerminalBar {
     fn reset(&mut self) {
         self.bar = None;
         self.length = None;
+        self.ranges = None;
         self.drawn = ByteCount(0);
         self.heading = None;
         self.restored = None;
@@ -282,6 +310,44 @@ impl TerminalBar {
     }
 }
 
+impl RangeShape {
+    fn from_facts(facts: ProgressFacts) -> Option<Self> {
+        let mut windows = [None; 4];
+        for (slot, facts) in windows.iter_mut().zip(facts.windows()) {
+            *slot = Some(facts.window());
+        }
+        windows[0]?;
+        Some(Self {
+            restored: facts.restored(),
+            windows,
+        })
+    }
+
+    fn sizes(self) -> impl Iterator<Item = u64> {
+        core::iter::once(self.restored.0)
+            .filter(|&length| length != 0)
+            .chain(
+                self.windows
+                    .into_iter()
+                    .flatten()
+                    .map(|window| window.end().0 - window.start().0),
+            )
+    }
+
+    fn update(self, bar: &mut Bar, facts: ProgressFacts) {
+        let counts = core::iter::once(self.restored.0)
+            .filter(|&length| length != 0)
+            .chain(facts.windows().map(|window| window.received().0));
+        for (index, received) in counts.enumerate() {
+            if let Some(segment) = bar.segment(index) {
+                // Both tones mean received here. Written coverage remains the separate prefix fact.
+                segment.lead_to(received.into());
+                segment.set_done(received.into());
+            }
+        }
+    }
+}
+
 impl Row {
     pub(super) fn plain(&self) -> String {
         let mut text = String::clone(&self.detailed);
@@ -292,6 +358,10 @@ impl Row {
         if let Some(eta) = &self.eta {
             text.push_str("  ");
             text.push_str(eta);
+        }
+        if let Some(coverage) = &self.coverage {
+            text.push_str("; ");
+            text.push_str(coverage);
         }
         text
     }
@@ -341,6 +411,16 @@ impl Row {
                 }
             } else if let Some(eta) = eta {
                 text.push_str(&format!("\n  {eta}"));
+            }
+        }
+        if let Some(coverage) = &self.coverage {
+            text.push('\n');
+            if !Self::append_wrapped(&mut text, coverage, columns) {
+                return Layout {
+                    text: self.plain(),
+                    bar_cells: 0,
+                    updating: false,
+                };
             }
         }
         Layout {
@@ -478,6 +558,10 @@ impl Theme {
                 .with_blank('░')
                 .with_header('▌'),
         };
+        let style = style.with_separator(match self.glyphs {
+            Glyphs::Unicode => '│',
+            Glyphs::Ascii => '|',
+        });
         match self.color {
             Color::Disabled => style,
             Color::Enabled => {

@@ -89,7 +89,11 @@ impl Output {
         if !matches!(self.format, Format::Plain) {
             return Ok(());
         }
-        self.write_line(&render(&self.human), &self.channel)
+        self.write_line(&self.human_text(render), &self.channel)
+    }
+
+    pub(crate) fn human_text(&self, render: impl FnOnce(&Human) -> String) -> String {
+        render(&self.human)
     }
 
     pub(crate) fn human_run_started(&self, files: usize) {

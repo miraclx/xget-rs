@@ -118,6 +118,7 @@ impl Human {
         } else {
             ""
         };
+        let measured = checks.measured();
         for requirement in checks.matched_requirements() {
             // Formatting into String cannot fail; only Output owns fallible I/O.
             let _ = write!(
@@ -126,8 +127,15 @@ impl Human {
                 requirement.digest,
                 Self::origins(requirement)
             );
+            if measured == Some(requirement.digest) {
+                text.push_str("; also measured");
+            }
         }
-        if let Some(digest) = checks.measured() {
+        if let Some(digest) = measured
+            && !checks
+                .matched_requirements()
+                .any(|required| required.digest == digest)
+        {
             let _ = write!(text, "\n  {recorded}measured {digest}");
         }
         if version == VersionConsistency::Unpinned

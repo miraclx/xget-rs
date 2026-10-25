@@ -325,12 +325,15 @@ fn checksum_remains_s_and_is_independent_of_a_full_required_digest() {
 }
 
 #[test]
-fn help_announces_the_boundary_and_irreversible_stdout() {
+fn help_teaches_the_default_download_and_explicit_authorities() {
     let help = Cli::command().render_long_help().to_string();
     let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
     for spelling in [
-        "-o",
-        "-D",
+        "Download files and inspect remote collections",
+        "by default, downloads are saved in the current directory",
+        "-o FILE to name one selected file",
+        "-D DIR to choose a directory",
+        "-o - for stdout",
         "pipefail",
         "list",
         "info",

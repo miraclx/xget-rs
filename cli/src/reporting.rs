@@ -17,7 +17,7 @@ use crate::output::{Channel, Format, ItemId, Output, RunId};
 mod bar;
 mod rate;
 
-use bar::{Decoration, Row, TerminalBar};
+use bar::{Decoration, RibbonStyle, Row, TerminalBar};
 use rate::RecentRate;
 
 /// Front-door presentation policy. These are not source concurrency or core timing knobs.
@@ -27,6 +27,9 @@ pub(crate) struct Presentation {
     /// versioned json, or none. None suppresses progress, not final results or failures.
     #[arg(long, value_enum, default_value_t = Mode::Auto, conflicts_with = "json")]
     progress: Mode,
+    /// Terminal ribbon glyphs and palette; does not change progress facts or captured output.
+    #[arg(long, value_enum, default_value_t = RibbonStyle::Classic)]
+    style: RibbonStyle,
     /// Versioned events on stderr, equivalent to --progress json.
     #[arg(long)]
     json: bool,
@@ -127,8 +130,10 @@ impl<'output> Reporter<'output> {
                 total: 0,
             },
             bar: match (mode, terminal) {
-                (Mode::Bar, true) => Some(TerminalBar::new(Decoration::Bar)),
-                (Mode::Plain, true) => Some(TerminalBar::new(Decoration::Plain)),
+                (Mode::Bar, true) => Some(TerminalBar::new(Decoration::Bar, presentation.style)),
+                (Mode::Plain, true) => {
+                    Some(TerminalBar::new(Decoration::Plain, presentation.style))
+                }
                 _ => None,
             },
             failure: None,
@@ -163,7 +168,15 @@ impl<'output> Reporter<'output> {
         if matches!(self.mode, Mode::None | Mode::Json) {
             return Ok(());
         }
-        self.output.human(|human| human.live_start(length))
+        let heading = self.output.human_text(|human| human.live_start(length));
+        match &mut self.bar {
+            Some(bar) => {
+                let (heading, warning) = heading.split_once('\n').unwrap_or((&heading, ""));
+                self.output.human(|_| warning.to_owned())?;
+                bar.start(heading.to_owned())
+            }
+            None => self.output.human(|_| heading),
+        }
     }
 
     pub(crate) fn live_progress(
@@ -230,10 +243,16 @@ impl<'output> Reporter<'output> {
             && restored.0 != 0
             && !self.restored_shown
         {
-            let result = self.clear_bar().and_then(|()| {
-                self.output
-                    .human(|human| format!("  restored {}", human.size(restored.0)))
-            });
+            let text = self
+                .output
+                .human_text(|human| format!("restored {}", human.size(restored.0)));
+            let result = match &mut self.bar {
+                Some(bar) => {
+                    bar.restored(text);
+                    Ok(())
+                }
+                None => self.output.human(|_| format!("  {text}")),
+            };
             self.record(result);
             if self.failure.is_some() {
                 return;
@@ -317,13 +336,17 @@ impl<'output> Reporter<'output> {
                 if self.mode == Mode::None {
                     return Ok(());
                 }
-                self.output.human(|human| {
+                let heading = |human: &Human| {
                     human.header(
                         planned.destination(),
                         planned.file().length(),
                         self.position,
                     )
-                })?;
+                };
+                match &mut self.bar {
+                    Some(bar) => bar.start(self.output.human_text(heading))?,
+                    None => self.output.human(heading)?,
+                }
                 self.output.emit_saved("FileStarted", key.run_id(), Some(key), json!({
                     "destination": Output::path(planned.destination()),
                     "length_bytes": Output::length(planned.file().length()),
@@ -336,8 +359,13 @@ impl<'output> Reporter<'output> {
                 Ok(())
             }
             Event::FileCompleted { key, published } => {
-                self.clear_bar()?;
-                self.output.human(|human| human.published(published))?;
+                match &mut self.bar {
+                    Some(bar) => {
+                        let receipt = self.output.human_text(|human| human.published(published));
+                        bar.receipt(&receipt)?;
+                    }
+                    None => self.output.human(|human| human.published(published))?,
+                }
                 self.output.emit_saved(
                     "Published",
                     key.run_id(),
@@ -356,7 +384,9 @@ impl<'output> Reporter<'output> {
                 }
             }
             Event::RunFailed { failure } => {
-                self.clear_bar()?;
+                if let Some(bar) = &mut self.bar {
+                    bar.failed()?;
+                }
                 self.terminal = Terminal::Failed;
                 self.output.human_run_failed(failure);
                 let facts = Self::failure_facts(failure);
@@ -490,7 +520,7 @@ impl Snapshot {
             Delivery::Live { .. } => "accepted",
         };
         let current = self.count().0;
-        let (count, detailed, determinate) = match self.length {
+        let (count, detailed) = match self.length {
             Length::Known(total) => {
                 let count = format!(
                     "{operation} {}/{}",
@@ -498,24 +528,21 @@ impl Snapshot {
                     human.size(total.0)
                 );
                 if total.0 == 0 {
-                    (
-                        String::clone(&count),
-                        format!("{count}; awaiting completion"),
-                        false,
-                    )
+                    let waiting = format!("{count}; awaiting completion");
+                    (String::clone(&waiting), waiting)
                 } else if current >= total.0 {
                     let percent = if current == total.0 { "100% " } else { "" };
                     let waiting = format!("{percent}{count}; awaiting completion");
-                    (format!("{count}; awaiting completion"), waiting, true)
+                    (format!("{count}; awaiting completion"), waiting)
                 } else {
                     let percent = u128::from(current) * 100 / u128::from(total.0);
                     let detailed = format!("{percent}% {count}");
-                    (count, detailed, true)
+                    (count, detailed)
                 }
             }
             Length::Unknown => {
                 let count = format!("{operation} {} (unknown size)", human.size(current));
-                (String::clone(&count), count, false)
+                (String::clone(&count), count)
             }
         };
         let eta = match (self.length, rate) {
@@ -529,10 +556,18 @@ impl Snapshot {
             }
             _ => None,
         };
+        let percent = match self.length {
+            Length::Known(total) if total.0 > 0 && current <= total.0 => {
+                // Exact integer tenths, rounded down once; no floating-point byte arithmetic.
+                let tenths = u128::from(current) * 1000 / u128::from(total.0);
+                Some(format!("{}.{:01}%", tenths / 10, tenths % 10))
+            }
+            _ => None,
+        };
         Row {
-            count,
+            count: count.replace('/', " / "),
             detailed,
-            determinate,
+            percent,
             rate: rate.map(|BytesPerSecond(rate)| human.speed(rate)),
             eta,
         }

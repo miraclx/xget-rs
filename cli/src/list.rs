@@ -2,10 +2,12 @@
 
 use clap::Args;
 use serde_json::json;
+use xget::input::{InputKind, InputScope};
 use xget::{Client, Input};
 
 use crate::args::Inputs;
 use crate::failure::Failure;
+use crate::human::SelectorContext;
 use crate::output::{Channel, Format, ItemId, Output, RunId};
 
 #[derive(Args)]
@@ -59,11 +61,19 @@ impl Prepared {
     }
 
     pub(crate) async fn run(self, client: &Client, output: &Output) -> Result<(), Failure> {
+        let selector = match self.inputs.as_slice() {
+            [input] if input.kind() == InputKind::S3 && input.scope() == InputScope::Exact => {
+                SelectorContext::ExactInput
+            }
+            [_] => SelectorContext::Selectable,
+            _ => SelectorContext::MixedInputs,
+        };
         let inventory = client
             .resolve_all(self.inputs)
             .await
             .map_err(Failure::library)?;
         for (index, file) in inventory.files().enumerate() {
+            output.human(|human| human.member(file, selector))?;
             output.emit("Member", Some(ItemId(index)), json!({
                 "source_path": file.source_path(),
                 "namespace": file.namespace().map(|namespace| namespace.as_str()),
@@ -75,6 +85,7 @@ impl Prepared {
             }))?;
         }
         for directory in inventory.directories() {
+            output.human(|human| human.directory(directory))?;
             output.emit(
                 "Directory",
                 None,
@@ -87,6 +98,14 @@ impl Prepared {
                 }),
             )?;
         }
+        output.human(|human| {
+            human.listed(
+                inventory.files().len(),
+                inventory.directories().len(),
+                selector == SelectorContext::Selectable
+                    && inventory.files().any(|file| file.member_token().is_some()),
+            )
+        })?;
         output.emit(
             "End",
             None,

@@ -6,6 +6,7 @@ mod args;
 mod display;
 mod download;
 mod failure;
+mod human;
 mod info;
 mod list;
 mod output;
@@ -73,7 +74,7 @@ fn main() {
             match cli.command {
                 Some(args::Command::Info(command)) => command.run(&output).await,
                 Some(args::Command::Resume(command)) => {
-                    let prepared = command.prepare().await?;
+                    let prepared = command.prepare(&output).await?;
                     let client = compose_client(prepared.needs_s3(), prepared.gateway()).await?;
                     prepared.run(&client, &output).await
                 }

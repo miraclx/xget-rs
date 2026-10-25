@@ -11,11 +11,14 @@ use xget::transfer::{ByteCount, Length, WriteExtent};
 
 use crate::display::DisplayFormat;
 use crate::failure::{Diagnostic, Failure};
+use crate::human::{Human, Position};
 use crate::output::{Channel, Format, ItemId, Output, RunId};
 
 mod bar;
+mod rate;
 
-use bar::TerminalBar;
+use bar::{Decoration, Row, TerminalBar};
+use rate::RecentRate;
 
 /// Front-door presentation policy. These are not source concurrency or core timing knobs.
 #[derive(Args, Clone, Copy, Default)]
@@ -52,7 +55,7 @@ impl Presentation {
         } else {
             Format::Plain
         };
-        Output::new(run, format, Channel::Diagnostic)
+        Output::new(run, format, Channel::Diagnostic).with_units(self.units())
     }
 
     fn resolved(self, terminal: bool) -> Mode {
@@ -87,6 +90,11 @@ pub(crate) struct Reporter<'output> {
     started: Instant,
     rate: Rate,
     last_render: Option<Duration>,
+    human_rate: RecentRate,
+    last_human: Option<Duration>,
+    last_count: Option<ByteCount>,
+    restored_shown: bool,
+    position: Position,
     bar: Option<TerminalBar>,
     failure: Option<Failure>,
     terminal: Terminal,
@@ -101,7 +109,8 @@ enum Terminal {
 
 impl<'output> Reporter<'output> {
     pub(crate) fn new(output: &'output Output, presentation: Presentation) -> Self {
-        let mode = presentation.resolved(std::io::stderr().is_terminal());
+        let terminal = std::io::stderr().is_terminal();
+        let mode = presentation.resolved(terminal);
         Self {
             output,
             mode,
@@ -109,7 +118,19 @@ impl<'output> Reporter<'output> {
             started: Instant::now(),
             rate: Rate::default(),
             last_render: None,
-            bar: (mode == Mode::Bar).then(TerminalBar::new),
+            human_rate: RecentRate::at(Duration::ZERO),
+            last_human: None,
+            last_count: None,
+            restored_shown: false,
+            position: Position {
+                current: 0,
+                total: 0,
+            },
+            bar: match (mode, terminal) {
+                (Mode::Bar, true) => Some(TerminalBar::new(Decoration::Bar)),
+                (Mode::Plain, true) => Some(TerminalBar::new(Decoration::Plain)),
+                _ => None,
+            },
             failure: None,
             terminal: Terminal::Pending,
         }
@@ -136,6 +157,13 @@ impl<'output> Reporter<'output> {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn live_started(&mut self, length: Length) -> Result<(), Failure> {
+        if matches!(self.mode, Mode::None | Mode::Json) {
+            return Ok(());
+        }
+        self.output.human(|human| human.live_start(length))
     }
 
     pub(crate) fn live_progress(
@@ -166,49 +194,66 @@ impl<'output> Reporter<'output> {
             return;
         }
         let elapsed = self.started.elapsed();
+        // The machine sampler, including its unconfirmed-extent bypass, is deliberately unchanged.
         let rate = self.rate.sample(snapshot.source, elapsed);
-        // Bounded presentation frequency belongs here, not in the source or native worker. The
-        // first snapshot is immediate; terminal publication receipts retain final exact counters.
-        let unconfirmed = matches!(
-            snapshot.delivery,
-            Delivery::Native {
-                extent: WriteExtent::Unconfirmed,
-                ..
+        if self.mode == Mode::Json {
+            let unconfirmed = matches!(
+                snapshot.delivery,
+                Delivery::Native {
+                    extent: WriteExtent::Unconfirmed,
+                    ..
+                }
+            );
+            if !unconfirmed
+                && self
+                    .last_render
+                    .is_some_and(|last| elapsed.saturating_sub(last) < Duration::from_millis(100))
+            {
+                return;
             }
-        );
-        if !unconfirmed
-            && self
-                .last_render
-                .is_some_and(|last| elapsed.saturating_sub(last) < Duration::from_millis(100))
+            self.last_render = Some(elapsed);
+            let facts = snapshot.machine(rate);
+            let result = match key {
+                Some(key) => self
+                    .output
+                    .emit_saved("Progress", key.run_id(), Some(key), facts),
+                None => self.output.emit("Progress", Some(ItemId(0)), facts),
+            };
+            self.record(result);
+            return;
+        }
+        if self.mode == Mode::None {
+            return;
+        }
+        self.human_rate.sample(snapshot.source, elapsed);
+        if let Delivery::Native { restored, .. } = snapshot.delivery
+            && restored.0 != 0
+            && !self.restored_shown
+        {
+            let result = self.clear_bar().and_then(|()| {
+                self.output
+                    .human(|human| format!("  restored {}", human.size(restored.0)))
+            });
+            self.record(result);
+            if self.failure.is_some() {
+                return;
+            }
+            self.restored_shown = true;
+        }
+        let count = snapshot.count();
+        if self.last_count == Some(count)
+            || self
+                .last_human
+                .is_some_and(|last| elapsed.saturating_sub(last) < Duration::from_millis(200))
         {
             return;
         }
-        self.last_render = Some(elapsed);
-        let result = match self.mode {
-            Mode::Json => {
-                let facts = snapshot.machine(rate);
-                match key {
-                    Some(key) => self
-                        .output
-                        .emit_saved("Progress", key.run_id(), Some(key), facts),
-                    None => self.output.emit("Progress", Some(ItemId(0)), facts),
-                }
-            }
-            Mode::Plain | Mode::Auto => self
-                .output
-                .human_progress(&snapshot.human(self.units, rate)),
-            Mode::Bar => match &mut self.bar {
-                Some(bar) => bar.render(
-                    snapshot.length,
-                    snapshot.received,
-                    snapshot.settled,
-                    &snapshot.human(self.units, rate),
-                ),
-                None => self
-                    .output
-                    .human_progress(&snapshot.human(self.units, rate)),
-            },
-            Mode::None => Ok(()),
+        self.last_count = Some(count);
+        self.last_human = Some(elapsed);
+        let row = snapshot.human(self.units, self.human_rate.rate(elapsed));
+        let result = match &mut self.bar {
+            Some(bar) => bar.render(snapshot.length, count, &row),
+            None => self.output.human_progress(&format!("  {}", row.plain())),
         };
         self.record(result);
     }
@@ -245,6 +290,11 @@ impl<'output> Reporter<'output> {
                 saved_run,
                 files,
             } => {
+                self.position = Position {
+                    current: 0,
+                    total: files,
+                };
+                self.output.human_run_started(files);
                 if self.mode == Mode::None {
                     return Ok(());
                 }
@@ -256,11 +306,24 @@ impl<'output> Reporter<'output> {
             }
             Event::FileStarted { key, planned } => {
                 self.clear_bar()?;
-                self.rate = Rate::at(self.started.elapsed());
+                let elapsed = self.started.elapsed();
+                self.rate = Rate::at(elapsed);
                 self.last_render = None;
+                self.human_rate = RecentRate::at(elapsed);
+                self.last_human = None;
+                self.last_count = None;
+                self.restored_shown = false;
+                self.position.current += 1;
                 if self.mode == Mode::None {
                     return Ok(());
                 }
+                self.output.human(|human| {
+                    human.header(
+                        planned.destination(),
+                        planned.file().length(),
+                        self.position,
+                    )
+                })?;
                 self.output.emit_saved("FileStarted", key.run_id(), Some(key), json!({
                     "destination": Output::path(planned.destination()),
                     "length_bytes": Output::length(planned.file().length()),
@@ -274,6 +337,7 @@ impl<'output> Reporter<'output> {
             }
             Event::FileCompleted { key, published } => {
                 self.clear_bar()?;
+                self.output.human(|human| human.published(published))?;
                 self.output.emit_saved(
                     "Published",
                     key.run_id(),
@@ -284,6 +348,7 @@ impl<'output> Reporter<'output> {
             Event::RunCompleted { report } => {
                 self.clear_bar()?;
                 self.terminal = Terminal::Complete;
+                self.output.human_done(report.completed().len())?;
                 let facts = json!({"complete": true, "completed_files": report.completed().len(), "state_path": report.saved_run().map(Output::path)});
                 match report.run_id() {
                     Some(run) => self.output.emit_saved("End", run, None, facts),
@@ -293,6 +358,7 @@ impl<'output> Reporter<'output> {
             Event::RunFailed { failure } => {
                 self.clear_bar()?;
                 self.terminal = Terminal::Failed;
+                self.output.human_run_failed(failure);
                 let facts = Self::failure_facts(failure);
                 match failure.report.run_id() {
                     Some(run) => self.output.emit_saved("RunFailed", run, None, facts),
@@ -410,41 +476,66 @@ impl Snapshot {
         facts
     }
 
-    fn human(&self, units: DisplayFormat, rate: BytesPerSecond) -> String {
-        let length = match self.length {
-            Length::Known(total) => units.size(total.0),
-            Length::Unknown => "unknown".to_owned(),
-        };
+    fn count(&self) -> ByteCount {
+        match self.delivery {
+            Delivery::Native { .. } => self.received,
+            Delivery::Live { .. } => self.settled,
+        }
+    }
+
+    fn human(&self, units: DisplayFormat, rate: Option<BytesPerSecond>) -> Row {
+        let human = Human { units, cwd: None };
         let operation = match self.delivery {
-            Delivery::Native { .. } => "written",
+            Delivery::Native { .. } => "received",
             Delivery::Live { .. } => "accepted",
         };
-        let received = match self.delivery {
-            Delivery::Native { .. } => "logical received",
-            Delivery::Live { .. } => "received",
+        let current = self.count().0;
+        let (count, detailed, determinate) = match self.length {
+            Length::Known(total) => {
+                let count = format!(
+                    "{operation} {}/{}",
+                    human.size(current),
+                    human.size(total.0)
+                );
+                if total.0 == 0 {
+                    (
+                        String::clone(&count),
+                        format!("{count}; awaiting completion"),
+                        false,
+                    )
+                } else if current >= total.0 {
+                    let percent = if current == total.0 { "100% " } else { "" };
+                    let waiting = format!("{percent}{count}; awaiting completion");
+                    (format!("{count}; awaiting completion"), waiting, true)
+                } else {
+                    let percent = u128::from(current) * 100 / u128::from(total.0);
+                    let detailed = format!("{percent}% {count}");
+                    (count, detailed, true)
+                }
+            }
+            Length::Unknown => {
+                let count = format!("{operation} {} (unknown size)", human.size(current));
+                (String::clone(&count), count, false)
+            }
         };
-        let restored = match self.delivery {
-            Delivery::Native { restored, .. } => format!("; restored {}", units.size(restored.0)),
-            Delivery::Live { .. } => String::new(),
+        let eta = match (self.length, rate) {
+            (Length::Known(total), Some(BytesPerSecond(rate)))
+                if rate > 0 && self.received.0 < total.0 =>
+            {
+                Some(format!(
+                    "ETA {}s",
+                    total.0.saturating_sub(self.received.0).div_ceil(rate)
+                ))
+            }
+            _ => None,
         };
-        let extent = match self.delivery {
-            Delivery::Native {
-                extent: WriteExtent::Unconfirmed,
-                ..
-            } => " (write extent unconfirmed)",
-            _ => "",
-        };
-        let eta = self
-            .eta(rate)
-            .map_or_else(|| "unknown".to_owned(), |seconds| format!("{seconds}s"));
-        format!(
-            "{received} {}/{length}; {operation} {}; hashed {}; source {}{restored}; {}; eta {eta}{extent}",
-            units.size(self.received.0),
-            units.size(self.settled.0),
-            units.size(self.hashed.0),
-            units.size(self.source.0),
-            units.speed(rate.0)
-        )
+        Row {
+            count,
+            detailed,
+            determinate,
+            rate: rate.map(|BytesPerSecond(rate)| human.speed(rate)),
+            eta,
+        }
     }
 }
 

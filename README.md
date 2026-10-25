@@ -57,7 +57,7 @@ Download one exact HTTP file to the current directory:
 xget https://example.com/big.iso
 ```
 
-This writes `big.iso` and reports the measured SHA-256 in its published record. The name comes from the
+This writes `big.iso` and reports `saved big.iso`, its size and the measured SHA-256. The name comes from the
 final percent-decoded component of the URL path. A `Content-Disposition` filename is not used. If the
 URL has no usable final component, name the output explicitly.
 
@@ -83,7 +83,8 @@ xget https://example.com/big.iso -o - | sha256sum
 
 Live output is checked while it runs, but bytes already written to stdout cannot be retracted. A late
 source error, length mismatch or required-check failure still exits non-zero. `pipefail` makes the
-pipeline report that failure. No file is published, and the final record reports `published_files: 0`.
+pipeline report that failure. Success reports `delivered` to stdout, not a published file. Explicit JSON
+retains `published_files: 0` in its final record.
 Live output creates no owned run or native destination, so `--fresh`, `--restart` and `--overwrite`
 are rejected for `-o -`, including live previews.
 
@@ -204,11 +205,31 @@ The table describes the acquisition command. `list` shares input, selection, acc
 | `--bits` | human speed in bits; byte counts remain bytes |
 | `--raw-sizes` | raw byte sizes in human output |
 
-`--progress` defaults to `auto`. Bars use terminal stderr only; captured stderr falls back to complete
-plain snapshots without cursor control. `--progress none` suppresses progress, not final result or
-failure records. Download and resume diagnostics go to stderr. Metadata commands write to stdout.
-JSON records include `schema_version: 1`; this README does not define a separate compatibility policy
-for that envelope.
+Human presentation is the default. `--progress auto` uses an xprogress bar on terminal stderr and
+complete plain snapshots when captured. Explicit `plain` updates on a terminal and uses complete lines
+otherwise; `bar` also falls back to plain when captured. The active row shows received bytes, or
+sink-accepted bytes for live output, with a recent source rate and ETA when available. Reaching 100%
+still awaits clean completion, required checks and publication or sink flush. Restored bytes do not
+inflate source speed. Sizes use xbytes IEC bytes; `--bits` changes speed only, and `--raw-sizes` wins.
+
+Each successful file has a readable `saved` or `delivered` receipt, separate `required … matched` and
+optional `measured …` digest lines, and one elapsed-time summary. No-hash success has no checksum
+boilerplate. A locally revalidated file is labeled `revalidated`, with recorded checks and an explicit
+warning that its remote version was not checked. Unpinned sources without a matched strong required
+checksum carry an actionable warning; a measured digest alone is not an expected-content pin.
+
+`--progress none` suppresses starts and intermediate progress, not receipts, checks, warnings, summaries,
+recovery paths or errors. Ordinary successful downloads do not dump state paths or internal events.
+Failures preserve acknowledged completed-file counts, available partial/uncertain facts and actual
+recovery locations in one diagnosis. `info` and explicit `resume` retain the full state context;
+`list` prints actual selector operands, and inspection/preview labels are not execution receipts.
+Names and paths are visibly escaped. Copy helpers use POSIX quoting for printable UTF-8 and are labeled
+`bash/zsh` when controls or native Unix bytes require ANSI-C quoting.
+
+Download, resume and dry-run presentation stays on stderr. Metadata commands write to stdout; live
+stdout remains payload only. JSON is opt-in with `--json` or `--progress json` where supported and
+retains its existing events, fields, correlation and byte/second units. Records include
+`schema_version: 1`; this README does not define a separate compatibility policy for that envelope.
 
 There is no `--sequential` flag or `--chunks` counter. The common coordinator selects eligible pinned
 ranges; `--restart` and `-f` are the separate guarded policies described below.
@@ -238,18 +259,21 @@ replacement but has no execution authority.
 
 ### Metadata-only inspection
 
-`--dry-run` performs the real resolution and planning work, then stops. It emits one `Planned` record
-per file with the source path, destination, length, required digests and measurement policy. For
-`-o -`, it emits `PlannedLive` with the live target and check proposals. It opens no payload, creates no
-output directory, starts no native stage and touches no run store. It still makes source metadata
-requests, so it is not an offline mode.
+`--dry-run` performs the real resolution and planning work, then stops. Human output shows `would save`
+for each file, with its source path, destination, length, required digests and measurement policy, then
+`planned N files; not executed`. For `-o -`, it shows `would stream` with the live target and check
+proposals. With JSON selected, these are `Planned` or `PlannedLive` records. Neither mode opens a payload,
+creates an output directory, starts a native stage or touches the run store. Both still make source
+metadata requests, so dry-run is not an offline mode.
 
 `xget list` (alias `xget ls`) resolves complete bounded metadata and prints member facts without
-opening payloads or creating outputs. Records include the original `source_path`, `namespace`, length,
-`selector_token` when ID selection is available, version evidence and any required digests. Directories
-are shown as inspection-only and are never materialized as empty outputs. `list` does not assign local
-destination names; use `--dry-run` for the frozen plan. `--json` writes the same records as versioned
-lines on stdout.
+opening payloads or creating outputs. Entries include the original source path, namespace, length,
+member token when supplied by the source, version evidence and any required digests. Human output
+prints a copyable `--select-id=...` action only for one original input whose scope supports selection.
+An exact S3 input already selects its file; mixed-input listings retain identity tokens without guessing
+their original selection scope. A token's presence alone is not selection authority. Directories are
+inspection-only and are never materialized as empty outputs. `list` does not assign local destination
+names; use `--dry-run` for the frozen plan. `--json` retains the versioned metadata records on stdout.
 
 ### Inspect and continue unfinished work
 
@@ -261,9 +285,9 @@ Completed members are revalidated rather than refetched, including when `--resta
 
 `xget info <STATE>` is offline. It opens the owned aggregate state path without a Client, transport,
 credential discovery, payload hashing or execution lease. It reports each member's binding key,
-destination, length, status, measurement and required digests, with
-`content_revalidated: false` and no execution authority. The state is an owned run record, not an
-incomplete payload. Old `.xget` partials are not imported, migrated or cleaned automatically.
+destination, length, status, measurement and required digests. Human output says `offline metadata only;
+content not revalidated`; JSON includes `content_revalidated: false`. Neither grants execution
+authority. The state is an owned run record, not an incomplete payload. Old `.xget` partials are not imported, migrated or cleaned automatically.
 
 Usually, repeat the original download request for automatic matching. To choose a particular saved run,
 use explicit resume; rebinding is not rediscovery:

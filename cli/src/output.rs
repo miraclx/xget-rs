@@ -9,7 +9,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 use xget::transfer::{CheckResults, Length, Phase, WriteExtent};
 
+use crate::display::DisplayFormat;
 use crate::failure::{Diagnostic, Failure};
+use crate::human::{FailureContext, Human};
 
 /// Correlation for this invocation only. Persistent core run/member IDs remain a library seam.
 /// The schema explicitly says so rather than confusing these IDs with recovery authority.
@@ -51,6 +53,11 @@ pub(crate) struct Output {
     // Task-local diagnostic context only, with no executable lease or shared-worker ownership.
     saved_id: Cell<Option<xget::client::RunId>>,
     saved_path: RefCell<Option<PathBuf>>,
+    human: Human,
+    human_failure: RefCell<FailureContext>,
+    // Suppress retries only on the failed sink; metadata stdout cannot disable healthy stderr.
+    metadata_failed: Cell<bool>,
+    diagnostic_failed: Cell<bool>,
 }
 
 impl Output {
@@ -62,7 +69,69 @@ impl Output {
             started: Instant::now(),
             saved_id: Cell::new(None),
             saved_path: RefCell::new(None),
+            human: Human {
+                units: DisplayFormat::HumanBytes,
+                cwd: std::env::current_dir().ok(),
+            },
+            human_failure: RefCell::new(FailureContext::default()),
+            metadata_failed: Cell::new(false),
+            diagnostic_failed: Cell::new(false),
         }
+    }
+
+    pub(crate) fn with_units(mut self, units: DisplayFormat) -> Self {
+        self.human.units = units;
+        self
+    }
+
+    /// Human output is built directly from typed facts, never decoded from a machine envelope.
+    pub(crate) fn human(&self, render: impl FnOnce(&Human) -> String) -> Result<(), Failure> {
+        if !matches!(self.format, Format::Plain) {
+            return Ok(());
+        }
+        self.write_line(&render(&self.human), &self.channel)
+    }
+
+    pub(crate) fn human_run_started(&self, files: usize) {
+        self.human_failure.borrow_mut().total = Some(files);
+    }
+
+    pub(crate) fn human_run_failed(&self, failure: &xget::client::RunFailure) {
+        let mut context = self.human_failure.borrow_mut();
+        context.completed = Some(failure.report.completed().len());
+        context.state = failure.report.saved_run().map(Path::to_path_buf);
+    }
+
+    pub(crate) fn human_recovery(&self, state: Option<&Path>, choices: &[PathBuf]) {
+        if !matches!(self.format, Format::Plain) {
+            return;
+        }
+        let mut context = self.human_failure.borrow_mut();
+        if let Some(state) = state {
+            context.state = Some(state.to_path_buf());
+        }
+        context.choices = choices.to_vec();
+    }
+
+    pub(crate) fn explicit_resume(&self) {
+        self.human_failure.borrow_mut().explicit_resume = true;
+    }
+
+    pub(crate) fn live(&self) {
+        self.human_failure.borrow_mut().live = true;
+    }
+
+    pub(crate) fn human_done(&self, files: usize) -> Result<(), Failure> {
+        self.human(|human| {
+            human.done(
+                files,
+                self.started.elapsed(),
+                self.saved_path
+                    .borrow()
+                    .as_deref()
+                    .filter(|_| self.human_failure.borrow().explicit_resume),
+            )
+        })
     }
 
     pub(crate) fn emit(
@@ -81,11 +150,11 @@ impl Output {
         facts: Value,
         channel: &Channel,
     ) -> Result<(), Failure> {
-        if matches!(self.format, Format::None) {
+        if !matches!(self.format, Format::Json) {
             return Ok(());
         }
         let envelope = self.envelope(kind, item, &facts);
-        self.write(kind, &facts, &envelope, channel)
+        self.write_json(&envelope, channel)
     }
 
     pub(crate) fn emit_saved(
@@ -95,32 +164,40 @@ impl Output {
         item: Option<xget::client::BindingKey>,
         facts: Value,
     ) -> Result<(), Failure> {
+        if !matches!(self.format, Format::Json) {
+            return Ok(());
+        }
         let mut envelope = self.envelope(kind, None, &facts);
         envelope["run_id"] = json!(run.to_string());
         envelope["item_id"] = json!(item.map(|key| key.to_string()));
         envelope["correlation_scope"] = json!("SavedWorkspace");
-        self.write(kind, &facts, &envelope, &self.channel)
+        self.write_json(&envelope, &self.channel)
     }
 
-    fn write(
-        &self,
-        kind: &str,
-        facts: &Value,
-        envelope: &Value,
-        channel: &Channel,
-    ) -> Result<(), Failure> {
-        let line = match self.format {
-            Format::Json => serde_json::to_string(envelope)
-                .map_err(|_| Failure::runtime("cannot encode output; no completion is claimed"))?,
-            // JSON escaping is also a plain, newline-delimited human snapshot. In particular,
-            // remote names and controls cannot turn captured human output into terminal commands.
-            Format::Plain => format!("{} {}", kind.to_ascii_lowercase(), facts),
-            Format::None => return Ok(()),
+    fn write_json(&self, envelope: &Value, channel: &Channel) -> Result<(), Failure> {
+        let line = serde_json::to_string(envelope)
+            .map_err(|_| Failure::runtime("cannot encode output; no completion is claimed"))?;
+        self.write_line(&line, channel)
+    }
+
+    fn write_line(&self, line: &str, channel: &Channel) -> Result<(), Failure> {
+        let failed = match channel {
+            Channel::Metadata => &self.metadata_failed,
+            Channel::Diagnostic => &self.diagnostic_failed,
         };
-        match channel {
+        if failed.get() {
+            return Err(Failure::runtime(
+                "command output previously failed; transferred bytes or published files are not rolled back",
+            ));
+        }
+        let result = match channel {
             Channel::Metadata => writeln!(io::stdout().lock(), "{line}"),
             Channel::Diagnostic => writeln!(io::stderr().lock(), "{line}"),
-        }.map_err(|cause| Failure::io(cause, "cannot write command output; transferred bytes or published files are not rolled back"))
+        };
+        result.map_err(|cause| {
+            failed.set(true);
+            Failure::io(cause, "cannot write command output; transferred bytes or published files are not rolled back")
+        })
     }
 
     fn envelope(&self, kind: &str, item: Option<ItemId>, facts: &Value) -> Value {
@@ -145,13 +222,27 @@ impl Output {
     }
 
     pub(crate) fn failure(&self, failure: &Failure) -> Result<(), Failure> {
+        match self.format {
+            Format::Plain => {
+                return self.write_line(
+                    &self.human.failure(
+                        failure,
+                        &self.human_failure.borrow(),
+                        self.saved_path.borrow().as_deref(),
+                    ),
+                    &Channel::Diagnostic,
+                );
+            }
+            Format::None => return Ok(()),
+            Format::Json => {}
+        }
         let facts = self.failure_facts(failure);
         let mut envelope = self.envelope("Error", None, &facts);
         if let Some(run) = self.saved_id.get() {
             envelope["run_id"] = json!(run.to_string());
             envelope["correlation_scope"] = json!("SavedWorkspace");
         }
-        self.write("Error", &facts, &envelope, &Channel::Diagnostic)
+        self.write_json(&envelope, &Channel::Diagnostic)
     }
 
     fn failure_facts(&self, failure: &Failure) -> Value {
@@ -198,9 +289,7 @@ impl Output {
     }
 
     pub(crate) fn human_progress(&self, line: &str) -> Result<(), Failure> {
-        writeln!(io::stderr().lock(), "{line}").map_err(|cause| Failure::io(cause,
-            "cannot write progress output; publication or delivered prefixes are not rolled back"
-        ))
+        self.write_line(line, &Channel::Diagnostic)
     }
 
     pub(crate) fn path(path: &Path) -> Value {

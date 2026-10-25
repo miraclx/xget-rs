@@ -105,7 +105,8 @@ impl Directory {
                     break;
                 }
                 let line = &captured[start..];
-                let native_progress = line.starts_with(b"logical received ")
+                let native_progress = (line.starts_with(b"  ")
+                    && core::str::from_utf8(line).is_ok_and(|line| line.contains("received ")))
                     || serde_json::from_slice::<Value>(line).is_ok_and(|event| {
                         event["kind"] == "Progress" && event["facts"]["kind"] == "Native"
                     });
@@ -141,6 +142,13 @@ impl Drop for Directory {
 #[derive(Clone, Copy)]
 enum Behavior {
     Complete,
+    #[cfg(unix)]
+    Empty,
+    #[cfg(unix)]
+    UnknownLength,
+    #[cfg(unix)]
+    Unpinned,
+    Binary,
     ShortBody,
     #[cfg(unix)]
     ShortBodyAfterHeaders,
@@ -161,6 +169,8 @@ enum Behavior {
     S3Many,
     #[cfg(feature = "s3")]
     S3Directory,
+    #[cfg(all(feature = "s3", unix))]
+    S3Selectors,
 }
 
 struct Server {
@@ -217,6 +227,8 @@ impl Server {
                                     Behavior::S3One => &["a.bin"],
                                     Behavior::S3Many => &["a.bin", "b.bin"],
                                     Behavior::S3Directory => &["a.bin", "folder/"],
+                                    #[cfg(unix)]
+                                    Behavior::S3Selectors => &["-asset.bin", "--help"],
                                     _ => panic!("unexpected fixture listing"),
                                 };
                                 let mut xml = String::from(
@@ -240,6 +252,8 @@ impl Server {
                                 continue;
                             }
                             let length = match behavior {
+                                #[cfg(unix)]
+                                Behavior::Empty => 0,
                                 Behavior::ShortBody => 4,
                                 #[cfg(unix)]
                                 Behavior::ShortBodyAfterHeaders => 4,
@@ -250,7 +264,13 @@ impl Server {
                                 Behavior::S3Directory if head && request.contains("/folder/") => 0,
                                 _ => 3,
                             };
-                            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n").unwrap();
+                            match behavior {
+                                #[cfg(unix)]
+                                Behavior::UnknownLength => write!(stream, "HTTP/1.1 200 OK\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n").unwrap(),
+                                #[cfg(unix)]
+                                Behavior::Unpinned => write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").unwrap(),
+                                _ => write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n").unwrap(),
+                            }
                             if !head {
                                 #[cfg(unix)]
                                 if matches!(
@@ -275,6 +295,13 @@ impl Server {
                                 };
                                 #[cfg(not(all(feature = "ipfs", unix)))]
                                 let bytes = b"abc";
+                                let bytes: &[u8] = match behavior {
+                                    #[cfg(unix)]
+                                    Behavior::Empty => b"",
+
+                                    Behavior::Binary => b"\0\xff\n",
+                                    _ => bytes,
+                                };
                                 stream.write_all(bytes).unwrap();
                                 #[cfg(unix)]
                                 if matches!(behavior, Behavior::ShortFirstWhole) {
@@ -366,6 +393,650 @@ fn events(bytes: &[u8]) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn human_text(bytes: &[u8]) -> &str {
+    let text = core::str::from_utf8(bytes).unwrap();
+    assert!(
+        !text.chars().any(|ch| ch.is_control() && ch != '\n'),
+        "{text:?}"
+    );
+    for boilerplate in [
+        "schema_version",
+        "correlation_scope",
+        "runstarted {",
+        "filestarted {",
+        "published {",
+        "end {",
+        "runfailed {",
+    ] {
+        assert!(!text.contains(boilerplate), "{text}");
+    }
+    text
+}
+
+#[test]
+#[cfg(unix)]
+fn native_machine_optins_keep_exact_envelopes_event_order_correlation_and_fixed_units() {
+    let server = Server::start(Behavior::Complete);
+    let reference = server.reference("/a.bin?signature=machine-shape-secret");
+    for optin in [vec!["--json"], vec!["--progress", "json"]] {
+        let directory = Directory::fresh();
+        let mut args = vec![
+            reference.as_str(),
+            "-o",
+            "out.bin",
+            "-s",
+            "none",
+            "--bits",
+            "--raw-sizes",
+        ];
+        args.extend(optin);
+        let result = directory.run(&args);
+        assert_eq!(result.status.code(), Some(0));
+        assert!(result.stdout.is_empty());
+        let records = events(&result.stderr);
+        let kinds: Vec<_> = records
+            .iter()
+            .filter(|event| event["kind"] != "Progress")
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["RunStarted", "FileStarted", "Published", "End"]);
+        for record in &records {
+            assert_eq!(record.as_object().unwrap().len(), 8);
+            assert_eq!(record["schema_version"], 1);
+            assert_eq!(record["correlation_scope"], "SavedWorkspace");
+            assert_eq!(record["run_id"], records[0]["run_id"]);
+            assert_eq!(record["invocation_id"], records[0]["invocation_id"]);
+            assert!(record["elapsed_ms"].is_u64());
+        }
+        let published = records
+            .iter()
+            .find(|event| event["kind"] == "Published")
+            .unwrap();
+        let facts = &published["facts"];
+        assert_eq!(facts.as_object().unwrap().len(), 8);
+        for field in [
+            "length_bytes",
+            "logical_received_bytes",
+            "logical_written_bytes",
+        ] {
+            assert_eq!(facts[field], 3);
+            assert!(facts[field].is_u64());
+        }
+        assert_eq!(facts["hashed_bytes"], 0);
+        assert!(facts["range_attempt"].is_null());
+        assert!(facts["checks"]["measured_digest"].is_null());
+        assert_eq!(
+            facts["checks"]["matched_requirements"],
+            serde_json::json!([])
+        );
+        assert_eq!(facts["version"], "StrongEtagMatched");
+        assert_eq!(published["item_id"], records[1]["item_id"]);
+        for progress in records.iter().filter(|event| event["kind"] == "Progress") {
+            assert!(progress["facts"]["rate_bytes_per_second"].is_u64());
+            assert_eq!(progress["facts"]["completion_evidence"], false);
+        }
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("machine-shape-secret"));
+    }
+}
+
+#[test]
+#[cfg(all(feature = "s3", unix))]
+fn human_sdk_listing_supplies_real_copyable_selectors_and_inspection_only_directories() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::S3Directory);
+    let listed = directory.run_sdk(&server, &["list", "--tree", "s3://fixture-bucket/"]);
+    assert_eq!(listed.status.code(), Some(0));
+    assert!(listed.stderr.is_empty());
+    let text = human_text(&listed.stdout);
+    assert!(text.contains("file a.bin  3 B\n  select: --select-id='a.bin'"));
+    assert!(text.contains("directory folder  inspection only"));
+    assert_eq!(text.matches("select: --select-id").count(), 1);
+    assert!(text.contains("1 file, 1 directory; metadata only"));
+    assert!(text.contains("use each selector with its original input"));
+    let selected = directory.run_sdk(
+        &server,
+        &[
+            "--tree",
+            "s3://fixture-bucket/",
+            "--select-id",
+            "a.bin",
+            "-o",
+            "selected.bin",
+            "--progress",
+            "none",
+        ],
+    );
+    assert_eq!(selected.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read(directory.path().join("selected.bin")).unwrap(),
+        b"abc"
+    );
+    assert!(human_text(&selected.stderr).contains("saved selected.bin  3 B"));
+}
+
+#[test]
+#[cfg(all(feature = "s3", unix))]
+fn human_sdk_selector_actions_survive_shell_and_option_parsing() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::S3Selectors);
+    let listed = directory.run_sdk(&server, &["list", "--tree", "s3://fixture-bucket/"]);
+    assert_eq!(listed.status.code(), Some(0));
+    let text = human_text(&listed.stdout);
+    let actions: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("  select: "))
+        .collect();
+    assert_eq!(actions.len(), 2);
+    for (index, action) in actions.iter().enumerate() {
+        let parsed = Command::new("sh")
+            .args(["-c", &format!("set -- {action}; printf '%s\\0' \"$@\"")])
+            .output()
+            .unwrap();
+        assert!(parsed.status.success());
+        let arguments: Vec<_> = parsed
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| core::str::from_utf8(argument).unwrap())
+            .collect();
+        assert_eq!(arguments.len(), 1);
+        assert!(arguments[0].starts_with("--select-id="));
+        let destination = format!("selected-{index}.bin");
+        let selected = directory.run_sdk(
+            &server,
+            &[
+                "--tree",
+                "s3://fixture-bucket/",
+                arguments[0],
+                "-o",
+                &destination,
+                "--progress",
+                "none",
+            ],
+        );
+        assert_eq!(
+            selected.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join(destination)).unwrap(),
+            b"abc"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(feature = "s3", unix))]
+fn human_exact_and_mixed_sdk_listings_do_not_advertise_unsupported_selector_actions() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::S3One);
+    let exact = "s3://fixture-bucket/a.bin";
+    let listed = directory.run_sdk(&server, &["list", exact]);
+    assert_eq!(listed.status.code(), Some(0));
+    let text = human_text(&listed.stdout);
+    assert!(text.contains("member token: a.bin"));
+    assert!(text.contains("exact input already selects this file"));
+    assert!(!text.contains("--select-id"));
+    assert!(!text.contains("use each selector"));
+    let selected = directory.run_sdk(&server, &[exact, "-o", "exact.bin", "--progress", "none"]);
+    assert_eq!(selected.status.code(), Some(0));
+    assert_eq!(
+        std::fs::read(directory.path().join("exact.bin")).unwrap(),
+        b"abc"
+    );
+    let mixed = directory.run_sdk(&server, &["list", exact, "--tree", "s3://fixture-bucket/"]);
+    assert_eq!(mixed.status.code(), Some(0));
+    let text = human_text(&mixed.stdout);
+    assert!(text.contains("identity only; original selection scope not identified"));
+    assert!(!text.contains("--select-id"));
+    assert!(!text.contains("use each selector"));
+}
+
+#[test]
+#[cfg(unix)]
+fn broken_metadata_stdout_still_reports_once_on_healthy_stderr_in_human_and_json_modes() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
+
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::Complete);
+    let reference = server.reference("/a.bin");
+    for json in [false, true] {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        drop(reader);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_xget"));
+        command.args(["list", &reference]);
+        if json {
+            command.arg("--json");
+        }
+        let result = command
+            .current_dir(directory.path())
+            .env("TMPDIR", directory.path().join("tmp"))
+            .env_remove("RUST_LOG")
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        if json {
+            let records = events(&result.stderr);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["kind"], "Error");
+            assert_eq!(records[0]["facts"]["exit_code"], 1);
+        } else {
+            let text = human_text(&result.stderr);
+            assert_eq!(text.matches("error: ").count(), 1);
+            assert!(text.contains("cannot write command output"));
+            assert!(text.contains("not rolled back"));
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn ordinary_native_modes_have_human_receipts_checks_and_elapsed_without_success_state_logs() {
+    let server = Server::start(Behavior::Complete);
+    let reference = server.reference("/a.bin?signature=human-native-secret");
+    for mode in [None, Some("auto"), Some("bar"), Some("plain"), Some("none")] {
+        let directory = Directory::fresh();
+        let mut args = vec![reference.as_str(), "-o", "out.bin"];
+        if let Some(mode) = mode {
+            args.extend(["--progress", mode]);
+        }
+        let result = directory.run(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.stdout.is_empty());
+        assert_eq!(
+            std::fs::read(directory.path().join("out.bin")).unwrap(),
+            b"abc"
+        );
+        let text = human_text(&result.stderr);
+        assert!(text.contains("saved out.bin  3 B\n  measured sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+        assert!(text.contains("done 1 file in "));
+        for absent in [
+            ".xget-runs",
+            "state:",
+            "StrongEtag",
+            "version:",
+            "human-native-secret",
+            "verified",
+            "required: none",
+        ] {
+            assert!(!text.contains(absent), "{text}");
+        }
+        if mode == Some("none") {
+            assert!(text.starts_with("saved out.bin"));
+            assert!(!text.contains("received "));
+        } else {
+            assert!(text.starts_with("out.bin  3 B\n"));
+            assert!(text.contains("received "));
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn human_check_results_distinguish_optional_measurement_requirements_and_multiple_origins() {
+    let server = Server::start(Behavior::Complete);
+    let reference = server.reference("/a.bin");
+    let required = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    for measurement in ["none", "sha1"] {
+        let directory = Directory::fresh();
+        std::fs::write(directory.path().join("checks"), format!("{required}\n")).unwrap();
+        let result = directory.run(&[
+            &reference,
+            "-o",
+            "out.bin",
+            "--fresh",
+            "--expect",
+            required,
+            "--expect-file",
+            "checks",
+            "-s",
+            measurement,
+            "--progress",
+            "none",
+        ]);
+        assert_eq!(result.status.code(), Some(0));
+        let text = human_text(&result.stderr);
+        assert!(
+            text.contains(&format!("required {required} matched (caller, sidecar)")),
+            "{text}"
+        );
+        assert_eq!(text.matches("required sha256:").count(), 1);
+        assert!(!text.contains("measured sha256:"));
+        if measurement == "none" {
+            assert!(!text.contains("measured "));
+        } else {
+            assert!(text.contains("measured sha1:a9993e364706816aba3e25717850c26c9cd0d89d"));
+        }
+    }
+    let directory = Directory::fresh();
+    let result = directory.run(&[
+        &reference,
+        "-o",
+        "nohash.bin",
+        "-s",
+        "none",
+        "--progress",
+        "none",
+    ]);
+    assert_eq!(result.status.code(), Some(0));
+    let text = human_text(&result.stderr);
+    assert!(text.starts_with("saved nohash.bin  3 B\ndone 1 file in "));
+    for absent in ["measured", "required", "verified", "checks", "none"] {
+        assert!(!text.contains(absent));
+    }
+    let wrong = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let mismatch = directory.run(&[
+        &reference,
+        "-o",
+        "failed.bin",
+        "--expect",
+        wrong,
+        "-s",
+        "sha1",
+        "--progress",
+        "none",
+    ]);
+    assert_eq!(mismatch.status.code(), Some(1));
+    assert!(mismatch.stdout.is_empty());
+    assert!(!directory.path().join("failed.bin").exists());
+    let text = human_text(&mismatch.stderr);
+    assert_eq!(text.matches("error: ").count(), 1);
+    assert!(text.contains("required digest does not match"));
+    for absent in [
+        required,
+        wrong,
+        "measured sha1:",
+        "saved failed.bin",
+        "done 1 file",
+        "rolled back",
+    ] {
+        assert!(!text.contains(absent));
+    }
+}
+
+#[test]
+fn human_metadata_and_native_live_previews_are_readable_and_have_no_execution_effects() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::Complete);
+    let a = server.reference("/a.bin?signature=human-metadata-secret");
+    let b = server.reference("/b.bin");
+    let listed = directory.run(&["list", &a, &b]);
+    assert_eq!(listed.status.code(), Some(0));
+    assert!(listed.stderr.is_empty());
+    let text = human_text(&listed.stdout);
+    assert!(text.contains("file a.bin  3 B"), "{text}");
+    assert!(text.contains("file b.bin  3 B"));
+    assert!(text.contains("select: unavailable"));
+    assert!(text.contains("2 files, 0 directories; metadata only"));
+    assert!(!text.contains("human-metadata-secret"));
+    for target in ["renamed.bin", "-"] {
+        let preview = directory.run(&[
+            &a,
+            "-o",
+            target,
+            "--dry-run",
+            "-s",
+            "none",
+            "--progress",
+            "none",
+            "--raw-sizes",
+        ]);
+        assert_eq!(preview.status.code(), Some(0));
+        assert!(preview.stdout.is_empty());
+        let text = human_text(&preview.stderr);
+        assert!(
+            text.contains(if target == "-" {
+                "would stream a.bin -> stdout  3 B"
+            } else {
+                "would save a.bin -> renamed.bin  3 B"
+            }),
+            "{text}"
+        );
+        assert!(text.contains("required: none"));
+        assert!(text.contains("measurement: none"));
+        assert!(text.contains("planned 1 file; not executed"));
+    }
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.starts_with("HEAD "))
+    );
+    assert!(!directory.path().join(".xget-runs").exists());
+    assert!(!directory.path().join("renamed.bin").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn known_zero_unknown_and_unpinned_receipts_keep_their_actual_qualifications() {
+    for (behavior, size) in [
+        (Behavior::Empty, "0 B"),
+        (Behavior::UnknownLength, "unknown size"),
+        (Behavior::Unpinned, "3 B"),
+    ] {
+        let directory = Directory::fresh();
+        let server = Server::start(behavior);
+        let reference = server.reference("/a.bin");
+        let result = directory.run(&[&reference, "-o", "out.bin", "-s", "none"]);
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let text = human_text(&result.stderr);
+        assert!(text.starts_with(&format!("out.bin  {size}\n")), "{text}");
+        assert!(text.contains("saved out.bin"));
+        if matches!(behavior, Behavior::Empty | Behavior::UnknownLength) {
+            assert!(!text.contains('%'));
+            assert!(!text.contains("ETA"));
+        }
+        assert_eq!(
+            text.contains("warning: source version unpinned"),
+            matches!(behavior, Behavior::Unpinned)
+        );
+    }
+    let server = Server::start(Behavior::Unpinned);
+    let reference = server.reference("/a.bin");
+    let directory = Directory::fresh();
+    let checked = directory.run(&[
+        &reference,
+        "-o",
+        "checked.bin",
+        "-s",
+        "none",
+        "--expect",
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "--progress",
+        "none",
+    ]);
+    assert_eq!(checked.status.code(), Some(0));
+    assert!(!human_text(&checked.stderr).contains("warning: source version unpinned"));
+}
+
+#[test]
+fn live_human_modes_keep_binary_stdout_exact_and_none_retains_delivery_and_checks() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::Binary);
+    let reference = server.reference("/payload.bin?signature=human-live-secret");
+    for mode in ["auto", "bar", "plain", "none"] {
+        for dump in ["", "1"] {
+            let result = Command::new(env!("CARGO_BIN_EXE_xget"))
+                .args([&reference, "-o", "-", "--progress", mode])
+                .current_dir(directory.path())
+                .env("TMPDIR", directory.path().join("tmp"))
+                .env("XPROGRESS_DUMP", dump)
+                .env_remove("RUST_LOG")
+                .output()
+                .unwrap();
+            assert_eq!(result.status.code(), Some(0));
+            assert_eq!(result.stdout, b"\0\xff\n");
+            let text = human_text(&result.stderr);
+            assert!(text.contains("delivered 3 B to stdout\n  measured sha256:"));
+            assert!(text.contains("done 1 file in "));
+            assert!(!text.contains("saved "));
+            assert!(!text.contains("human-live-secret"));
+            if mode == "none" {
+                assert!(!text.contains("accepted "));
+                assert!(!text.contains("live output;"));
+            } else {
+                assert!(text.starts_with(
+                    "stdout  3 B\n  live output; delivered prefixes cannot be retracted\n"
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn live_human_failure_has_one_diagnosis_and_no_success_receipt_even_with_none() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::ShortBody);
+    let reference = server.reference("/a.bin?signature=human-failure-secret");
+    for mode in ["plain", "none"] {
+        let result = directory.run(&[&reference, "-o", "-", "--progress", mode]);
+        assert_eq!(result.status.code(), Some(1));
+        let text = human_text(&result.stderr);
+        assert_eq!(text.matches("error: ").count(), 1);
+        assert!(
+            text.contains("stdout may contain irreversible prefixes; completion not confirmed")
+        );
+        assert!(!text.contains("delivered 3 B to stdout"));
+        assert!(!text.contains("done 1 file"));
+        assert!(!text.contains("human-failure-secret"));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn human_later_failure_and_offline_resume_keep_receipts_keys_and_local_revalidation_distinct() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::FailSecondOnce);
+    let a = server.reference("/a.bin?signature=resume-human-secret");
+    let b = server.reference("/b.bin");
+    let failed = directory.run(&[&a, &b, "-D", "downloads"]);
+    assert_eq!(failed.status.code(), Some(1));
+    let text = human_text(&failed.stderr);
+    assert!(text.contains("[1/2] downloads/a.bin  3 B"));
+    assert!(text.contains("saved downloads/a.bin  3 B"));
+    assert!(text.contains("[2/2] downloads/b.bin  3 B"));
+    assert!(text.contains("completed: 1 of 2 files"));
+    assert_eq!(text.matches("error: ").count(), 1);
+    assert!(!text.contains("done 2 files"));
+    let state = text
+        .lines()
+        .find_map(|line| line.strip_prefix("state: "))
+        .unwrap();
+    let before = server.requests();
+    let inspected = directory.run(&["info", state]);
+    assert_eq!(inspected.status.code(), Some(0));
+    assert!(inspected.stderr.is_empty());
+    assert_eq!(server.requests(), before);
+    let info = human_text(&inspected.stdout);
+    assert!(info.starts_with(&format!("state: '{state}'\nrecorded complete: no\n")));
+    assert!(info.contains("complete: publication recorded; continuation revalidates"));
+    assert!(info.contains("offline metadata only; content not revalidated"));
+    assert!(info.contains("measurement: sha256"));
+    let keys: Vec<_> = info
+        .lines()
+        .filter_map(|line| line.strip_prefix("  key: "))
+        .collect();
+    assert_eq!(keys.len(), 2);
+    let bindings = [format!("{}={a}", keys[0]), format!("{}={b}", keys[1])];
+    let refused = directory.run(&[
+        "resume",
+        state,
+        "--input",
+        &bindings[0],
+        "--progress",
+        "none",
+    ]);
+    assert_eq!(refused.status.code(), Some(2));
+    let refusal = human_text(&refused.stderr);
+    assert_eq!(refusal.matches("error: ").count(), 1);
+    assert!(refusal.contains(&format!("state: {state}")));
+    assert!(!refusal.contains("completed:"));
+    assert!(!refusal.contains("resume-human-secret"));
+    assert_eq!(server.requests(), before);
+    let resumed = directory.run(&[
+        "resume",
+        state,
+        "--input",
+        &bindings[0],
+        "--input",
+        &bindings[1],
+        "--progress",
+        "none",
+    ]);
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let text = human_text(&resumed.stderr);
+    assert!(text.contains("revalidated downloads/a.bin  3 B"));
+    assert!(text.contains("remote version not checked"));
+    assert!(text.contains("recorded measured sha256:"));
+    assert!(text.contains("saved downloads/b.bin  3 B"));
+    assert!(text.contains("done 2 files in "));
+    assert_eq!(text.matches(&format!("state: '{state}'")).count(), 1);
+    assert!(!text.contains("resume-human-secret"));
+    assert!(
+        server.requests()[before.len()..]
+            .iter()
+            .all(|request| !request.starts_with("HEAD "))
+    );
+}
+
+#[test]
+fn human_metadata_escapes_hostile_names_and_errors_never_echo_access_or_rejected_values() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::Complete);
+    let reference =
+        server.reference("/odd%0Aname%1B%5C%27%E2%80%AE.bin?signature=hostile-name-secret");
+    let result = directory.run(&["list", &reference]);
+    assert_eq!(result.status.code(), Some(0));
+    let text = human_text(&result.stdout);
+    assert!(!text.contains('\u{202e}'));
+    assert!(!text.contains("hostile-name-secret"));
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("file "))
+            .count(),
+        1
+    );
+    for args in [
+        vec![
+            "https://user:password@example.test/a?signature=secret",
+            "--progress",
+            "wrong",
+        ],
+        vec![reference.as_str(), "--expect", "private-rejected-value"],
+    ] {
+        let failed = directory.run(&args);
+        assert_eq!(failed.status.code(), Some(2));
+        assert!(failed.stdout.is_empty());
+        let text = human_text(&failed.stderr);
+        assert!(text.starts_with("error: "));
+        assert_eq!(text.matches("error: ").count(), 1);
+        for absent in ["password", "signature", "secret", "private-rejected-value"] {
+            assert!(!text.contains(absent));
+        }
+    }
 }
 
 #[test]
@@ -1647,7 +2318,7 @@ fn malformed_progress_preserves_following_json_option_and_respects_terminator() 
     assert_eq!(terminated.status.code(), Some(2));
     assert!(terminated.stdout.is_empty());
     assert!(
-        terminated.stderr.starts_with(b"error "),
+        terminated.stderr.starts_with(b"error: "),
         "a token after -- is not a JSON presentation option"
     );
 }
@@ -1985,11 +2656,25 @@ fn captured_plain_failure_keeps_actionable_reason_and_partial_on_stderr() {
         text.contains("http response failed before clean completion"),
         "{text}"
     );
-    assert!(text.contains("\"reason\":\"HttpRequest\""));
-    assert!(text.contains("\"phase\":null"));
-    assert!(text.contains("\"partial\":"));
-    assert!(text.contains("\"logical_received_bytes\":"));
-    assert!(text.contains("\"completion_evidence\":false"));
+    assert_eq!(text.matches("error: ").count(), 1);
+    assert_eq!(
+        text.matches("http response failed before clean completion")
+            .count(),
+        1
+    );
+    assert!(text.contains("completed: 0 of 1 files"));
+    assert!(text.contains("partial: received "));
+    assert!(text.contains("; written "));
+    assert!(text.contains("; hashed "));
+    assert!(text.contains("these counts are not completion evidence"));
+    assert!(text.contains("\nstate: "));
+    assert!(text.contains("\nnative state: "));
+    assert!(text.contains("\ninspect: xget info '"));
+    assert!(!text.contains("phase:"));
+    assert!(!text.contains("\"partial\""));
+    assert!(!text.contains("runfailed"));
+    assert!(!text.contains("saved out.bin"));
+    assert!(!text.contains("done 1 file"));
     assert!(!text.contains("uxdoc-plain-marker"));
     assert!(!text.contains('\u{1b}'));
     assert!(!text.contains('\r'));

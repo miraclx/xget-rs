@@ -94,7 +94,7 @@ use ipfs::Ipfs;
 pub use ipfs::IpfsError;
 pub use live::{CheckedBody, LiveReceipt, OpenedFile};
 use observation::FileProgress;
-pub use observation::{Event, Observer, ProgressFacts};
+pub use observation::{Event, Observer, ProgressFacts, Reception, WindowFacts};
 #[cfg(feature = "s3")]
 use s3::S3;
 #[cfg(feature = "s3")]

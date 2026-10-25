@@ -108,6 +108,13 @@ requested byte still fail. Up to four ranges write bounded prefixes. The checker
 settled-write frontier while bodies run, not a post-slowest-range hash pass. Stage readback uses the same
 physical-operation registration and leases as writes, including after waiter drop.
 
+`ProgressFacts::available` observes the contiguous acknowledged settled prefix independently of hashing
+and before hash readback delay. At most four actual offset-ordered `WindowFacts` distinguish received,
+written, extent certainty and `Reception`; whole bodies have no synthetic windows. Restored prefix,
+EOF, matched checks and publication remain separate facts. No observation grants persisted reuse or
+concurrent-owner-mutation safety. Drained native write failure must not remain hidden behind an earlier
+source-only refusal; other stop/length/response-validation precedence stays intact.
+
 Reader/check/body/error families remain concrete and conditionally Send. Generic Send helpers name one
 borrow's F/B/E families with equality bounds; do not replace that with an HRTB or static requirement.
 V3 reader records freeze session size/representation/version, destination, check policy and data

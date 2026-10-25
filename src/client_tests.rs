@@ -1899,6 +1899,8 @@ impl Drop for Directory {
     }
 }
 
+// Mirror the bounded caller-task snapshot without introducing a different boxed fixture shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Observed {
     Started {

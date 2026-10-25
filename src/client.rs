@@ -641,6 +641,20 @@ impl Client {
                 }));
             }
         }
+        if matches!(authority.publication, crate::transfer::Publication::Absent) {
+            // The complete selected layout/check policy is already frozen. Reject the whole known
+            // target set before creating directories, aggregate state or opening any payload. This
+            // is only a preflight; the native leased absent-only publication remains authoritative.
+            for (index, planned) in plan.files.iter().enumerate() {
+                if let Err(error) = Self::absent_destination(&planned.destination).await {
+                    return Err(Box::new(RunFailure {
+                        error,
+                        report,
+                        failed: Some(plan.files.remove(index)),
+                    }));
+                }
+            }
+        }
         if let Err(error) = Self::prepare_directories(&plan).await {
             return Err(Box::new(RunFailure {
                 error,
@@ -945,6 +959,16 @@ impl Client {
         Ok(report)
     }
 
+    async fn absent_destination(destination: &Path) -> Result<(), Error> {
+        match tokio::fs::symlink_metadata(destination).await {
+            // A symlink, including a dangling one, is an incumbent role too. Never follow it to
+            // decide absence or adopt equal foreign bytes as an acknowledged completed member.
+            Ok(_) => Err(Error::DestinationExists),
+            Err(cause) if cause.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(cause) => Err(Error::Directory(cause)),
+        }
+    }
+
     async fn prepare_directories(plan: &Plan) -> Result<(), Error> {
         let Some(root) = &plan.directory_root else {
             for file in &plan.files {
@@ -1232,8 +1256,9 @@ impl Download<'_> {
         self
     }
 
-    /// Intentionally discovers new work instead of matching unfinished owned runs. Old run artifacts
-    /// remain untouched; Fresh does not grant overwrite or restart any existing attempt.
+    /// Intentionally discovers new work instead of matching unfinished owned runs. Native artifacts
+    /// remain untouched; completed aggregate metadata follows [`SavedRun`]'s bounded retention.
+    /// Fresh does not grant overwrite or restart any existing attempt.
     pub fn fresh(mut self, _policy: Fresh) -> Self {
         self.reentry = match self.reentry {
             Reentry::Restart | Reentry::Conflict => Reentry::Conflict,
@@ -1665,8 +1690,8 @@ pub struct RunFailure {
     pub error: Error,
     /// Files published before the terminal failure.
     pub report: Report,
-    /// Frozen failing member/assignment when execution had reached one, without automatic retry.
-    /// Its native partial/state facts remain in the typed transfer error.
+    /// Frozen failing member/assignment when known, including a target rejected during preflight.
+    /// This grants no automatic retry. Native partial/state facts, if any, remain in the typed error.
     pub failed: Option<PlannedFile>,
 }
 
@@ -1826,6 +1851,11 @@ pub enum Error {
         "unsafe output directory role or permissions; choose a caller-owned non-shared directory"
     )]
     UnsafeDirectory,
+    /// A fresh absent-only target is already occupied. No aggregate/native attempt was needed.
+    #[error(
+        "output destination already exists; choose a new name or use fresh with explicit overwrite"
+    )]
+    DestinationExists,
     /// Directory inspection/creation is execution-only and does not grant overwrite authority.
     #[error("output directory preparation failed; choose a suitable caller-owned directory")]
     Directory(#[source] std::io::Error),

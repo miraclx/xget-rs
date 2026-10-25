@@ -999,7 +999,7 @@ async fn layout_depth_limits_fail_without_retaining_unbounded_prefix_keys_or_fet
 
 #[cfg(unix)]
 #[tokio::test]
-async fn native_digest_failure_preserves_partial_state_and_an_existing_destination() {
+async fn native_digest_failure_preserves_partial_state_and_an_authorized_incumbent() {
     let directory = Directory::new();
     let server = MockServer::start().await;
     let reference = exact(&server, "/payload").await;
@@ -1009,6 +1009,7 @@ async fn native_digest_failure_preserves_partial_state_and_an_existing_destinati
     let client = Client::new().expect("client");
     let failure = client
         .download(reference.as_str())
+        .overwrite(crate::client::Overwrite)
         .expect(wrong)
         .to_file(&destination)
         .run()

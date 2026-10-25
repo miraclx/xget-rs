@@ -202,6 +202,7 @@ impl Prepared {
         if self.dry_run {
             let plan = pending.plan().await.map_err(Failure::library)?;
             for (index, planned) in plan.files().enumerate() {
+                output.human(|human| human.planned(planned, self.overwrite))?;
                 output.emit("Planned", Some(ItemId(index)), json!({
                     "source_path": planned.file().source_path(),
                     "destination": Output::path(planned.destination()),
@@ -212,6 +213,7 @@ impl Prepared {
                     "execution_authority": false,
                 }))?;
             }
+            output.human(|human| human.planned_end(plan.files().len()))?;
             return output.emit(
                 "End",
                 None,
@@ -234,11 +236,15 @@ impl Prepared {
     async fn stream(self, client: &Client, output: &Output) -> Result<(), Failure> {
         let selected = OneFile::resolve(client, self.inputs, self.expect, self.sidecar).await?;
         if self.dry_run {
+            output.human(|human| {
+                human.planned_live(&selected.file, &selected.checks, self.measurement)
+            })?;
             output.emit(
                 "PlannedLive",
                 Some(ItemId(0)),
                 selected.live_inspection(self.measurement),
             )?;
+            output.human(|human| human.planned_end(1))?;
             return output.emit("End", None, json!({
                 "planned_files": 1, "executed": false, "payload_opened": false, "output_created": false,
             }));
@@ -257,6 +263,8 @@ impl Prepared {
         let mut body = opened.into_body();
         let mut stdout = io::stdout();
         let mut reporter = Reporter::new(output, self.presentation);
+        output.live();
+        reporter.live_started(length)?;
         while let Some(chunk) = body.next().await {
             let bytes = chunk.map_err(|_| Failure::runtime(
                 "live source, length or required-check failure; stdout may contain irreversible prefixes and is not verified complete"
@@ -283,6 +291,13 @@ impl Prepared {
             )
         })?;
         reporter.finish()?;
+        output.human(|human| {
+            human.delivered(
+                receipt.body().progress().released,
+                receipt.body().checks(),
+                receipt.version(),
+            )
+        })?;
         output.emit(
             "Delivered",
             Some(ItemId(0)),
@@ -295,6 +310,7 @@ impl Prepared {
                 "version": Output::version(receipt.version()),
             }),
         )?;
+        output.human_done(1)?;
         output.emit(
             "End",
             None,
@@ -304,6 +320,11 @@ impl Prepared {
 
     pub(crate) fn recovery(error: &xget::client::Error, output: &Output) -> Result<(), Failure> {
         if let xget::client::Error::Saved(saved) = error {
+            let choices = match saved {
+                xget::client::SavedError::Ambiguous { resume_paths } => resume_paths.as_slice(),
+                _ => &[],
+            };
+            output.human_recovery(saved.saved_run(), choices);
             if let xget::client::SavedError::Ambiguous { resume_paths } = saved {
                 output.emit("ResumeChoices", None, json!({
                     "state_paths": resume_paths.iter().map(|path| Output::path(path)).collect::<Vec<_>>()

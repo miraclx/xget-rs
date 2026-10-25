@@ -50,14 +50,18 @@ pub(crate) struct Prepared {
 
 impl Command {
     pub(crate) fn output(&self, run: RunId) -> Output {
-        self.presentation.output(run)
+        let output = self.presentation.output(run);
+        output.explicit_resume();
+        output.human_recovery(Some(&self.state), &[]);
+        output
     }
 
-    pub(crate) async fn prepare(self) -> Result<Prepared, Failure> {
+    pub(crate) async fn prepare(self, output: &Output) -> Result<Prepared, Failure> {
         // Inspection is offline, before transport construction or credential discovery.
         let saved = SavedRun::inspect(self.state)
             .await
             .map_err(Failure::saved)?;
+        output.human_recovery(Some(saved.path()), &[]);
         let mut bindings = Vec::new();
         // A shared CLI convenience must not broadcast credentials across different original inputs.
         let mut header_reference: Option<Zeroizing<String>> = None;

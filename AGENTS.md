@@ -266,11 +266,20 @@ gateway adapter, not the older IPFS Source.
   Stdin/remote sidecars are unsupported; labels match exact original source paths, not renamed outputs.
 - Human sizes and default rates use bytes. `--bits` changes human speed only; `--raw-sizes` wins.
   JSON counts/rates remain bytes/bytes-per-second and elapsed times remain milliseconds.
+- Human output is the default, formatted directly from typed facts, not event labels plus JSON or
+  foreign Debug/source chains. Receipts distinguish required matches, optional measurements, local
+  revalidation and live sink delivery. None suppresses starts/progress, not results, checks or errors.
+  Ordinary success omits state/event boilerplate; failures retain one diagnosis, acknowledged completed
+  counts, partial/uncertain/checkpoint facts and actual copyable recovery paths. Info/resume retain state.
 - JSON uses `schema_version: 1` and PascalCase kinds with structured facts. Do not claim a separate
-  schema compatibility policy. Metadata goes to stdout; acquisition/resume diagnostics go to stderr.
-  JSON escaping also protects plain newline-delimited facts from remote controls.
-- Bars explicitly target terminal stderr, ignoring the library demo Dump override. Captured bar/auto
-  output becomes complete plain snapshots without cursor control; payload stdout stays separate.
+  schema compatibility policy or change machine events/fields/order/units/sampling for human polish.
+  Keep machine RunFailed plus Error. Metadata goes to stdout; acquisition/resume diagnostics to stderr.
+  Escape human controls/bidi and preserve native bytes; display escaping is not shell operand quoting.
+- xbytes owns byte/bits/raw units. xprogress bars explicitly target terminal stderr, ignoring the demo
+  Dump override. One received frontier is not verification. Budget the whole active row, shrink optional
+  ETA/rate/bar and use complete snapshots when required counts cannot fit. Plain updates only on TTY;
+  captured human output has no CR/ANSI styling. Payload stdout stays separate. Human recent-source
+  rates exclude restoration; the existing machine sampler retains its own semantics.
 - `--header` applies only to one original HTTP/WebDAV input. Explicit resume renews headers only when
   every binding resupplies the same original reference spelling. Access is not persisted in state/events.
 - `--ipfs-gateway` supplies access, never identity; exact IPFS still uses frozen CID/path requirements.

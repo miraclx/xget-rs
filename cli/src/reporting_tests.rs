@@ -9,6 +9,49 @@ use crate::failure::Failure;
 use crate::output::{Channel, Format, Output, RunId};
 
 #[test]
+fn zero_unknown_overrun_and_live_acceptance_keep_distinct_human_counts_without_completion_claims() {
+    let mut snapshot = Snapshot {
+        length: Length::Known(ByteCount(0)),
+        received: ByteCount(0),
+        settled: ByteCount(0),
+        hashed: ByteCount(0),
+        source: ByteCount(0),
+        delivery: Delivery::Native {
+            restored: ByteCount(0),
+            written: ByteCount(0),
+            extent: WriteExtent::Confirmed,
+        },
+    };
+    let zero = snapshot.human(Presentation::default().units(), Some(BytesPerSecond(2)));
+    assert!(!zero.determinate);
+    assert!(zero.eta.is_none());
+    assert!(!zero.plain().contains('%'));
+    snapshot.length = Length::Unknown;
+    let unknown = snapshot.human(Presentation::default().units(), Some(BytesPerSecond(2)));
+    assert!(!unknown.determinate);
+    assert!(unknown.eta.is_none());
+    assert!(unknown.plain().contains("unknown size"));
+    snapshot.length = Length::Known(ByteCount(3));
+    snapshot.received = ByteCount(u64::MAX);
+    let overrun = snapshot
+        .human(crate::display::DisplayFormat::RawBytes, None)
+        .plain();
+    assert!(overrun.contains("18446744073709551615 B/3 B"));
+    assert!(!overrun.contains("100%"));
+    assert!(overrun.contains("awaiting completion"));
+    snapshot.length = Length::Known(ByteCount(10));
+    snapshot.received = ByteCount(9);
+    snapshot.settled = ByteCount(3);
+    snapshot.delivery = Delivery::Live {
+        released: ByteCount(3),
+    };
+    let live = snapshot.human(Presentation::default().units(), Some(BytesPerSecond(2)));
+    assert!(live.plain().contains("30% accepted 3 B/10 B"));
+    assert_eq!(live.eta.as_deref(), Some("ETA 1s"));
+    assert!(!live.plain().contains("verified"));
+}
+
+#[test]
 fn restored_logical_jumps_never_enter_the_source_rate() {
     let restored = Snapshot {
         length: Length::Known(ByteCount(1_000_000)),
@@ -143,7 +186,9 @@ fn live_facts_describe_sink_acceptance_not_native_publication_or_write_extents()
     assert!(facts.get("write_extent").is_none());
     assert!(facts["length_bytes"].is_null());
     assert!(facts["eta_seconds"].is_null());
-    let line = snapshot.human(Presentation::default().units(), BytesPerSecond(2));
+    let line = snapshot
+        .human(Presentation::default().units(), Some(BytesPerSecond(2)))
+        .plain();
     assert!(line.contains("accepted"));
     assert!(!line.contains("verified"));
     assert!(!line.chars().any(char::is_control));
@@ -169,11 +214,31 @@ fn native_unconfirmed_extents_remain_explicit_without_verified_claims() {
     assert_eq!(facts["hashed_bytes"], 2);
     assert_eq!(facts["completion_evidence"], false);
     assert_eq!(facts["eta_seconds"], 0);
-    assert!(
-        snapshot
-            .human(Presentation::default().units(), BytesPerSecond(5))
-            .contains("unconfirmed")
-    );
+    let line = snapshot
+        .human(Presentation::default().units(), Some(BytesPerSecond(5)))
+        .plain();
+    assert!(line.contains("100% received"));
+    assert!(line.contains("awaiting completion"));
+    assert!(!line.contains("verified"));
+    // Extent lower bounds remain explicit in the final human diagnostic, not seven progress columns.
+    let failure = Failure::library(Error::Transfer(Box::new(xget::transfer::Failure {
+        kind: FailureKind::Stopped,
+        partial: Partial {
+            received: snapshot.received,
+            written: snapshot.settled,
+            hashed: snapshot.hashed,
+            write_extent: WriteExtent::Unconfirmed,
+            ..Partial::default()
+        },
+        state: None,
+    })));
+    let human = crate::human::Human {
+        units: Presentation::default().units(),
+        cwd: None,
+    };
+    let diagnostic = human.failure(&failure, &crate::human::FailureContext::default(), None);
+    assert!(diagnostic.contains("written at least 3 B"));
+    assert!(diagnostic.contains("write extent unconfirmed"));
 }
 
 #[test]

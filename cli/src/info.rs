@@ -35,7 +35,9 @@ impl Command {
         let saved = SavedRun::inspect(self.state)
             .await
             .map_err(Failure::saved)?;
+        output.human(|human| human.info_header(saved.path(), saved.is_complete()))?;
         for member in saved.members() {
+            output.human(|human| human.saved_member(&member))?;
             output.emit_saved("SavedMember", saved.id(), Some(member.key()), json!({
                 "binding_key": member.key().to_string(),
                 "destination": Output::path(member.destination()),
@@ -45,6 +47,12 @@ impl Command {
                 "required_digests": member.requirements().map(|required| required.digest.to_string()).collect::<Vec<_>>(),
             }))?;
         }
+        output.human(|human| {
+            human.info_end(
+                saved.members().len(),
+                saved.members().map(|member| member.status()),
+            )
+        })?;
         output.emit_saved(
             "End",
             saved.id(),

@@ -133,7 +133,7 @@ use futures::{Stream, StreamExt as _};
 use tokio::sync::Notify;
 
 use super::native::Native;
-use super::observation::{Observation, Observer};
+use super::observation::{Observation, Observer, Reception};
 use super::plan::Plan;
 use super::{
     Algorithm, ByteCount, Conflict, Digest, Failure, FailureKind, Measurement, Partial, Provenance,
@@ -654,7 +654,6 @@ where
         hashed: restored,
         ..Partial::default()
     };
-    observation.update(&partial, restored);
     let mut stop = pin!(stop);
     let result = receive::<R, F, B, E, _, O>(
         reader,
@@ -747,6 +746,8 @@ where
     let restored = partial.written.0;
     let ranges = Window::partition(partial.written, size);
     let mut settled: Vec<u64> = ranges.iter().map(|range| range.start.0).collect();
+    observation.ranges(&ranges);
+    observation.update(partial, ByteCount(restored), ByteCount(restored));
     let mut work = FuturesUnordered::new();
     for (index, &window) in ranges.iter().enumerate() {
         work.push(advance::<R, F, B, E>(
@@ -785,7 +786,8 @@ where
             accepted,
             extent,
             error,
-            complete,
+            write_failed,
+            reception,
         } = step;
         partial.received.0 = match partial.received.0.checked_add(received) {
             Some(count) => count,
@@ -799,68 +801,80 @@ where
         if extent == WriteExtent::Unconfirmed {
             partial.write_extent = extent;
         }
-        observation.update(partial, ByteCount(restored));
         settled[task.index] = task.offset;
+        observation.range_step(
+            task.index,
+            ByteCount(received),
+            ByteCount(task.offset),
+            extent,
+            reception,
+        );
+        // Even a failed step can acknowledge a real prefix. Account every settled end, including
+        // writes drained after cancellation, before any hash readback can delay observation.
+        let mut available = restored;
+        for (range, end) in ranges.iter().zip(&settled) {
+            if range.start.0 > available {
+                break;
+            }
+            available = *end;
+            if *end != range.end.0 {
+                break;
+            }
+        }
+        observation.update(partial, ByteCount(restored), ByteCount(available));
         if let Some(error) = error {
-            failure.get_or_insert(error);
+            // A negotiable source refusal must not hide a submitted native write's later failure.
+            // Preserve the first native failure and unrelated stop/length/response-validation reasons.
+            if write_failed && matches!(failure, Some(FailureKind::Body(ReaderError::Source(_)))) {
+                failure = Some(error);
+            } else {
+                failure.get_or_insert(error);
+            }
             cancellation.cancel();
         }
-        if failure.is_none() {
-            // Only settled prefixes are visible. Tail writes never let the verifier jump a hole.
-            let mut available = restored;
-            for (range, end) in ranges.iter().zip(&settled) {
-                if range.start.0 > available {
-                    break;
+        if failure.is_none() && checks.active() {
+            while frontier < available {
+                let mut end = available.min(frontier.saturating_add(64 * 1024));
+                // Never persist the last byte as cached EOF authority. Even a fully received
+                // late-error body must be reopened for at least a proper suffix on continuation.
+                if frontier < size.0.saturating_sub(1) {
+                    end = end.min(size.0 - 1);
                 }
-                available = *end;
-                if *end != range.end.0 {
-                    break;
-                }
-            }
-            if checks.active() {
-                while frontier < available {
-                    let mut end = available.min(frontier.saturating_add(64 * 1024));
-                    // Never persist the last byte as cached EOF authority. Even a fully received
-                    // late-error body must be reopened for at least a proper suffix on continuation.
-                    if frontier < size.0.saturating_sub(1) {
-                        end = end.min(size.0 - 1);
-                    }
-                    match native
-                        .read_prefix(ByteCount(frontier), ByteCount(end))
-                        .await
-                    {
-                        Ok(bytes) => {
-                            checks.update(&bytes);
-                            frontier = end;
-                            partial.hashed = ByteCount(frontier);
-                            observation.update(partial, ByteCount(restored));
-                            if frontier < size.0
-                                && let Some(anchor) = checks.prefix_anchor()
-                                && let Err(error) = native
-                                    .checkpoint_prefix(*partial, ByteCount(frontier), anchor)
-                                    .await
-                            {
-                                failure = Some(error.into_kind());
-                                cancellation.cancel();
-                                break;
-                            }
-                            #[cfg(test)]
-                            if let Some(notify) = FRONTIER_TEST
-                                .with(|hook| hook.borrow().as_ref().map(std::sync::Arc::clone))
-                            {
-                                notify.notify_one();
-                            }
-                        }
-                        Err(error) => {
+                match native
+                    .read_prefix(ByteCount(frontier), ByteCount(end))
+                    .await
+                {
+                    Ok(bytes) => {
+                        checks.update(&bytes);
+                        frontier = end;
+                        partial.hashed = ByteCount(frontier);
+                        observation.update(partial, ByteCount(restored), ByteCount(available));
+                        if frontier < size.0
+                            && let Some(anchor) = checks.prefix_anchor()
+                            && let Err(error) = native
+                                .checkpoint_prefix(*partial, ByteCount(frontier), anchor)
+                                .await
+                        {
                             failure = Some(error.into_kind());
                             cancellation.cancel();
                             break;
                         }
+                        #[cfg(test)]
+                        if let Some(notify) = FRONTIER_TEST
+                            .with(|hook| hook.borrow().as_ref().map(std::sync::Arc::clone))
+                        {
+                            notify.notify_one();
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(error.into_kind());
+                        cancellation.cancel();
+                        break;
                     }
                 }
             }
         }
-        if !complete && failure.is_none() {
+        if reception == Reception::Receiving && failure.is_none() {
             work.push(advance::<R, F, B, E>(task, native, &cancellation));
             if received == 0 && accepted == 0 {
                 // Empty ready chunks bypass native I/O, so they must not form an unbounded ready loop.
@@ -870,13 +884,15 @@ where
         // Remaining advance futures are drained after cancellation. Their read/body waits are
         // cancellable, but a write once submitted is not: its accepted prefix must be accounted.
     }
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    if partial.received != size || partial.written != size {
-        return Err(FailureKind::LengthMismatch);
-    }
-    Ok(checks)
+    let result = match failure {
+        Some(error) => Err(error),
+        None if partial.received != size || partial.written != size => {
+            Err(FailureKind::LengthMismatch)
+        }
+        None => Ok(checks),
+    };
+    observation.end_reception(&result);
+    result
 }
 
 #[derive(Default)]
@@ -920,7 +936,8 @@ struct Step<'read, R, B, E> {
     accepted: u64,
     extent: WriteExtent,
     error: Option<FailureKind<ReaderError<E>>>,
-    complete: bool,
+    write_failed: bool,
+    reception: Reception,
 }
 
 async fn advance<'read, R, F, B, E>(
@@ -937,18 +954,19 @@ where
     let mut received = 0;
     let mut accepted = 0;
     let mut extent = WriteExtent::Confirmed;
+    let mut write_failed = false;
     let result = async {
         // A queued slot is not source admission. Do not even construct an opening future after
         // cancellation: a synchronous read method may itself acquire a resource or submit work.
         if cancellation.cancelled.load(Ordering::Acquire) {
-            return Ok(true);
+            return Ok(Reception::Stopped);
         }
         if task.body.is_none() {
             let reader: &'read R = task.reader;
             let opening: F = <R as RangeReader<'read>>::read(reader, task.window);
             let response: ReadResponse<'read, B> = tokio::select! {
                 biased;
-                () = cancellation.wait() => return Ok(true),
+                () = cancellation.wait() => return Ok(Reception::Stopped),
                 response = opening => response.map_err(|error| FailureKind::Body(ReaderError::Source(error)))?,
             };
             if response.evidence != task.evidence {
@@ -963,11 +981,11 @@ where
             let Some(body) = task.body.as_mut() else { return Err(FailureKind::InvalidState); };
             let next = tokio::select! {
                 biased;
-                () = cancellation.wait() => return Ok(true),
+                () = cancellation.wait() => return Ok(Reception::Stopped),
                 next = body.next() => next,
             };
             match next {
-                None if task.offset == task.window.end.0 => return Ok(true),
+                None if task.offset == task.window.end.0 => return Ok(Reception::CleanEof),
                 None => return Err(FailureKind::LengthMismatch),
                 Some(Err(error)) => return Err(FailureKind::Body(ReaderError::Source(error))),
                 Some(Ok(bytes)) => {
@@ -979,12 +997,13 @@ where
                 }
             }
         }
-        if cancellation.cancelled.load(Ordering::Acquire) { return Ok(true); }
+        if cancellation.cancelled.load(Ordering::Acquire) { return Ok(Reception::Stopped); }
         if !task.chunk.is_empty() {
             let bytes = task.chunk.split_to(task.chunk.len().min(64 * 1024));
             match native.write(ByteCount(task.offset), bytes).await {
                 Ok(count) => { accepted = count.0; task.offset += count.0; }
                 Err(error) => {
+                    write_failed = true;
                     match error.accepted {
                         Some(count) => { accepted = count.0; task.offset += count.0; }
                         None => extent = WriteExtent::Unconfirmed,
@@ -993,11 +1012,11 @@ where
                 }
             }
         }
-        Ok(false)
+        Ok(Reception::Receiving)
     }.await;
-    let (complete, error) = match result {
-        Ok(complete) => (complete, None),
-        Err(error) => (true, Some(error)),
+    let (reception, error) = match result {
+        Ok(reception) => (reception, None),
+        Err(error) => (Reception::Failed, Some(error)),
     };
     Step {
         task,
@@ -1005,7 +1024,8 @@ where
         accepted,
         extent,
         error,
-        complete,
+        write_failed,
+        reception,
     }
 }
 

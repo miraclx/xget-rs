@@ -4,7 +4,7 @@ use std::path::Path;
 
 use super::{BindingKey, PlannedFile, PublishedFile, Report, RunFailure, RunId};
 use crate::transfer::observation::Observer as NativeObserver;
-pub use crate::transfer::observation::ProgressFacts;
+pub use crate::transfer::observation::{ProgressFacts, Reception, WindowFacts};
 
 /// Receives synchronous events on the task executing a Client run.
 ///
@@ -12,7 +12,11 @@ pub use crate::transfer::observation::ProgressFacts;
 /// not require Send, Sync, Clone or static observers. Slow callbacks delay that task deliberately;
 /// they are not covered by a payload inactivity timeout. A dropped run emits no promised terminal
 /// event. A callback panic unwinds execution under the same physical-work ownership rules as drop.
-/// Progress facts alone never establish clean EOF, matched requirements or publication.
+/// [`ProgressFacts::available`] reports acknowledged contiguous local coverage independently of
+/// hashing. [`ProgressFacts::windows`] carries at most four actual range windows, not an artificial
+/// split of a whole response. Reception distinguishes actual clean EOF from failure and cooperative
+/// stop; byte counts alone never establish EOF. Even clean EOF does not establish matched checks or
+/// publication. These snapshots provide no persisted reuse authority or storage-path announcement.
 ///
 /// ```no_run
 /// use xget::{Client, client::{Event, Observer}};
@@ -50,6 +54,9 @@ impl Observer for () {
 /// Saved identifiers correlate an actual frozen workspace. An empty no-op has no saved identifier.
 /// Names, source paths and destinations are caller-inspected metadata; machine/terminal renderers
 /// must choose their redaction and escaping rather than dumping Debug representations.
+// Progress carries a bounded Copy snapshot of at most four windows on the caller task. Boxing each
+// synchronous callback would introduce heap traffic solely to match the smaller metadata variants.
+#[allow(clippy::large_enum_variant)]
 pub enum Event<'event> {
     /// Execution has its frozen assignments and, when needed, saved-run ownership.
     RunStarted {
@@ -67,7 +74,8 @@ pub enum Event<'event> {
         /// Read-only selected metadata and assignment; no payload body is acquired by this borrow.
         planned: &'event PlannedFile,
     },
-    /// Logical and current-attempt counters from settled native/source work.
+    /// Source-backed logical/current-attempt work, settled available prefix and actual range windows.
+    /// This event carries no new file/end ordering or terminal-callback promise.
     Progress {
         /// Frozen member to which the facts belong.
         key: BindingKey,
@@ -117,3 +125,7 @@ impl<O: Observer + ?Sized> NativeObserver for FileProgress<'_, O> {
         });
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "observation_tests.rs"]
+mod tests;

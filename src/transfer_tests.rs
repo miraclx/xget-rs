@@ -82,6 +82,9 @@ async fn body_observation_is_borrowed_exact_and_does_not_invent_hash_work() {
         assert_eq!(facts.attempt_received(), facts.received());
         assert_eq!(facts.attempt_written(), facts.written());
         assert_eq!(facts.hashed(), receipt.partial().hashed);
+        assert_eq!(facts.available(), ByteCount(70_000));
+        assert_eq!(facts.reception(), super::observation::Reception::CleanEof);
+        assert_eq!(facts.windows().count(), 0);
         assert_eq!(
             facts.hashed(),
             if measurement == Measurement::None {
@@ -127,6 +130,16 @@ async fn stopped_and_overlong_body_observation_does_not_claim_publication() {
         assert_eq!(facts.received(), failure.partial.received);
         assert_eq!(facts.written(), ByteCount(0));
         assert_eq!(facts.hashed(), ByteCount(0));
+        assert_eq!(facts.available(), ByteCount(0));
+        assert_eq!(facts.windows().count(), 0);
+        assert_eq!(
+            facts.reception(),
+            if stop_now {
+                super::observation::Reception::Stopped
+            } else {
+                super::observation::Reception::Failed
+            }
+        );
         assert_eq!(
             facts.received(),
             if stop_now { ByteCount(0) } else { ByteCount(3) },

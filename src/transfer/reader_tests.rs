@@ -29,6 +29,20 @@ impl super::Observer for ReaderObservation<'_> {
     }
 }
 
+#[cfg(unix)]
+struct ReaderSignal<'a> {
+    facts: &'a RefCell<Vec<crate::transfer::observation::ProgressFacts>>,
+    changed: &'a tokio::sync::Notify,
+}
+
+#[cfg(unix)]
+impl super::Observer for ReaderSignal<'_> {
+    fn observe(&mut self, facts: crate::transfer::observation::ProgressFacts) {
+        self.facts.borrow_mut().push(facts);
+        self.changed.notify_one();
+    }
+}
+
 struct Directory(PathBuf);
 
 impl Directory {
@@ -109,6 +123,9 @@ async fn reader_stop_during_seal_settles_without_publication_or_writable_reentry
     assert_eq!(terminal.received(), failure.partial.received);
     assert_eq!(terminal.written(), failure.partial.written);
     assert_eq!(terminal.hashed(), failure.partial.hashed);
+    // Reception really reached EOF before sealing; a later stop is not a failed body or publication.
+    assert_eq!(terminal.reception(), super::Reception::CleanEof);
+    assert_eq!(terminal.available(), ByteCount(3));
     assert!(matches!(failure.kind, FailureKind::Stopped));
     assert!(!output.exists());
     let record =
@@ -176,30 +193,49 @@ fn a_send_but_not_sync_observer_preserves_one_borrows_send_reader_future() {
 #[cfg(unix)]
 #[tokio::test]
 async fn reader_observation_without_checks_keeps_hash_work_zero() {
-    let directory = Directory::create();
-    let reader = Memory {
-        bytes: b"abc",
-        behavior: Behavior::Exact,
-        calls: Rc::new(Cell::new(0)),
-    };
-    let facts = Rc::new(RefCell::new(Vec::new()));
-    let mut observer = ReaderObservation(&facts);
-    let receipt = ReaderTransfer::from_reader(&reader)
-        .measurement(Measurement::None)
-        .to_file(directory.0.join("output"))
-        .unwrap()
-        .run_registered_observed(None, &mut observer)
-        .await
-        .unwrap();
-    assert_eq!(receipt.native().partial().hashed, ByteCount(0));
-    let facts = facts.borrow();
-    assert!(facts.iter().all(|facts| facts.hashed() == ByteCount(0)));
-    let terminal = *facts.last().unwrap();
-    assert_eq!(terminal.received(), ByteCount(3));
-    assert_eq!(terminal.written(), ByteCount(3));
-    assert_eq!(terminal.attempt_received(), ByteCount(3));
-    assert_eq!(terminal.attempt_written(), ByteCount(3));
-    assert_eq!(terminal.restored(), ByteCount(0));
+    for bytes in [b"".as_slice(), b"a", b"abc", b"unequal windows"] {
+        let directory = Directory::create();
+        let reader = Memory {
+            bytes,
+            behavior: Behavior::Exact,
+            calls: Rc::new(Cell::new(0)),
+        };
+        let facts = Rc::new(RefCell::new(Vec::new()));
+        let mut observer = ReaderObservation(&facts);
+        let receipt = ReaderTransfer::from_reader(&reader)
+            .measurement(Measurement::None)
+            .to_file(directory.0.join("output"))
+            .unwrap()
+            .run_registered_observed(None, &mut observer)
+            .await
+            .unwrap();
+        assert_eq!(receipt.native().partial().hashed, ByteCount(0));
+        let facts = facts.borrow();
+        assert!(facts.iter().all(|facts| facts.hashed() == ByteCount(0)));
+        let terminal = *facts.last().unwrap();
+        let size = ByteCount(bytes.len() as u64);
+        assert_eq!(terminal.received(), size);
+        assert_eq!(terminal.written(), size);
+        assert_eq!(terminal.attempt_received(), size);
+        assert_eq!(terminal.attempt_written(), size);
+        assert_eq!(terminal.restored(), ByteCount(0));
+        assert_eq!(terminal.available(), size);
+        assert_eq!(
+            terminal.reception(),
+            if bytes.is_empty() {
+                super::Reception::Pending
+            } else {
+                super::Reception::CleanEof
+            }
+        );
+        assert_eq!(terminal.windows().count(), bytes.len().min(4));
+        assert!(
+            terminal
+                .windows()
+                .all(|window| window.reception() == super::Reception::CleanEof)
+        );
+        assert_eq!(reader.calls.get() as usize, bytes.len().min(4));
+    }
 }
 
 #[test]
@@ -380,12 +416,21 @@ async fn first_opening_failure_prevents_invoking_queued_openings() {
     }
     let directory = Directory::create();
     let reader = FailFirst(Cell::new(0));
+    let facts = Rc::new(RefCell::new(Vec::new()));
+    let mut observer = ReaderObservation(&facts);
     let failure = ReaderTransfer::from_reader(&reader)
         .to_file(directory.0.join("output"))
         .unwrap()
-        .run()
+        .run_registered_observed(None, &mut observer)
         .await
         .unwrap_err();
+    let terminal = *facts.borrow().last().unwrap();
+    assert_eq!(terminal.available(), ByteCount(0));
+    assert_eq!(terminal.reception(), super::Reception::Failed);
+    assert!(terminal.windows().all(|window| matches!(
+        window.reception(),
+        super::Reception::Failed | super::Reception::Stopped
+    )));
     assert!(matches!(
         failure.kind,
         FailureKind::Body(ReaderError::Source("opening failed"))
@@ -730,13 +775,23 @@ async fn wrong_windows_changed_sessions_short_overlong_and_late_errors_cannot_pu
             behavior,
             calls: Rc::new(Cell::new(0)),
         };
+        let facts = Rc::new(RefCell::new(Vec::new()));
+        let mut observer = ReaderObservation(&facts);
         let failure = ReaderTransfer::from_reader(&reader)
             .expect(required())
             .to_file(directory.0.join("output"))
             .unwrap()
-            .run()
+            .run_registered_observed(None, &mut observer)
             .await
             .unwrap_err();
+        let terminal = *facts.borrow().last().unwrap();
+        assert_eq!(terminal.reception(), super::Reception::Failed);
+        assert!(
+            terminal
+                .windows()
+                .any(|window| window.reception() == super::Reception::Failed)
+        );
+        assert!(terminal.available() <= terminal.written());
         assert!(failure.partial.received >= failure.partial.written);
         if matches!(behavior, Behavior::Overlong) {
             assert!(failure.partial.received > failure.partial.written);
@@ -844,9 +899,328 @@ async fn failed_physical_steps_keep_accepted_prefixes_and_mark_lost_extents_unco
         assert_eq!(observed.written(), partial.written);
         assert_eq!(observed.hashed(), partial.hashed);
         assert_eq!(observed.write_extent(), partial.write_extent);
+        assert_eq!(observed.reception(), super::Reception::Failed);
+        let head = observed.windows().next().unwrap();
+        assert_eq!(observed.available(), head.written());
+        if lose_result {
+            assert_eq!(observed.available(), ByteCount(0));
+            assert_eq!(head.write_extent(), WriteExtent::Unconfirmed);
+        } else {
+            assert_eq!(observed.available(), ByteCount(1));
+        }
         assert!(partial.received.0 >= partial.written.0);
         assert!(!directory.0.join("output").exists());
         drop(native);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_drained_write_failure_supersedes_an_earlier_source_only_refusal() {
+    use core::pin::Pin;
+    use core::sync::atomic::Ordering;
+    use core::task::{Context, Poll, Waker};
+
+    use futures::Stream;
+    use tokio::sync::Notify;
+
+    struct Refusal {
+        ready: Cell<bool>,
+        waiting: RefCell<Vec<Waker>>,
+    }
+    struct Body<'read> {
+        reader: &'read Refusal,
+        head: bool,
+        yielded: bool,
+    }
+    impl Stream for Body<'_> {
+        type Item = Result<Bytes, &'static str>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if self.head {
+                if self.yielded {
+                    return Poll::Pending;
+                }
+                self.yielded = true;
+                return Poll::Ready(Some(Ok(Bytes::from_static(b"head"))));
+            }
+            if !self.reader.ready.get() {
+                self.reader
+                    .waiting
+                    .borrow_mut()
+                    .push(Waker::clone(cx.waker()));
+                return Poll::Pending;
+            }
+            Poll::Ready(Some(Err("source-only refusal")))
+        }
+    }
+    impl<'read> RangeReader<'read> for Refusal {
+        type Error = &'static str;
+        type Body = Body<'read>;
+        type Read = Ready<Result<ReadResponse<'read, Self::Body>, Self::Error>>;
+        fn size(&self) -> ByteCount {
+            ByteCount(16)
+        }
+        fn evidence(&'read self) -> Evidence<'read> {
+            Evidence::Enforced {
+                representation: "bytes",
+                version: b"one",
+            }
+        }
+        fn read(&'read self, window: Window) -> Self::Read {
+            ready(Ok(ReadResponse {
+                window,
+                evidence: self.evidence(),
+                body: Body {
+                    reader: self,
+                    head: window.start() == ByteCount(0),
+                    yielded: false,
+                },
+            }))
+        }
+    }
+    let directory = Directory::create();
+    let reader = Refusal {
+        ready: Cell::new(false),
+        waiting: RefCell::new(Vec::new()),
+    };
+    let pending = ReaderTransfer::from_reader(&reader)
+        .measurement(Measurement::None)
+        .to_file(directory.0.join("output"))
+        .unwrap();
+    let native = super::Native::acquire_reader(pending.plan, pending.session, pending.resume, None)
+        .await
+        .unwrap();
+    native
+        .hooks()
+        .fail_write_prefix
+        .store(true, Ordering::Release);
+    let held = native.hooks().write.install();
+    let facts = RefCell::new(Vec::new());
+    let changed = Notify::new();
+    let mut observer = ReaderSignal {
+        facts: &facts,
+        changed: &changed,
+    };
+    let mut observation =
+        super::Observation::start(&mut observer, crate::transfer::Length::Known(reader.size()));
+    let mut partial = crate::transfer::Partial::default();
+    let mut receiving = Box::pin(super::receive(
+        &reader,
+        reader.size(),
+        reader.evidence(),
+        &native,
+        &mut partial,
+        native.policy().start(),
+        core::future::pending(),
+        &mut observation,
+    ));
+    let result = tokio::time::timeout(core::time::Duration::from_secs(5), async {
+        tokio::select! {
+            _ = &mut receiving => panic!("submitted head write must be held"),
+            () = held.entered.notified() => {}
+        }
+        reader.ready.set(true);
+        for waker in reader.waiting.borrow_mut().drain(..) { waker.wake(); }
+        loop {
+            tokio::select! {
+                _ = &mut receiving => panic!("source refusal must drain the held write"),
+                () = changed.notified() => {
+                    if facts.borrow().last().is_some_and(|facts| facts.reception() == super::Reception::Failed) { break; }
+                }
+            }
+        }
+        assert_eq!(facts.borrow().last().unwrap().written(), ByteCount(0));
+        held.release();
+        receiving.as_mut().await
+    }).await.unwrap();
+    drop(receiving);
+    match result {
+        Err(FailureKind::Io {
+            phase: crate::transfer::Phase::Write,
+            cause,
+        }) => assert_eq!(cause.to_string(), "injected write failure"),
+        Err(other) => {
+            panic!("settled native cause must prevent source-only negotiation: {other:?}")
+        }
+        Ok(_) => panic!("a source refusal plus failed write cannot succeed"),
+    }
+    assert_eq!(partial.written, ByteCount(1));
+    assert_eq!(
+        partial.write_extent,
+        crate::transfer::WriteExtent::Confirmed
+    );
+    let terminal = *facts.borrow().last().unwrap();
+    assert_eq!(terminal.available(), ByteCount(1));
+    assert_eq!(
+        terminal.write_extent(),
+        crate::transfer::WriteExtent::Confirmed
+    );
+    assert_eq!(terminal.windows().next().unwrap().written(), ByteCount(1));
+    assert_eq!(terminal.reception(), super::Reception::Failed);
+    assert!(!directory.0.join("output").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn available_prefix_precedes_hash_readback_and_does_not_depend_on_hashing() {
+    use core::pin::Pin;
+    use core::task::{Context, Poll, Waker};
+
+    use futures::Stream;
+    use tokio::sync::Notify;
+
+    struct Gated {
+        head_ready: Cell<bool>,
+        finish_head: Cell<bool>,
+        head_waker: RefCell<Option<Waker>>,
+    }
+    struct Body<'read> {
+        reader: &'read Gated,
+        window: Window,
+        sent: u64,
+    }
+    impl Stream for Body<'_> {
+        type Item = Result<Bytes, core::convert::Infallible>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let head = self.window.start() == ByteCount(0);
+            if head
+                && ((!self.reader.head_ready.get() && self.sent == 0)
+                    || (!self.reader.finish_head.get() && self.sent != 0))
+            {
+                *self.reader.head_waker.borrow_mut() = Some(Waker::clone(cx.waker()));
+                return Poll::Pending;
+            }
+            let remaining = self.window.end().0 - self.window.start().0 - self.sent;
+            if remaining == 0 {
+                return Poll::Ready(None);
+            }
+            let count = if head && self.sent == 0 { 2 } else { remaining };
+            self.sent += count;
+            Poll::Ready(Some(Ok(Bytes::from(vec![0; count as usize]))))
+        }
+    }
+    impl<'read> RangeReader<'read> for Gated {
+        type Error = core::convert::Infallible;
+        type Body = Body<'read>;
+        type Read = Ready<Result<ReadResponse<'read, Self::Body>, Self::Error>>;
+        fn size(&self) -> ByteCount {
+            ByteCount(19)
+        }
+        fn evidence(&'read self) -> Evidence<'read> {
+            Evidence::Enforced {
+                representation: "zeros",
+                version: b"one",
+            }
+        }
+        fn read(&'read self, window: Window) -> Self::Read {
+            ready(Ok(ReadResponse {
+                window,
+                evidence: self.evidence(),
+                body: Body {
+                    reader: self,
+                    window,
+                    sent: 0,
+                },
+            }))
+        }
+    }
+
+    for measurement in [Measurement::None, Measurement::default()] {
+        let directory = Directory::create();
+        let reader = Gated {
+            head_ready: Cell::new(false),
+            finish_head: Cell::new(false),
+            head_waker: RefCell::new(None),
+        };
+        let pending = ReaderTransfer::from_reader(&reader)
+            .measurement(measurement)
+            .to_file(directory.0.join("output"))
+            .unwrap();
+        let native =
+            super::Native::acquire_reader(pending.plan, pending.session, pending.resume, None)
+                .await
+                .unwrap();
+        let held = native.hooks().read.install();
+        let facts = RefCell::new(Vec::new());
+        let changed = Notify::new();
+        let mut observer = ReaderSignal {
+            facts: &facts,
+            changed: &changed,
+        };
+        let mut observation =
+            super::Observation::start(&mut observer, crate::transfer::Length::Known(reader.size()));
+        let mut partial = crate::transfer::Partial::default();
+        let mut receiving = Box::pin(super::receive(
+            &reader,
+            reader.size(),
+            reader.evidence(),
+            &native,
+            &mut partial,
+            native.policy().start(),
+            core::future::pending(),
+            &mut observation,
+        ));
+        tokio::time::timeout(core::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    _ = &mut receiving => panic!("held head must not finish"),
+                    () = changed.notified() => {
+                        if facts.borrow().last().is_some_and(|facts| facts.written() == ByteCount(14)) { break; }
+                    }
+                }
+            }
+            let tails = *facts.borrow().last().unwrap();
+            assert_eq!(tails.available(), ByteCount(0));
+            assert_eq!(tails.hashed(), ByteCount(0));
+            let windows: Vec<_> = tails.windows().collect();
+            assert_eq!(windows.iter().map(|facts| (facts.window().start().0, facts.window().end().0)).collect::<Vec<_>>(), [(0, 5), (5, 10), (10, 15), (15, 19)]);
+            assert_eq!(windows[0].written(), ByteCount(0));
+            assert_eq!(windows[3].written(), ByteCount(4));
+            reader.head_ready.set(true);
+            reader.head_waker.borrow_mut().take().unwrap().wake();
+            if measurement != Measurement::None {
+                tokio::select! {
+                    _ = &mut receiving => panic!("hash readback must be held"),
+                    () = held.entered.notified() => {}
+                }
+            } else {
+                loop {
+                    tokio::select! {
+                        _ = &mut receiving => panic!("partial head must not finish"),
+                        () = changed.notified() => {
+                            if facts.borrow().last().is_some_and(|facts| facts.available() == ByteCount(2)) { break; }
+                        }
+                    }
+                }
+            }
+            let head = *facts.borrow().last().unwrap();
+            assert_eq!(head.available(), ByteCount(2));
+            assert_eq!(head.written(), ByteCount(16));
+            assert_eq!(head.hashed(), ByteCount(0));
+            assert_eq!(head.windows().next().unwrap().written(), ByteCount(2));
+            assert_eq!(head.windows().next().unwrap().reception(), super::Reception::Receiving);
+            held.release();
+            reader.finish_head.set(true);
+            if let Some(waker) = reader.head_waker.borrow_mut().take() { waker.wake(); }
+            receiving.as_mut().await.unwrap();
+        }).await.unwrap();
+        drop(receiving);
+        let terminal = *facts.borrow().last().unwrap();
+        assert_eq!(terminal.available(), reader.size());
+        assert_eq!(terminal.reception(), super::Reception::CleanEof);
+        assert_eq!(terminal.windows().count(), 4);
+        assert_eq!(
+            terminal.hashed(),
+            if measurement == Measurement::None {
+                ByteCount(0)
+            } else {
+                reader.size()
+            }
+        );
+        assert!(
+            !directory.0.join("output").exists(),
+            "reception alone does not publish"
+        );
     }
 }
 
@@ -939,16 +1313,16 @@ async fn tails_then_partial_head_are_hashed_before_the_head_can_finish() {
     let receipt = result.unwrap().unwrap();
     assert_eq!(receipt.native().partial().hashed, ByteCount(16));
     let facts = facts.borrow();
-    assert!(
-        facts
-            .iter()
-            .any(|facts| { facts.written() == ByteCount(12) && facts.hashed() == ByteCount(0) })
-    );
-    assert!(
-        facts
-            .iter()
-            .any(|facts| { facts.written() == ByteCount(14) && facts.hashed() == ByteCount(2) })
-    );
+    assert!(facts.iter().any(|facts| {
+        facts.written() == ByteCount(12)
+            && facts.hashed() == ByteCount(0)
+            && facts.available() == ByteCount(0)
+    }));
+    assert!(facts.iter().any(|facts| {
+        facts.written() == ByteCount(14)
+            && facts.hashed() == ByteCount(2)
+            && facts.available() == ByteCount(2)
+    }));
     let terminal = *facts.last().unwrap();
     assert_eq!(terminal.attempt_received(), ByteCount(16));
     assert_eq!(terminal.attempt_written(), ByteCount(16));
@@ -1077,6 +1451,10 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
                 () = reader.paused.notified() => {}
             }
             drop(running);
+            assert_eq!(
+                initial_facts.borrow().last().unwrap().reception(),
+                super::Reception::Receiving
+            );
         } else {
             let failure = pending
                 .run_registered_until_observed(
@@ -1090,6 +1468,12 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
             assert_eq!(terminal.received(), failure.partial.received);
             assert_eq!(terminal.written(), failure.partial.written);
             assert_eq!(terminal.hashed(), failure.partial.hashed);
+            assert_eq!(terminal.reception(), super::Reception::Stopped);
+            assert_eq!(terminal.available(), ByteCount(4));
+            assert_eq!(
+                terminal.windows().next().unwrap().reception(),
+                super::Reception::Stopped
+            );
             assert!(matches!(failure.kind, FailureKind::Stopped));
         }
         let stopped_observations = initial_facts.borrow().len();
@@ -1142,6 +1526,12 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
                 && facts.hashed() == ByteCount(4)
                 && facts.attempt_received() == ByteCount(0)
                 && facts.attempt_written() == ByteCount(0)
+                && facts.available() == ByteCount(4)
+                && facts
+                    .windows()
+                    .map(|window| (window.window().start().0, window.window().end().0))
+                    .collect::<Vec<_>>()
+                    == [(4, 11), (11, 18), (18, 25), (25, 32)]
         }));
         let terminal = *facts.last().unwrap();
         assert_eq!(terminal.received(), ByteCount(32));
@@ -1150,6 +1540,22 @@ async fn real_stop_and_drop_restore_only_anchored_prefix_and_fetch_only_suffix()
         assert_eq!(terminal.restored(), ByteCount(4));
         assert_eq!(terminal.attempt_received(), ByteCount(28));
         assert_eq!(terminal.attempt_written(), ByteCount(28));
+        assert_eq!(terminal.available(), ByteCount(32));
+        assert_eq!(terminal.reception(), super::Reception::CleanEof);
+        assert_eq!(
+            terminal
+                .windows()
+                .map(|window| window.received().0)
+                .sum::<u64>(),
+            28
+        );
+        assert_eq!(
+            terminal
+                .windows()
+                .map(|window| window.written().0)
+                .sum::<u64>(),
+            28
+        );
         assert_eq!(initial_facts.borrow().len(), stopped_observations);
         assert!(
             reader

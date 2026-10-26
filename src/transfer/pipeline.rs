@@ -45,10 +45,11 @@ impl Run {
         let mut partial = Partial::default();
         let mut stop = pin!(stop);
         // The consuming helper drops the body before sealing/publication; no detached body pump exists.
-        let outcome = match self
+        let reception = self
             .receive(body, stop.as_mut(), &mut partial, observation)
-            .await
-        {
+            .await;
+        observation.end_reception(&reception);
+        let outcome = match reception {
             Ok(checks) => match self.native.seal(partial.written).await {
                 Ok(()) => tokio::select! {
                     biased;
@@ -115,6 +116,7 @@ impl Run {
         let mut body = pin!(body);
         let mut checks = self.native.policy().start();
         let hashing = checks.active();
+        observation.receiving();
         loop {
             // Stop wins simultaneous readiness and is checked between every bounded physical write.
             let next = tokio::select! {
@@ -133,7 +135,7 @@ impl Run {
                     .checked_add(chunk.len() as u64)
                     .ok_or(FailureKind::LengthOverflow)?,
             );
-            observation.update(partial, ByteCount(0));
+            observation.update(partial, ByteCount(0), partial.written);
             if let Length::Known(expected) = self.length
                 && partial.received > expected
             {
@@ -176,11 +178,11 @@ impl Run {
                         } else {
                             partial.write_extent = WriteExtent::Unconfirmed;
                         }
-                        observation.update(partial, ByteCount(0));
+                        observation.update(partial, ByteCount(0), partial.written);
                         return Err(error.error.into_kind());
                     }
                 }
-                observation.update(partial, ByteCount(0));
+                observation.update(partial, ByteCount(0), partial.written);
                 offset = end;
             }
         }

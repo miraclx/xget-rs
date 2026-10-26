@@ -468,8 +468,13 @@ async fn main() -> Result<(), Box<dyn core::error::Error>> {
 
 Events distinguish frozen metadata, byte-work facts, individual publications and the returned run
 outcome. `ProgressFacts` separates logical totals, validated restored bytes and current-attempt work.
-Hash counts are zero when no checks are active. Reaching a length proves neither EOF nor matched
-checks. Reconciled publications emit no invented attempt progress; a file completion can precede an
+Its `available()` is the contiguous acknowledged settled prefix, independent of hashing: range tails
+do not fill a head gap. `windows()` exposes at most four actual offset-ordered current-attempt reader
+windows, with received and written counts, extent certainty and reception state. Whole ordered bodies
+have no synthetic windows. `Reception::CleanEof` describes reception only, not checks or publication.
+These facts are observations, not persisted permission to reuse bytes or a guarantee against concurrent
+owner changes. Hash counts are zero when no checks are active. Reaching a length proves neither EOF nor
+matched checks. Reconciled publications emit no invented attempt progress; a file completion can precede an
 aggregate checkpoint failure, so use the returned terminal result to judge the whole run.
 
 Callbacks must return promptly. Drop or callback panic promises no terminal callback, rollback or

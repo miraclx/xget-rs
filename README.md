@@ -215,8 +215,13 @@ and a nonempty `NO_COLOR` disables color without changing filenames or progress 
 The active region keeps its ribbon scale fixed within a terminal-width profile, with received bytes,
 or sink-accepted bytes for live output, on separate metric rows. Numbers growing do not shrink the
 track; resize recomposes the owned region on the next observed update. Rate and ETA use current-attempt
-source bytes, never restored bytes. Reaching 100% still awaits clean completion, required checks and
-publication or sink flush. Sizes use xbytes IEC bytes; `--bits` changes speed only, and `--raw-sizes` wins.
+source bytes, never restored bytes. A ranged file uses the same ribbon with its actual windows in
+increasing offset order, separated by slim dividers; filled tails do not fill a missing head. A restored
+prefix occupies a separate segment, not a new requested window. Whole bodies have one received track,
+not invented chunks. `available prefix` separately labels the contiguous acknowledged written prefix,
+independent of hashing or apparent file length. Neither the received map nor availability is verification.
+Reaching 100% still awaits clean completion, required checks and publication or sink flush. Sizes use
+xbytes IEC bytes; `--bits` changes speed only, and `--raw-sizes` wins.
 
 Each successful file has a readable `saved` or `delivered` receipt, distinctly labeled required matches
 and optional measurements, and one elapsed-time summary. An identical required/measured digest is

@@ -16,6 +16,7 @@ fn zero_unknown_overrun_and_live_acceptance_keep_distinct_human_counts_without_c
         settled: ByteCount(0),
         hashed: ByteCount(0),
         source: ByteCount(0),
+        native: None,
         delivery: Delivery::Native {
             restored: ByteCount(0),
             written: ByteCount(0),
@@ -59,6 +60,7 @@ fn restored_logical_jumps_never_enter_the_source_rate() {
         settled: ByteCount(900_000),
         hashed: ByteCount(900_000),
         source: ByteCount(0),
+        native: None,
         delivery: Delivery::Native {
             restored: ByteCount(900_000),
             written: ByteCount(0),
@@ -174,6 +176,7 @@ fn live_facts_describe_sink_acceptance_not_native_publication_or_write_extents()
         settled: ByteCount(3),
         hashed: ByteCount(3),
         source: ByteCount(3),
+        native: None,
         delivery: Delivery::Live {
             released: ByteCount(3),
         },
@@ -202,6 +205,7 @@ fn native_unconfirmed_extents_remain_explicit_without_verified_claims() {
         settled: ByteCount(3),
         hashed: ByteCount(2),
         source: ByteCount(10),
+        native: None,
         delivery: Delivery::Native {
             restored: ByteCount(0),
             written: ByteCount(3),
@@ -249,6 +253,7 @@ fn machine_counts_are_exact_integers_with_fixed_units_and_no_human_policy() {
         settled: ByteCount(u64::MAX),
         hashed: ByteCount(0),
         source: ByteCount(u64::MAX),
+        native: None,
         delivery: Delivery::Live {
             released: ByteCount(u64::MAX),
         },
@@ -383,6 +388,7 @@ fn ribbon_percent_is_exact_tenths_and_a_full_received_frontier_still_awaits_comp
         settled: ByteCount(32),
         hashed: ByteCount(0),
         source: ByteCount(160),
+        native: None,
         delivery: Delivery::Native {
             restored: ByteCount(0),
             written: ByteCount(32),

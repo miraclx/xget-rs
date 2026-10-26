@@ -1,6 +1,8 @@
+use xget::transfer::ByteCount;
+use xget::transfer::reader::Window;
 use xprogress::{Bar, DrawTarget};
 
-use super::{Color, Decoration, Footprint, Glyphs, RibbonStyle, Row, Theme};
+use super::{Color, Decoration, Footprint, Glyphs, RangeShape, RibbonStyle, Row, Theme};
 
 fn sample_row() -> Row {
     Row {
@@ -9,6 +11,7 @@ fn sample_row() -> Row {
         rate: Some("5 KiB/s".to_owned()),
         eta: Some("ETA 1s".to_owned()),
         percent: Some("50.0%".to_owned()),
+        coverage: None,
     }
 }
 
@@ -99,6 +102,7 @@ fn narrow_profiles_wrap_required_counts_and_drop_optional_eta_before_rate() {
         rate: None,
         eta: None,
         percent: Some("100.0%".to_owned()),
+        coverage: None,
     };
     let layout = huge.layout(20, Decoration::Bar);
     assert!(!layout.updating);
@@ -179,6 +183,88 @@ fn resize_cleanup_counts_reflowed_rows_without_counting_our_sgr_bytes() {
     footprint.record("next frame");
     assert_eq!(footprint.rows_at(80), 1);
     assert_eq!(Footprint::default().rows_at(20), 0);
+}
+
+#[test]
+fn actual_range_shapes_keep_tail_reception_after_a_visible_head_gap() {
+    let size = ByteCount(8);
+    let shape = RangeShape {
+        restored: ByteCount(0),
+        windows: [
+            Window::new(ByteCount(0), ByteCount(2), size),
+            Window::new(ByteCount(2), ByteCount(4), size),
+            Window::new(ByteCount(4), ByteCount(6), size),
+            Window::new(ByteCount(6), size, size),
+        ],
+    };
+    for glyphs in [Glyphs::Unicode, Glyphs::Ascii] {
+        let theme = theme(RibbonStyle::Classic, glyphs);
+        let mut bar = Bar::new(shape.sizes())
+            .with_target(DrawTarget::hidden())
+            .with_style(theme.style());
+        for index in 1..4 {
+            bar.advance(index, 2_u64);
+        }
+        for width in [48, 28, 8] {
+            let text = bar.render(width);
+            assert_eq!(text.chars().count(), usize::from(width));
+            let separator = if matches!(glyphs, Glyphs::Ascii) {
+                '|'
+            } else {
+                '│'
+            };
+            let parts: Vec<_> = text.split(separator).collect();
+            assert_eq!(parts.len(), 4);
+            assert!(parts[0].chars().all(|glyph| glyph == theme.style().blank()));
+            assert!(
+                parts[1..]
+                    .iter()
+                    .all(|part| part.chars().all(|glyph| glyph == theme.style().filler()))
+            );
+        }
+    }
+}
+
+#[test]
+fn restored_prefix_is_separate_from_the_actual_suffix_window_sizes() {
+    let size = ByteCount(u64::MAX);
+    let shape = RangeShape {
+        restored: ByteCount(1),
+        windows: [Window::new(ByteCount(1), size, size), None, None, None],
+    };
+    assert_eq!(shape.sizes().collect::<Vec<_>>(), [1, u64::MAX - 1]);
+    let one = RangeShape {
+        restored: ByteCount(0),
+        windows: [
+            Window::new(ByteCount(0), ByteCount(1), ByteCount(1)),
+            None,
+            None,
+            None,
+        ],
+    };
+    assert_eq!(one.sizes().collect::<Vec<_>>(), [1]);
+}
+
+#[test]
+fn available_prefix_is_explicit_and_wrapped_independently_of_received_metrics() {
+    let mut row = sample_row();
+    row.coverage = Some("available prefix 0 B; 4 ranges, receiving".to_owned());
+    for columns in [80, 40, 20] {
+        let layout = row.layout(columns, Decoration::Bar);
+        assert!(layout.updating);
+        assert!(
+            layout
+                .text
+                .lines()
+                .all(|line| line.len() < usize::from(columns))
+        );
+        assert!(layout.text.contains("prefix"));
+        assert!(!layout.text.contains("verified"));
+    }
+    assert!(
+        row.plain()
+            .ends_with("available prefix 0 B; 4 ranges, receiving")
+    );
 }
 
 #[test]

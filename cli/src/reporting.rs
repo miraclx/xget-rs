@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use clap::Args;
 use serde_json::{Value, json};
-use xget::client::{BindingKey, Event, Observer, ProgressFacts};
+use xget::client::{BindingKey, Event, Observer, ProgressFacts, Reception};
 use xget::transfer::{ByteCount, Length, WriteExtent};
 
 use crate::display::DisplayFormat;
@@ -96,6 +96,7 @@ pub(crate) struct Reporter<'output> {
     human_rate: RecentRate,
     last_human: Option<Duration>,
     last_count: Option<ByteCount>,
+    last_native: Option<ProgressFacts>,
     restored_shown: bool,
     position: Position,
     bar: Option<TerminalBar>,
@@ -124,6 +125,7 @@ impl<'output> Reporter<'output> {
             human_rate: RecentRate::at(Duration::ZERO),
             last_human: None,
             last_count: None,
+            last_native: None,
             restored_shown: false,
             position: Position {
                 current: 0,
@@ -191,6 +193,7 @@ impl<'output> Reporter<'output> {
             settled: accepted,
             hashed: progress.hashed,
             source: progress.received,
+            native: None,
             delivery: Delivery::Live {
                 released: progress.released,
             },
@@ -260,7 +263,7 @@ impl<'output> Reporter<'output> {
             self.restored_shown = true;
         }
         let count = snapshot.count();
-        if self.last_count == Some(count)
+        if (self.last_count == Some(count) && self.last_native == snapshot.native)
             || self
                 .last_human
                 .is_some_and(|last| elapsed.saturating_sub(last) < Duration::from_millis(200))
@@ -268,10 +271,11 @@ impl<'output> Reporter<'output> {
             return;
         }
         self.last_count = Some(count);
+        self.last_native = snapshot.native;
         self.last_human = Some(elapsed);
         let row = snapshot.human(self.units, self.human_rate.rate(elapsed));
         let result = match &mut self.bar {
-            Some(bar) => bar.render(snapshot.length, count, &row),
+            Some(bar) => bar.render(snapshot.length, count, snapshot.native, &row),
             None => self.output.human_progress(&format!("  {}", row.plain())),
         };
         self.record(result);
@@ -331,6 +335,7 @@ impl<'output> Reporter<'output> {
                 self.human_rate = RecentRate::at(elapsed);
                 self.last_human = None;
                 self.last_count = None;
+                self.last_native = None;
                 self.restored_shown = false;
                 self.position.current += 1;
                 if self.mode == Mode::None {
@@ -429,6 +434,7 @@ struct Snapshot {
     settled: ByteCount,
     hashed: ByteCount,
     source: ByteCount,
+    native: Option<ProgressFacts>,
     delivery: Delivery,
 }
 
@@ -452,6 +458,7 @@ impl Snapshot {
             settled: facts.written(),
             hashed: facts.hashed(),
             source: facts.attempt_received(),
+            native: Some(facts),
             delivery: Delivery::Native {
                 restored: facts.restored(),
                 written: facts.attempt_written(),
@@ -564,12 +571,28 @@ impl Snapshot {
             }
             _ => None,
         };
+        let coverage = self.native.map(|facts| {
+            let mut text = format!("available prefix {}", human.size(facts.available().0));
+            let ranges = facts.windows().count();
+            if ranges != 0 {
+                let reception = match facts.reception() {
+                    Reception::Pending => "pending",
+                    Reception::Receiving => "receiving",
+                    Reception::CleanEof => "eof; awaiting completion",
+                    Reception::Failed => "failed",
+                    Reception::Stopped => "stopped",
+                };
+                text.push_str(&format!("; {ranges} ranges, {reception}"));
+            }
+            text
+        });
         Row {
             count: count.replace('/', " / "),
             detailed,
             percent,
             rate: rate.map(|BytesPerSecond(rate)| human.speed(rate)),
             eta,
+            coverage,
         }
     }
 }

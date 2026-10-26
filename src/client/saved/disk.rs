@@ -53,7 +53,7 @@ pub(super) async fn checkpoint(
     work(move || {
         let _registration = registration;
         #[cfg(all(test, unix))]
-        tests::enter_checkpoint(&path);
+        tests::enter_work(&path);
         Disk::checkpoint(&path, &bytes)
     })
     .await
@@ -115,18 +115,27 @@ pub(super) async fn create(
     let registration = lease_directory(record.root.join(STORE))
         .await
         .map_err(native_error)?;
-    let operation_owner = std::sync::Arc::clone(&registration);
-    let saved = work(move || {
-        let _registration = operation_owner;
-        Disk::create(record, reentry)
-    })
-    .await?;
+    let saved = admit(record, reentry, std::sync::Arc::clone(&registration)).await?;
     Ok(Owned {
         saved,
         registration,
         #[cfg(test)]
         before_completed_checkpoint: None,
     })
+}
+
+async fn admit(
+    record: Record,
+    reentry: crate::client::Reentry,
+    registration: OperationOwner,
+) -> Result<SavedRun, SavedError> {
+    work(move || {
+        // Admission can retire metadata under pressure. Its queued/running physical work owns the
+        // store lease even if the caller drops the waiting future before retirement settles.
+        let _registration = registration;
+        Disk::create(record, reentry)
+    })
+    .await
 }
 
 pub(super) async fn resume(saved: SavedRun) -> Result<Owned, SavedError> {
@@ -171,6 +180,7 @@ mod unix {
     use core::sync::atomic::{AtomicU64, Ordering};
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read as _, Write as _};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
     use std::path::{Component, Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -186,6 +196,14 @@ mod unix {
 
     impl Disk {
         pub(super) fn inspect(path: PathBuf) -> Result<SavedRun, SavedError> {
+            let saved = Self::metadata(path)?;
+            Self::payload_parents(&saved.record)?;
+            Ok(saved)
+        }
+
+        // Classification must not depend on unrelated completed payload directories still existing.
+        // Checksummed structure and root/store/workspace identity remain mandatory for every record.
+        fn metadata(path: PathBuf) -> Result<SavedRun, SavedError> {
             let path = absolute(&path)?;
             Self::directory(&path, DirectoryRole::Private)?;
             let path = fs::canonicalize(path).map_err(SavedError::Io)?;
@@ -204,13 +222,17 @@ mod unix {
             Self::directory(root, DirectoryRole::Root)?;
             Self::directory(store, DirectoryRole::Private)?;
             Self::lease_marker(store)?;
+            Self::read_metadata(path)
+        }
+
+        fn read_metadata(path: PathBuf) -> Result<SavedRun, SavedError> {
             let file = Self::read_file(&path.join("state"))?;
             let mut bytes = Vec::new();
             file.take(MAX_RECORD as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(SavedError::Io)?;
             let record = codec::decode(&bytes)?;
-            Self::validate(&path, &record)?;
+            Self::validate_metadata(&path, &record)?;
             Ok(SavedRun {
                 path,
                 record,
@@ -286,9 +308,10 @@ mod unix {
                 });
             }
             let store = record.root.join(STORE);
-            if Self::entries(&store)?.len() >= MAX_RUNS {
-                return Err(SavedError::Limit);
-            }
+            // Preparation precedes lease acquisition. A replacement must not turn the old lease
+            // into authority to retire metadata in a different root or store.
+            Self::store_identity(&record)?;
+            Self::make_room(&store, &record)?;
             // Uniqueness is enforced by mkdir, not by time/counter identity. The name is not authority.
             let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let time = SystemTime::now()
@@ -333,10 +356,11 @@ mod unix {
             let mut found: Option<SavedRun> = None;
             let mut ambiguous = Vec::new();
             for path in Self::entries(&store)? {
-                let saved = Self::inspect(path)?;
+                let saved = Self::metadata(path)?;
                 if saved.record.complete || saved.record.request != Some(request) {
                     continue;
                 }
+                Self::payload_parents(&saved.record)?;
                 if found.is_none() && ambiguous.is_empty() {
                     found = Some(saved);
                     continue;
@@ -361,7 +385,8 @@ mod unix {
             let mut scanned = 0;
             for entry in fs::read_dir(store).map_err(SavedError::Io)? {
                 scanned += 1;
-                if scanned > MAX_RUNS + 1 {
+                // One stable lease and one interrupted retirement are independent of active runs.
+                if scanned > MAX_RUNS + 2 {
                     return Err(SavedError::Limit);
                 }
                 let entry = entry.map_err(SavedError::Io)?;
@@ -369,13 +394,190 @@ mod unix {
                 if name == "lease" {
                     continue;
                 }
+                if name == "retired" {
+                    Self::retired(store)?;
+                    continue;
+                }
                 if !name.to_str().is_some_and(Self::run_name) {
                     return Err(SavedError::Corrupt);
                 }
                 entries.push(entry.path());
+                if entries.len() > MAX_RUNS {
+                    return Err(SavedError::Limit);
+                }
             }
             entries.sort();
             Ok(entries)
+        }
+
+        fn make_room(store: &Path, record: &Record) -> Result<(), SavedError> {
+            let entries = Self::entries(store)?;
+            if entries.len() < MAX_RUNS {
+                return Ok(());
+            }
+            let mut candidate = None;
+            for path in entries {
+                // Finish the bounded integrity scan before deleting anything. Even a nonmatching
+                // corrupt record cannot be treated as known completed history.
+                let saved = Self::metadata(path)?;
+                if candidate.is_none() && Self::retirable(&saved.record) {
+                    candidate = Some(saved);
+                }
+            }
+            let saved = candidate.ok_or(SavedError::StoreFull)?;
+            #[cfg(test)]
+            super::tests::enter_work(store);
+            Self::store_identity(record)?;
+            let directory = Self::open_directory(store)?;
+            if Self::file_identity(&directory)? != record.store_identity {
+                return Err(SavedError::Corrupt);
+            }
+            Self::clear_retired(store, &directory)?;
+            let current = Self::metadata(PathBuf::clone(&saved.path))?;
+            if current.snapshot != saved.snapshot {
+                return Err(SavedError::Changed);
+            }
+            if !Self::workspace_state(&saved.path)? {
+                return Err(SavedError::Corrupt);
+            }
+            let name = std::ffi::CString::new(
+                saved
+                    .path
+                    .file_name()
+                    .ok_or(SavedError::Corrupt)?
+                    .as_encoded_bytes(),
+            )
+            .map_err(|_| SavedError::Corrupt)?;
+            // SAFETY: both names are single components and the live store descriptor owns both
+            // sides of the rename. No destination can be replaced: the fixed slot was emptied above
+            // under the operation-owned store lease. Same-user hostile mutation is not a sandbox.
+            if unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    directory.as_raw_fd(),
+                    c"retired".as_ptr(),
+                )
+            } != 0
+            {
+                return Err(SavedError::Io(io::Error::last_os_error()));
+            }
+            // A replaced candidate must not turn the atomic move into deletion authority over an
+            // unvalidated workspace, even if the replacement is empty.
+            if Self::identity(&store.join("retired"))? != saved.record.workspace_identity {
+                return Err(SavedError::Corrupt);
+            }
+            // Interruption after rename leaves a private, independently validated quarantine, never
+            // a half-deleted ordinary run. No native state, payload or stable lock is removed.
+            Self::clear_retired(store, &directory)
+        }
+
+        fn retirable(record: &Record) -> bool {
+            record.complete
+                && record.members.iter().all(|member| {
+                    matches!(member.attempts.as_slice(), [attempt]
+                        if attempt.status == crate::client::saved::AttemptStatus::Complete)
+                })
+        }
+
+        fn retired(store: &Path) -> Result<Option<SavedRun>, SavedError> {
+            let path = store.join("retired");
+            match fs::symlink_metadata(&path) {
+                Err(cause) if cause.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(cause) => return Err(SavedError::Io(cause)),
+                Ok(_) => Self::directory(&path, DirectoryRole::Private)?,
+            }
+            if !Self::workspace_state(&path)? {
+                // The only deletion after the atomic move is `state`, followed by the empty
+                // directory. An empty private slot is the other interruption boundary.
+                return Ok(None);
+            }
+            let saved = Self::read_metadata(path)?;
+            if !Self::retirable(&saved.record) {
+                return Err(SavedError::Corrupt);
+            }
+            Ok(Some(saved))
+        }
+
+        fn workspace_state(path: &Path) -> Result<bool, SavedError> {
+            let mut entries = fs::read_dir(path).map_err(SavedError::Io)?;
+            let Some(entry) = entries.next() else {
+                return Ok(false);
+            };
+            if entry.map_err(SavedError::Io)?.file_name() != "state" || entries.next().is_some() {
+                return Err(SavedError::Corrupt);
+            }
+            Ok(true)
+        }
+
+        fn clear_retired(store: &Path, directory: &File) -> Result<(), SavedError> {
+            let saved = Self::retired(store)?;
+            let path = store.join("retired");
+            let workspace = match Self::open_directory_at(directory, c"retired") {
+                Ok(workspace) => workspace,
+                Err(SavedError::Io(cause)) if cause.kind() == io::ErrorKind::NotFound => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if Self::file_identity(&workspace)? != Self::identity(&path)? {
+                return Err(SavedError::Corrupt);
+            }
+            if let Some(saved) = saved {
+                if Self::file_identity(&workspace)? != saved.record.workspace_identity {
+                    return Err(SavedError::Corrupt);
+                }
+                // SAFETY: `state` is the sole bounded, validated regular metadata entry in the
+                // pinned private workspace. unlinkat never follows a replaced directory path.
+                if unsafe { libc::unlinkat(workspace.as_raw_fd(), c"state".as_ptr(), 0) } != 0 {
+                    return Err(SavedError::Io(io::Error::last_os_error()));
+                }
+            }
+            // SAFETY: removal is descriptor-relative, names one fixed slot, and can remove only an
+            // empty directory. Unknown entries are never traversed or recursively deleted.
+            if unsafe {
+                libc::unlinkat(
+                    directory.as_raw_fd(),
+                    c"retired".as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            } != 0
+            {
+                return Err(SavedError::Io(io::Error::last_os_error()));
+            }
+            Ok(())
+        }
+
+        fn open_directory(path: &Path) -> Result<File, SavedError> {
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(SavedError::Io)
+        }
+
+        fn open_directory_at(directory: &File, name: &core::ffi::CStr) -> Result<File, SavedError> {
+            // SAFETY: name is one NUL-terminated component and the returned descriptor is owned once.
+            let descriptor = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if descriptor < 0 {
+                return Err(SavedError::Io(io::Error::last_os_error()));
+            }
+            // SAFETY: successful openat transferred a fresh owned descriptor to this File.
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+
+        fn file_identity(file: &File) -> Result<RootIdentity, SavedError> {
+            let metadata = file.metadata().map_err(SavedError::Io)?;
+            Ok(RootIdentity {
+                device: RootDevice(metadata.dev()),
+                inode: RootInode(metadata.ino()),
+            })
         }
 
         fn run_name(name: &str) -> bool {
@@ -389,17 +591,32 @@ mod unix {
         }
 
         fn validate(path: &Path, record: &Record) -> Result<(), SavedError> {
+            Self::validate_metadata(path, record)?;
+            Self::payload_parents(record)
+        }
+
+        fn store_identity(record: &Record) -> Result<(), SavedError> {
+            Self::directory(&record.root, DirectoryRole::Root)?;
+            let store = record.root.join(STORE);
+            Self::directory(&store, DirectoryRole::Private)?;
+            Self::lease_marker(&store)?;
+            if absolute(&record.root)? != record.root
+                || Self::identity(&record.root)? != record.identity
+                || Self::identity(&store)? != record.store_identity
+            {
+                return Err(SavedError::Corrupt);
+            }
+            Ok(())
+        }
+
+        fn validate_metadata(path: &Path, record: &Record) -> Result<(), SavedError> {
             let root = path
                 .parent()
                 .and_then(Path::parent)
                 .ok_or(SavedError::Corrupt)?;
-            if record.root != root
-                || absolute(root)? != root
-                || Self::identity(root)? != record.identity
-                || Self::identity(path.parent().ok_or(SavedError::Corrupt)?)?
-                    != record.store_identity
-                || Self::identity(path)? != record.workspace_identity
-            {
+            Self::store_identity(record)?;
+            Self::directory(path, DirectoryRole::Private)?;
+            if record.root != root || Self::identity(path)? != record.workspace_identity {
                 return Err(SavedError::Corrupt);
             }
             Layout::frozen_paths(
@@ -412,18 +629,6 @@ mod unix {
             .map_err(|_| SavedError::Corrupt)?;
             let mut attempts = std::collections::BTreeSet::new();
             for member in &record.members {
-                let relative = member
-                    .destination
-                    .strip_prefix(root)
-                    .map_err(|_| SavedError::Corrupt)?;
-                let mut parent = root.to_path_buf();
-                for component in relative.parent().ok_or(SavedError::Corrupt)?.components() {
-                    let Component::Normal(component) = component else {
-                        return Err(SavedError::Corrupt);
-                    };
-                    parent.push(component);
-                    Self::directory(&parent, DirectoryRole::Root)?;
-                }
                 for attempt in &member.attempts {
                     let state = attempt.state.path();
                     if state.parent() != member.destination.parent()
@@ -443,6 +648,24 @@ mod unix {
                     {
                         return Err(SavedError::Corrupt);
                     }
+                }
+            }
+            Ok(())
+        }
+
+        fn payload_parents(record: &Record) -> Result<(), SavedError> {
+            for member in &record.members {
+                let relative = member
+                    .destination
+                    .strip_prefix(&record.root)
+                    .map_err(|_| SavedError::Corrupt)?;
+                let mut parent = PathBuf::clone(&record.root);
+                for component in relative.parent().ok_or(SavedError::Corrupt)?.components() {
+                    let Component::Normal(component) = component else {
+                        return Err(SavedError::Corrupt);
+                    };
+                    parent.push(component);
+                    Self::directory(&parent, DirectoryRole::Root)?;
                 }
             }
             Ok(())

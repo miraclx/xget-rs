@@ -94,6 +94,38 @@ fn native_failure_facts_keep_exact_lower_bounds_phase_and_locator_without_foreig
 }
 
 #[test]
+fn fresh_existing_target_diagnostic_has_a_workable_remedy_without_native_effects() {
+    let failure = crate::failure::Failure::library(Error::DestinationExists);
+    let output = Output::new(RunId::fresh(), Format::Json, Channel::Diagnostic);
+    let facts = output.failure_facts(&failure);
+    assert_eq!(facts["reason"], "DestinationExists");
+    assert_eq!(facts["exit_code"], 1);
+    assert!(facts["phase"].is_null());
+    assert!(facts["partial"].is_null());
+    assert!(facts["native_state_path"].is_null());
+    assert!(
+        facts["message"]
+            .as_str()
+            .unwrap()
+            .contains("--fresh --overwrite")
+    );
+}
+
+#[test]
+fn capacity_diagnostic_describes_retained_evidence_not_successful_history() {
+    let failure = crate::failure::Failure::saved(xget::client::SavedError::StoreFull);
+    let output = Output::new(RunId::fresh(), Format::Json, Channel::Diagnostic);
+    let facts = output.failure_facts(&failure);
+    assert_eq!(facts["reason"], "SavedLimit");
+    assert_eq!(facts["exit_code"], 2);
+    assert!(facts["phase"].is_null());
+    assert!(facts["partial"].is_null());
+    let message = facts["message"].as_str().unwrap();
+    assert!(message.contains("unfinished or uncertain evidence"));
+    assert!(!message.contains("fewer pending requests"));
+}
+
+#[test]
 fn known_native_reasons_do_not_fabricate_a_physical_phase_or_completion() {
     for (kind, reason) in [
         (FailureKind::LengthMismatch, "LengthMismatch"),

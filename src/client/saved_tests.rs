@@ -618,13 +618,11 @@ async fn complete_prior_run_is_not_automatically_matched_and_fresh_preserves_old
         .run()
         .await
         .unwrap_err();
-    assert!(
-        matches!(failure.error, Error::Transfer(ref failure) if matches!(failure.kind, FailureKind::DestinationExists))
-    );
+    assert!(matches!(failure.error, Error::DestinationExists));
     assert_eq!(count(&server, "HEAD").await, 2);
-    assert_eq!(count(&server, "GET").await, 2);
-    assert_ne!(failure.report.saved_run(), Some(old.as_path()));
-    let failed_path = failure.report.saved_run().unwrap().to_path_buf();
+    assert_eq!(count(&server, "GET").await, 1);
+    assert!(failure.report.saved_run().is_none());
+    assert!(SavedRun::inspect(&old).await.unwrap().is_complete());
     let failure = client
         .download(reference.as_str())
         .fresh(Fresh)
@@ -632,9 +630,162 @@ async fn complete_prior_run_is_not_automatically_matched_and_fresh_preserves_old
         .run()
         .await
         .unwrap_err();
-    assert!(matches!(failure.error, Error::Transfer(_)));
-    assert!(old.exists() && failed_path.exists());
-    assert_eq!(root.runs().len(), 3);
+    assert!(matches!(failure.error, Error::DestinationExists));
+    assert!(failure.report.saved_run().is_none());
+    assert!(old.exists());
+    assert_eq!(root.runs().len(), 1);
+    assert_eq!(count(&server, "GET").await, 1);
+    // The first refusal left no sealed failed attempt to capture the next ordinary request.
+    let replacement = client
+        .download(reference.as_str())
+        .overwrite(crate::client::Overwrite)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(replacement.completed().len(), 1);
+    assert_eq!(count(&server, "GET").await, 2);
+    assert_eq!(root.runs().len(), 2);
+    assert!(old.exists());
+}
+
+#[tokio::test]
+async fn moved_completed_payload_parents_do_not_poison_unrelated_matching() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let reference = exact(&server, "/payload").await;
+    let client = Client::new().unwrap();
+    let input = crate::Input::parse(&reference)
+        .unwrap()
+        .under("nested")
+        .unwrap();
+    let completed = client
+        .download(input)
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    let path = completed.saved_run().unwrap().to_path_buf();
+    let bytes = fs::read(path.join("state")).unwrap();
+    fs::rename(root.path().join("nested"), root.path().join("moved")).unwrap();
+    // Direct inspection retains its existing strong parent-role checks.
+    assert!(matches!(
+        SavedRun::inspect(&path).await,
+        Err(SavedError::Missing)
+    ));
+    let next = exact(&server, "/other").await;
+    let report = client
+        .download(next.as_str())
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(report.completed().len(), 1);
+    assert_eq!(fs::read(root.path().join("other")).unwrap(), b"abc");
+    assert_eq!(fs::read(root.path().join("moved/payload")).unwrap(), b"abc");
+    assert_eq!(fs::read(path.join("state")).unwrap(), bytes);
+    assert_eq!(count(&server, "GET").await, 2);
+}
+
+#[tokio::test]
+async fn selected_unfinished_work_still_validates_all_payload_parents_before_reentry() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let reference = format!("{}/payload", server.uri());
+    let client = Client::new().unwrap();
+    let input = || {
+        crate::Input::parse(&reference)
+            .unwrap()
+            .under("nested")
+            .unwrap()
+    };
+    let failure = client
+        .download(input())
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap_err();
+    let path = failure.report.saved_run().unwrap().to_path_buf();
+    let bytes = fs::read(path.join("state")).unwrap();
+    fs::rename(root.path().join("nested"), root.path().join("moved")).unwrap();
+    let heads = count(&server, "HEAD").await;
+    let gets = count(&server, "GET").await;
+    let failure = client
+        .download(input())
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::Saved(SavedError::Missing)));
+    assert_eq!(count(&server, "HEAD").await, heads);
+    assert_eq!(count(&server, "GET").await, gets);
+    assert_eq!(fs::read(path.join("state")).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn corrupt_completed_nonmatching_metadata_is_not_skipped() {
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let reference = exact(&server, "/payload").await;
+    let client = Client::new().unwrap();
+    let report = client
+        .download(reference.as_str())
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap();
+    let state = report.saved_run().unwrap().join("state");
+    let mut bytes = fs::read(&state).unwrap();
+    let last = bytes.last_mut().unwrap();
+    *last ^= 1;
+    fs::write(&state, &bytes).unwrap();
+    let other = exact(&server, "/other").await;
+    let failure = client
+        .download(other.as_str())
+        .to_directory(root.path())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::Saved(SavedError::Corrupt)));
+    assert_eq!(count(&server, "HEAD").await, 1);
+    assert_eq!(count(&server, "GET").await, 1);
+    assert!(!root.path().join("other").exists());
+    assert_eq!(fs::read(state).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn a_destination_appearing_after_preflight_still_meets_native_no_clobber() {
+    struct Incumbent(PathBuf);
+    impl crate::client::Observer for Incumbent {
+        fn observe(&mut self, event: crate::client::Event<'_>) {
+            if matches!(event, crate::client::Event::RunStarted { .. }) {
+                fs::write(&self.0, b"incumbent").unwrap();
+            }
+        }
+    }
+    let root = Fixture::new();
+    let server = MockServer::start().await;
+    let reference = exact(&server, "/payload").await;
+    let destination = root.path().join("payload");
+    let failure = Client::new()
+        .unwrap()
+        .download(reference.as_str())
+        .to_directory(root.path())
+        .run_with(&mut Incumbent(PathBuf::clone(&destination)))
+        .await
+        .unwrap_err();
+    assert!(matches!(failure.error, Error::Transfer(ref failure)
+        if matches!(failure.kind, FailureKind::DestinationExists)));
+    assert!(failure.report.saved_run().is_some());
+    assert_eq!(fs::read(destination).unwrap(), b"incumbent");
 }
 
 #[tokio::test]
@@ -2262,7 +2413,7 @@ async fn fresh_is_not_overwrite_but_explicit_ordinary_overwrite_uses_checked_nat
                     .insert_header("etag", "\"v1\"")
                     .set_body_bytes(b"abc".to_vec()),
             )
-            .expect(1)
+            .expect(u64::from(replace))
             .mount(&server)
             .await;
         let destination = root.path().join("output");

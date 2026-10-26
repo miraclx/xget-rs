@@ -1332,7 +1332,7 @@ async fn reference_only_binding_reconstructs_frozen_tree_namespace_patterns_with
 
 #[cfg(unix)]
 #[tokio::test]
-async fn s3_required_mismatch_preserves_destination_and_does_not_publish() {
+async fn s3_required_mismatch_preserves_an_authorized_incumbent_and_does_not_publish() {
     let server = MockServer::start().await;
     head(&server, "object", 3).await;
     get(&server, "object", b"abc").await;
@@ -1341,13 +1341,18 @@ async fn s3_required_mismatch_preserves_destination_and_does_not_publish() {
     fs::write(&destination, b"sentinel").unwrap();
     let failure = client(&server.uri())
         .download("s3://fixture-bucket/object")
+        .overwrite(crate::client::Overwrite)
         .expect(Digest::parse(crate::transfer::Algorithm::Sha256, &"00".repeat(32)).unwrap())
         .measurement(Measurement::None)
         .to_file(&destination)
         .run()
         .await
         .unwrap_err();
-    assert!(matches!(failure.error, Error::Transfer(_)));
+    assert!(matches!(
+        failure.error,
+        Error::Transfer(ref failure)
+            if matches!(failure.kind, crate::transfer::FailureKind::DigestMismatch(_))
+    ));
     assert_eq!(fs::read(destination).unwrap(), b"sentinel");
     assert_eq!(failure.report.completed().len(), 0);
 }

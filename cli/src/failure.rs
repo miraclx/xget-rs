@@ -62,6 +62,7 @@ impl Failure {
             | SavedError::NeedsInput
             | SavedError::ParentPath
             | SavedError::Limit
+            | SavedError::StoreFull
             | SavedError::Authority
             | SavedError::RestartMissing => 2,
             _ => 1,
@@ -243,6 +244,12 @@ impl Diagnostic {
             Error::RuntimeUnavailable => Reason::RuntimeUnavailable,
             Error::NativeUnsupported => Reason::Unsupported,
             Error::UnsafeDirectory => Reason::UnsafeDirectory,
+            Error::DestinationExists => {
+                return Self::plain(
+                    Reason::DestinationExists,
+                    "destination exists; choose another target, or use --fresh --overwrite only if checked replacement is intended",
+                );
+            }
             Error::Directory(_) => Reason::DirectoryIo,
             Error::IpfsUnavailable | Error::S3Unavailable => Reason::ProviderUnavailable,
             #[cfg(feature = "swisstransfer")]
@@ -295,7 +302,7 @@ impl Diagnostic {
             SavedError::RequestAppeared { .. } => Reason::RequestAppeared,
             SavedError::Changed => Reason::SavedChanged,
             SavedError::ParentPath => Reason::ParentPath,
-            SavedError::Limit => Reason::SavedLimit,
+            SavedError::Limit | SavedError::StoreFull => Reason::SavedLimit,
             SavedError::Uncertain => Reason::PublicationUnknown,
             SavedError::Conflict => Reason::SavedConflict,
             SavedError::NotRevalidatable => Reason::NotRevalidatable,
@@ -350,7 +357,7 @@ impl Diagnostic {
             ),
             FailureKind::DestinationExists => Self::plain(
                 Reason::DestinationExists,
-                "destination exists; choose an absent -o path, or use --overwrite only if checked replacement is intended",
+                "destination exists; choose an absent target, or use --fresh --overwrite only if checked replacement is intended; retain the old attempt",
             ),
             FailureKind::RuntimeUnavailable => Self::plain(
                 Reason::RuntimeUnavailable,

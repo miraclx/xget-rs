@@ -2593,12 +2593,24 @@ fn native_destination_digest_and_short_body_failures_have_distinct_actionable_di
                 facts["message"].as_str().unwrap(),
                 facts["message"].as_str().unwrap().to_lowercase()
             );
-            assert!(facts["partial"]["logical_received_bytes"].is_u64());
-            assert!(facts["partial"]["logical_written_bytes"].is_u64());
-            assert!(facts["partial"]["hashed_bytes"].is_u64());
-            assert_eq!(facts["partial"]["completion_evidence"], false);
+            if incumbent.is_none() {
+                assert!(facts["partial"]["logical_received_bytes"].is_u64());
+                assert!(facts["partial"]["logical_written_bytes"].is_u64());
+                assert!(facts["partial"]["hashed_bytes"].is_u64());
+                assert_eq!(facts["partial"]["completion_evidence"], false);
+                assert!(facts["state_path"].as_str().is_some());
+            } else {
+                assert!(facts["partial"].is_null());
+                assert!(facts["state_path"].is_null());
+                assert!(facts["native_state_path"].is_null());
+                assert!(
+                    facts["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("--fresh --overwrite")
+                );
+            }
             assert_eq!(facts["pause_confirmed"], false);
-            assert!(facts["state_path"].as_str().is_some());
         }
         for field in [
             "reason",
@@ -2621,6 +2633,13 @@ fn native_destination_digest_and_short_body_failures_have_distinct_actionable_di
             assert_eq!(
                 std::fs::read(directory.0.join("out.bin")).unwrap(),
                 b"sentinel"
+            );
+            assert!(!directory.0.join(".xget-runs").exists());
+            assert!(
+                server
+                    .requests()
+                    .iter()
+                    .all(|request| request.starts_with("HEAD "))
             );
         }
         assert!(

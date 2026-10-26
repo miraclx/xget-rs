@@ -50,6 +50,10 @@ const MAX_RECORD: usize = 1024 * 1024;
 /// automatic matching finds unique unfinished work before fresh discovery. To choose a particular
 /// run, retain its actual path from [`Report::saved_run`], including `failure.report.saved_run()` on a
 /// [`RunFailure`], and inspect it. Inspection alone does not revalidate payloads.
+/// The store retains up to 128 aggregate records. At capacity it can retire fully acknowledged
+/// single-attempt completion metadata, so a completed aggregate path may later become missing.
+/// Native attempt workspaces, payloads and stable locks are not removed. Unfinished work and complete
+/// histories with earlier possibly uncertain attempts are retained rather than silently discarded.
 ///
 /// This explicit recipe requires a run originally created from exactly one member and the exact
 /// original reference shown below. Replace both placeholders with your own run path and reference.
@@ -269,8 +273,9 @@ pub enum SavedStatus {
     Complete,
 }
 
-/// Explicitly bypass automatic unfinished-request continuation, leaving all old state untouched.
-/// This grants neither overwrite permission nor authority over another live owner.
+/// Explicitly bypass automatic unfinished-request continuation without restarting old attempts.
+/// Native artifacts remain untouched; completed aggregate metadata follows the bounded store's
+/// retention policy. This grants neither overwrite permission nor authority over another live owner.
 #[derive(Clone, Copy, Debug)]
 pub struct Fresh;
 
@@ -533,11 +538,14 @@ pub enum SavedError {
         "parent path components are unsupported; supply a resolved output root without dot-dot"
     )]
     ParentPath,
-    /// The bounded store/record/attempt budget cannot be silently truncated.
-    #[error(
-        "saved run limit exceeded; use a new owned destination or retain fewer pending requests"
-    )]
+    /// The bounded record/attempt budget cannot be silently truncated.
+    #[error("saved run limit exceeded; use a smaller request or a new owned destination")]
     Limit,
+    /// Capacity cannot be reclaimed from unfinished work or ambiguous historical attempts.
+    #[error(
+        "saved run store is full of retained unfinished or uncertain evidence; continue its runs or use a new owned destination"
+    )]
+    StoreFull,
     /// Older records lack a reconstructable nonsecret recipe, or the supplied default binding differs.
     #[error(
         "saved binding needs original intent; supply the original scope, namespace and patterns explicitly"

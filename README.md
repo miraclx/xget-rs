@@ -252,7 +252,9 @@ Native publication in the default command is absent-only unless `-f` is supplied
 hardlink support and a suitable caller-owned parent directory. An existing parent must be owned by the caller, must have
 owner read, write and execute permission, and must not be group- or other-writable; missing directory
 roots are created with a requested mode of `0700`. Without `-f`, a present destination is an error even
-when its contents match. Clean EOF, the declared length when known, settled writes, sealing and every
+when its contents match. Fresh work checks all frozen targets before opening any payload or creating
+run state; publication still refuses a target that appears after that check. To replace a file from a
+newly discovered request, use `--fresh --overwrite` deliberately. Clean EOF, the declared length when known, settled writes, sealing and every
 required digest precede publication. Non-Unix hosts get a typed unsupported result for native file
 publication; `-o -` does not create a native file.
 
@@ -326,9 +328,14 @@ separate Fresh/one-original/one-selected-file restriction. `--fresh` and `-f` ca
 freshly discovered checked replacement, but neither implies the other or grants cleanup permission.
 
 State is flushed and atomically replaced, but not fsynced. This covers process interruption, not
-power-loss durability. The store is bounded and has no automatic cleanup. A dropped waiter is not a
-rollback: submitted physical work may still finish without a returned receipt. Retain the printed state
-path and inspect it rather than starting a blind replacement.
+power-loss durability. The store retains at most 128 aggregate records. Under capacity pressure it
+retires fully acknowledged single-attempt completion metadata, not native workspaces, payloads or
+stable locks. A retired completed run's `info` path may become missing. Unfinished runs and histories
+with possibly uncertain earlier attempts remain; a store full of that evidence refuses new work rather
+than deleting it. Completed metadata whose payload parent has moved does not block matching an
+unrelated unfinished request, but selected reentry and direct inspection still validate that parent.
+A dropped waiter is not a rollback: submitted physical work may still finish without a returned receipt.
+Retain the printed state path and inspect it rather than starting a blind replacement.
 
 Exit status is `0` for success and `130` for an interrupt. Rejected usage, request, selection and layout
 errors use `2`; runtime, I/O and library failures generally use `1`.

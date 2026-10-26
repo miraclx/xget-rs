@@ -3147,6 +3147,7 @@ impl TerminalChild {
             ws_ypixel: 0,
         };
         // openpty initializes two owned descriptors on success; neither aliases an existing fixture.
+        // Its winsize parameter is const on Linux and mutable on Darwin.
         assert_eq!(
             unsafe {
                 libc::openpty(
@@ -3154,7 +3155,7 @@ impl TerminalChild {
                     &mut slave,
                     ptr::null_mut(),
                     ptr::null_mut(),
-                    &mut size,
+                    &raw mut size,
                 )
             },
             0

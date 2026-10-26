@@ -23,12 +23,12 @@ fn zero_unknown_overrun_and_live_acceptance_keep_distinct_human_counts_without_c
         },
     };
     let zero = snapshot.human(Presentation::default().units(), Some(BytesPerSecond(2)));
-    assert!(!zero.determinate);
+    assert!(zero.percent.is_none());
     assert!(zero.eta.is_none());
     assert!(!zero.plain().contains('%'));
     snapshot.length = Length::Unknown;
     let unknown = snapshot.human(Presentation::default().units(), Some(BytesPerSecond(2)));
-    assert!(!unknown.determinate);
+    assert!(unknown.percent.is_none());
     assert!(unknown.eta.is_none());
     assert!(unknown.plain().contains("unknown size"));
     snapshot.length = Length::Known(ByteCount(3));
@@ -373,4 +373,50 @@ fn a_range_protocol_failure_keeps_its_native_partial_without_inventing_remote_or
     assert!(facts["phase"].is_null());
     assert_eq!(facts["complete"], false);
     assert_eq!(facts["pause_confirmed"], false);
+}
+
+#[test]
+fn ribbon_percent_is_exact_tenths_and_a_full_received_frontier_still_awaits_completion() {
+    let mut snapshot = Snapshot {
+        length: Length::Known(ByteCount(256)),
+        received: ByteCount(160),
+        settled: ByteCount(32),
+        hashed: ByteCount(0),
+        source: ByteCount(160),
+        delivery: Delivery::Native {
+            restored: ByteCount(0),
+            written: ByteCount(32),
+            extent: WriteExtent::Confirmed,
+        },
+    };
+    let units = Presentation::default().units();
+    let partial = snapshot.human(units, None);
+    assert_eq!(partial.percent.as_deref(), Some("62.5%"));
+    assert!(!partial.plain().contains("verified"));
+    snapshot.length = Length::Known(ByteCount(u64::MAX));
+    snapshot.received = ByteCount(u64::MAX - 1);
+    assert_eq!(
+        snapshot.human(units, None).percent.as_deref(),
+        Some("99.9%")
+    );
+    snapshot.received = ByteCount(u64::MAX);
+    let full = snapshot.human(units, None);
+    assert_eq!(full.percent.as_deref(), Some("100.0%"));
+    assert!(full.count.contains("awaiting completion"));
+    assert!(!full.plain().contains("saved"));
+    snapshot.length = Length::Known(ByteCount(3));
+    assert!(snapshot.human(units, None).percent.is_none());
+}
+
+#[test]
+fn glyph_presets_are_one_presentation_option_not_new_progress_modes() {
+    use clap::Parser as _;
+
+    use crate::args::Cli;
+
+    for style in ["classic", "fine", "solid"] {
+        assert!(Cli::try_parse_from(["xget", "https://example.test/a", "--style", style]).is_ok());
+    }
+    assert!(Cli::try_parse_from(["xget", "https://example.test/a", "--progress", "fine"]).is_err());
+    assert!(Cli::try_parse_from(["xget", "https://example.test/a", "--style", "unknown"]).is_err());
 }

@@ -3096,3 +3096,394 @@ fn removed_interfaces_do_not_dispatch_a_second_engine_or_touch_the_network() {
     assert_eq!(help.status.code(), Some(0));
     assert!(!String::from_utf8_lossy(&help.stdout).contains("legacy"));
 }
+
+#[cfg(unix)]
+struct TerminalChild {
+    child: Option<std::process::Child>,
+    terminal: std::fs::File,
+    frames: std::sync::mpsc::Receiver<Vec<u8>>,
+    reader: Option<thread::JoinHandle<()>>,
+    captured: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl TerminalChild {
+    fn start(
+        directory: &Directory,
+        args: &[&str],
+        columns: u16,
+        environment: &[(&str, &str)],
+    ) -> Self {
+        use core::ptr;
+        use std::os::fd::FromRawFd as _;
+        use std::process::Stdio;
+        use std::sync::mpsc;
+
+        let mut master = -1;
+        let mut slave = -1;
+        let mut size = libc::winsize {
+            ws_row: 30,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // openpty initializes two owned descriptors on success; neither aliases an existing fixture.
+        // Its winsize parameter is const on Linux and mutable on Darwin.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &raw mut size,
+                )
+            },
+            0
+        );
+        let terminal = unsafe { std::fs::File::from_raw_fd(master) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+        let child = Command::new(env!("CARGO_BIN_EXE_xget"))
+            .args(args)
+            .current_dir(directory.path())
+            .env("TMPDIR", directory.path().join("tmp"))
+            .env("TERM", "xterm-256color")
+            .env("LC_ALL", "C.UTF-8")
+            .env_remove("NO_COLOR")
+            .env_remove("RUST_LOG")
+            .env_remove("XPROGRESS_DUMP")
+            .envs(environment.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(slave)
+            .spawn()
+            .unwrap();
+        let mut source = terminal.try_clone().unwrap();
+        let (sender, frames) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            loop {
+                match source.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if sender.send(buffer[..count].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    // Linux PTYs report EIO when the final slave closes; Darwin reports EOF.
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => panic!("fixture terminal read failed: {error}"),
+                }
+            }
+        });
+        Self {
+            child: Some(child),
+            terminal,
+            frames,
+            reader: Some(reader),
+            captured: Vec::new(),
+        }
+    }
+
+    fn resize(&self, columns: u16) {
+        use std::os::fd::AsRawFd as _;
+        let size = libc::winsize {
+            ws_row: 30,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // This descriptor is the test-owned PTY; no user's terminal is resized.
+        assert_eq!(
+            unsafe { libc::ioctl(self.terminal.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+    }
+
+    fn wait_for(&mut self, needle: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while !String::from_utf8_lossy(&self.captured).contains(needle) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let bytes = self.frames.recv_timeout(remaining).unwrap_or_else(|error| {
+                panic!(
+                    "terminal did not show {needle:?}: {error}; {}",
+                    String::from_utf8_lossy(&self.captured)
+                )
+            });
+            self.captured.extend(bytes);
+        }
+    }
+
+    fn finish(mut self) -> Output {
+        let mut result = self.child.take().unwrap().wait_with_output().unwrap();
+        self.reader.take().unwrap().join().unwrap();
+        for bytes in self.frames.try_iter() {
+            self.captured.extend(bytes);
+        }
+        result.stderr = core::mem::take(&mut self.captured);
+        result
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn classic_terminal_ribbon_reflows_80_40_20_80_and_collapses_only_to_an_acknowledged_receipt() {
+    use std::sync::mpsc;
+
+    for environment in [
+        vec![
+            ("LC_ALL", "C.UTF-8"),
+            ("NO_COLOR", "1"),
+            ("XPROGRESS_DUMP", ""),
+        ],
+        vec![("LC_ALL", "C.UTF-8"), ("XPROGRESS_DUMP", "1")],
+        vec![("LC_ALL", "C"), ("NO_COLOR", "1"), ("XPROGRESS_DUMP", "1")],
+    ] {
+        let directory = Directory::fresh();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let reference = format!("http://{}/archive.bin", listener.local_addr().unwrap());
+        let (step, steps) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("ribbon fixture accept failed: {error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let request = read_request(&mut stream).unwrap();
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8192\r\nETag: \"fixture\"\r\nConnection: close\r\n\r\n").unwrap();
+                if request.starts_with("HEAD ") {
+                    continue;
+                }
+                assert!(request.starts_with("GET "));
+                for _ in 0..4 {
+                    if steps.recv_timeout(Duration::from_secs(4)).is_err() {
+                        return;
+                    }
+                    // The human sampler is intentionally event-driven and throttled, not a ticker.
+                    thread::sleep(Duration::from_millis(220));
+                    if stream.write_all(&[b'x'; 2048]).is_err() {
+                        return;
+                    }
+                    stream.flush().unwrap();
+                }
+                return;
+            }
+            panic!("ribbon fixture did not receive the owned CLI request");
+        });
+        let mut terminal = TerminalChild::start(
+            &directory,
+            &[&reference, "-o", "archive.bin", "-s", "none"],
+            80,
+            &environment,
+        );
+        terminal.wait_for("0.0%");
+        step.send(()).unwrap();
+        terminal.wait_for("25.0%");
+        terminal.resize(40);
+        step.send(()).unwrap();
+        terminal.wait_for("50.0%");
+        terminal.resize(20);
+        step.send(()).unwrap();
+        terminal.wait_for("75.0%");
+        terminal.resize(80);
+        step.send(()).unwrap();
+        let result = terminal.finish();
+        worker.join().unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "the Dump override must never redirect progress to stdout"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("archive.bin")).unwrap(),
+            vec![b'x'; 8192]
+        );
+        let raw = core::str::from_utf8(&result.stderr).unwrap();
+        assert!(raw.contains("awaiting completion"));
+        assert!(raw.contains("saved archive.bin  8 KiB"));
+        assert!(raw.contains("done 1 file in "));
+        assert!(!raw.contains("verified"));
+        assert!(!raw.contains("measured"));
+        let no_color = environment.iter().any(|(key, _)| *key == "NO_COLOR");
+        let ascii = environment
+            .iter()
+            .any(|(key, value)| *key == "LC_ALL" && *value == "C");
+        let styled = raw
+            .split("\x1b[")
+            .skip(1)
+            .any(|sequence| sequence.chars().find(char::is_ascii_alphabetic) == Some('m'));
+        assert_eq!(styled, !no_color);
+        if ascii {
+            assert!(raw.is_ascii());
+            assert!(raw.contains('#'));
+        } else {
+            assert!(raw.contains('━'));
+            assert!(raw.contains('─'));
+            assert!(raw.contains('╸'));
+            assert!(!raw.contains('#'));
+        }
+        // Count only cell glyphs, ignoring style escapes and the independently reserved percentage.
+        for (percent, expected) in [("25.0%", 48), ("50.0%", 28), ("75.0%", 8), ("100.0%", 48)] {
+            let line = raw.lines().find(|line| line.contains(percent)).unwrap();
+            let cells = line
+                .chars()
+                .filter(|ch| matches!(ch, '━' | '─' | '╸' | '#' | '-' | '>'))
+                .count();
+            assert_eq!(cells, expected, "{line:?}");
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn narrow_ascii_ornaments_preserve_complete_unicode_names_as_permanent_evidence() {
+    let directory = Directory::fresh();
+    let server = Server::start(Behavior::Complete);
+    let reference = server.reference("/a.bin");
+    let name = "映画_長い名前_そのまま残す_archive.bin";
+    let terminal = TerminalChild::start(
+        &directory,
+        &[&reference, "-o", name, "-s", "none"],
+        20,
+        &[("LC_ALL", "C"), ("NO_COLOR", "1"), ("XPROGRESS_DUMP", "1")],
+    );
+    let result = terminal.finish();
+    assert_eq!(result.status.code(), Some(0));
+    assert!(result.stdout.is_empty());
+    assert_eq!(std::fs::read(directory.path().join(name)).unwrap(), b"abc");
+    let raw = core::str::from_utf8(&result.stderr).unwrap();
+    assert_eq!(
+        raw.matches(name).count(),
+        2,
+        "one complete identity, then its receipt"
+    );
+    assert!(raw.contains(&format!("saved {name}  3 B")));
+    assert!(!raw.contains('━'));
+    assert!(!raw.contains('╸'));
+    assert!(!raw.contains("\x1b[0m"));
+}
+
+#[test]
+#[cfg(unix)]
+fn terminal_ribbon_keeps_live_binary_stdout_exact_with_both_dump_overrides() {
+    for dump in ["", "1"] {
+        let directory = Directory::fresh();
+        let server = Server::start(Behavior::Binary);
+        let reference = server.reference("/payload.bin");
+        let terminal = TerminalChild::start(
+            &directory,
+            &[&reference, "-o", "-", "-s", "none"],
+            40,
+            &[("NO_COLOR", "1"), ("XPROGRESS_DUMP", dump)],
+        );
+        let result = terminal.finish();
+        assert_eq!(result.status.code(), Some(0));
+        assert_eq!(result.stdout, b"\0\xff\n");
+        let raw = core::str::from_utf8(&result.stderr).unwrap();
+        assert!(raw.contains("accepted"));
+        assert!(raw.contains("delivered 3 B to stdout"));
+        assert!(raw.contains("delivered prefixes cannot be retracted"));
+        for forbidden in ["saved ", "verified", "measured", "\x1b[0m"] {
+            assert!(!raw.contains(forbidden));
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn ribbon_presets_leave_captured_human_and_json_contracts_unchanged() {
+    let server = Server::start(Behavior::Complete);
+    let reference = server.reference("/a.bin");
+    let digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    for preset in ["classic", "fine", "solid"] {
+        let directory = Directory::fresh();
+        let captured = directory.run(&[
+            &reference,
+            "-o",
+            "human.bin",
+            "--style",
+            preset,
+            "--progress",
+            "bar",
+            "--expect",
+            digest,
+        ]);
+        assert_eq!(captured.status.code(), Some(0));
+        assert!(captured.stdout.is_empty());
+        let text = human_text(&captured.stderr);
+        assert!(text.contains("received "));
+        assert_eq!(
+            text.matches(digest).count(),
+            1,
+            "duplicate evidence should not compete with the receipt"
+        );
+        assert!(text.contains(&format!(
+            "required {digest} matched (caller); also measured"
+        )));
+        let json = directory.run(&[
+            &reference,
+            "-o",
+            "machine.bin",
+            "--style",
+            preset,
+            "--json",
+            "--bits",
+            "--raw-sizes",
+            "--expect",
+            digest,
+        ]);
+        assert_eq!(json.status.code(), Some(0));
+        assert!(json.stdout.is_empty());
+        let records = events(&json.stderr);
+        assert_eq!(records.first().unwrap()["kind"], "RunStarted");
+        assert_eq!(records.last().unwrap()["kind"], "End");
+        assert!(records.iter().all(|record| record["schema_version"] == 1));
+        let progress = records
+            .iter()
+            .find(|record| record["kind"] == "Progress")
+            .unwrap();
+        assert!(progress["facts"]["rate_bytes_per_second"].is_u64());
+        assert_eq!(progress["facts"]["completion_evidence"], false);
+        let published = records
+            .iter()
+            .find(|record| record["kind"] == "Published")
+            .unwrap();
+        assert_eq!(published["facts"]["checks"]["measured_digest"], digest);
+        assert_eq!(
+            published["facts"]["checks"]["matched_requirements"][0]["digest"],
+            digest
+        );
+    }
+}

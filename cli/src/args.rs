@@ -9,14 +9,14 @@ use zeroize::Zeroizing;
 
 use crate::{download, info, list, resume};
 
-/// Acquire files through the common library coordinator.
+/// Download files and inspect remote collections.
 #[derive(Parser)]
 #[command(
     name = "xget",
     version,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
-    after_help = "use -o FILE for one selected file or -D DIR for file jobs\nstdout prefixes cannot be retracted; use shell pipefail to detect late failures"
+    after_help = "by default, downloads are saved in the current directory\nuse -o FILE to name one selected file, -D DIR to choose a directory, or -o - for stdout\nstdout prefixes cannot be retracted; use shell pipefail to detect late failures"
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
@@ -42,7 +42,7 @@ impl Cli {
             );
         }
         crate::failure::Failure::request(
-            "invalid command or value; use xget --help and explicit -o/-D output",
+            "invalid command or value; use xget --help for commands and options",
         )
     }
 }

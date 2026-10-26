@@ -201,19 +201,26 @@ The table describes the acquisition command. `list` shares input, selection, acc
 | `-H, --header 'NAME: VALUE'` | transient access for one original HTTP/WebDAV input; transport-owned headers are rejected |
 | `--ipfs-gateway URL` | HTTP(S) gateway access for exact IPFS inputs; requires `ipfs` |
 | `--progress MODE` | `auto`, `bar`, `plain`, `json` or `none`; conflicts with `--json` |
+| `--style STYLE` | `classic` (default), `fine` or `solid`; human terminal glyphs and palette only |
 | `--json` | versioned records instead of plain lines |
 | `--bits` | human speed in bits; byte counts remain bytes |
 | `--raw-sizes` | raw byte sizes in human output |
 
-Human presentation is the default. `--progress auto` uses an xprogress bar on terminal stderr and
+Human presentation is the default. `--progress auto` uses an xprogress ribbon on terminal stderr and
 complete plain snapshots when captured. Explicit `plain` updates on a terminal and uses complete lines
-otherwise; `bar` also falls back to plain when captured. The active row shows received bytes, or
-sink-accepted bytes for live output, with a recent source rate and ETA when available. Reaching 100%
-still awaits clean completion, required checks and publication or sink flush. Restored bytes do not
-inflate source speed. Sizes use xbytes IEC bytes; `--bits` changes speed only, and `--raw-sizes` wins.
+otherwise; `bar` also falls back to plain when captured. `--style classic` is the Unicode default;
+`fine` and `solid` change only the terminal glyphs and palette. ASCII-locale fallback remains available,
+and a nonempty `NO_COLOR` disables color without changing filenames or progress facts.
 
-Each successful file has a readable `saved` or `delivered` receipt, separate `required … matched` and
-optional `measured …` digest lines, and one elapsed-time summary. No-hash success has no checksum
+The active region keeps its ribbon scale fixed within a terminal-width profile, with received bytes,
+or sink-accepted bytes for live output, on separate metric rows. Numbers growing do not shrink the
+track; resize recomposes the owned region on the next observed update. Rate and ETA use current-attempt
+source bytes, never restored bytes. Reaching 100% still awaits clean completion, required checks and
+publication or sink flush. Sizes use xbytes IEC bytes; `--bits` changes speed only, and `--raw-sizes` wins.
+
+Each successful file has a readable `saved` or `delivered` receipt, distinctly labeled required matches
+and optional measurements, and one elapsed-time summary. An identical required/measured digest is
+printed once with both roles; different digests retain their own complete values and provenance. No-hash success has no checksum
 boilerplate. A locally revalidated file is labeled `revalidated`, with recorded checks and an explicit
 warning that its remote version was not checked. Unpinned sources without a matched strong required
 checksum carry an actionable warning; a measured digest alone is not an expected-content pin.

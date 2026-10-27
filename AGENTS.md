@@ -68,6 +68,12 @@ actual dependency graphs. Warning-denied docs, an external library consumer, loc
 actual executable smoke checks are workspace-boundary gates. Package listing must exclude the old CLI
 and provisional provider tree from the library package.
 
+Release tooling under `release/` requires Python 3.11 or newer. Run its sibling tests with
+`python3.11 -I -B -m unittest discover -s release -p '*_tests.py' -v`. The candidate workflow is
+nonpublishing: four native optimized extracted-archive smokes and exact-source CI precede aggregate
+acceptance. Helper tests, source tests and runner labels are not archive execution evidence. Tags,
+GitHub releases and registry publication still require their separate explicit authorization.
+
 Rust 1.97.1 is the exercised support baseline. The previous advertised 1.85 was not proven. Do not
 claim a lower MSRV without the corresponding toolchain/dependency/feature validation.
 

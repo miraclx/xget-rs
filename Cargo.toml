@@ -19,6 +19,7 @@ autotests = false
 exclude = [
     "notes",
     "harness",
+    "release",
     "AGENTS.md",
     ".claude",
     "src/bin",

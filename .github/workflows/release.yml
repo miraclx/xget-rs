@@ -1,50 +1,126 @@
-name: Release
+name: RC artifacts (nonpublishing)
 
-# Build the `xget` binary for the common desktop targets on a version tag and attach the archives to a
-# GitHub release. Push a tag like `v0.1.0` to trigger it.
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    paths:
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/release.yml'
+      - 'release/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'src/**'
+      - 'cli/**'
+      - 'tests/**'
+      - 'LICENSE-*'
+      - 'README.md'
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'release/**'
+  workflow_dispatch:
 
+# This workflow only reads source/CI and stores expiring Actions artifacts. It never publishes.
 permissions:
-  contents: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: rc-artifacts-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '2'
+  PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
-  build:
-    name: build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-apple-darwin, os: macos-13 }
-          - { target: aarch64-apple-darwin, os: macos-latest }
+  helpers:
+    name: candidate helper tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python3 -I -B -m unittest discover -s release -p '*_tests.py' -v
+
+  build:
+    needs: helpers
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    name: candidate ${{ matrix.target }}
+    timeout-minutes: 90
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - {target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04}
+          - {target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm}
+          - {target: x86_64-apple-darwin, runner: macos-15-intel}
+          - {target: aarch64-apple-darwin, runner: macos-15}
+    env:
+      CANDIDATE_RUNNER: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      # S3 and IPFS are shipped in the released binary so a downloaded xget can reach every source.
-      - name: Build
-        run: cargo build --release --locked --bin xget --features "s3 ipfs" --target ${{ matrix.target }}
-      - name: Package
+      - name: Isolate candidate Cargo directories after toolchain setup
+        shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/xget"
-          strip "$bin" || true
-          tar -C "target/${{ matrix.target }}/release" -czf "xget-${{ matrix.target }}.tar.gz" xget
-          shasum -a 256 "xget-${{ matrix.target }}.tar.gz" > "xget-${{ matrix.target }}.tar.gz.sha256"
-      - name: Attach to the release
-        uses: softprops/action-gh-release@v2
+          printf 'CARGO_HOME=%s/candidate-cargo\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'CARGO_TARGET_DIR=%s/candidate-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Helper tests
+        run: python3 -I -B -m unittest discover -s release -p '*_tests.py' -v
+      - name: Build, package and smoke extracted final bytes
+        run: python3 -I -B release/artifact.py build --target '${{ matrix.target }}' --output '${{ runner.temp }}/candidate-output'
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
-            xget-${{ matrix.target }}.tar.gz
-            xget-${{ matrix.target }}.tar.gz.sha256
+          name: candidate-${{ matrix.target }}
+          path: ${{ runner.temp }}/candidate-output/*
+          if-no-files-found: error
+          retention-days: 14
+
+  accept:
+    name: accept complete candidate set
+    needs: build
+    timeout-minutes: 100
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          path: ${{ runner.temp }}/candidate-input
+          merge-multiple: false
+      - name: Require successful CI for this exact source commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B release/ci_gate.py --output '${{ runner.temp }}/ci.json' --deadline-seconds 5400
+      - name: Validate all four archives and receipts, assemble provenance and checksums
+        run: python3 -I -B release/artifact.py aggregate --input '${{ runner.temp }}/candidate-input' --ci '${{ runner.temp }}/ci.json' --output '${{ runner.temp }}/accepted-candidate'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: accepted-rc-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/accepted-candidate/*
+          if-no-files-found: error
+          retention-days: 14

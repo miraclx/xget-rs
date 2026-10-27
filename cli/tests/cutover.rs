@@ -768,6 +768,18 @@ fn human_check_results_distinguish_optional_measurement_requirements_and_multipl
 }
 
 #[test]
+fn executable_reports_its_package_version_without_stderr() {
+    let directory = Directory::fresh();
+    let version = directory.run(&["--version"]);
+    assert_eq!(version.status.code(), Some(0));
+    assert_eq!(
+        version.stdout,
+        format!("xget {}\n", env!("CARGO_PKG_VERSION")).as_bytes()
+    );
+    assert!(version.stderr.is_empty());
+}
+
+#[test]
 fn human_metadata_and_native_live_previews_are_readable_and_have_no_execution_effects() {
     let directory = Directory::fresh();
     let server = Server::start(Behavior::Complete);
@@ -779,7 +791,8 @@ fn human_metadata_and_native_live_previews_are_readable_and_have_no_execution_ef
     let text = human_text(&listed.stdout);
     assert!(text.contains("file a.bin  3 B"), "{text}");
     assert!(text.contains("file b.bin  3 B"));
-    assert!(text.contains("select: unavailable"));
+    assert!(text.contains("--select-id: unavailable (no literal member token)"));
+    assert!(!text.contains("select: unavailable"));
     assert!(text.contains("2 files, 0 directories; metadata only"));
     assert!(!text.contains("human-metadata-secret"));
     for target in ["renamed.bin", "-"] {

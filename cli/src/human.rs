@@ -194,7 +194,7 @@ impl Human {
                     Text(token.as_str())
                 );
             }
-            (None, _) => text.push_str("\n  select: unavailable"),
+            (None, _) => text.push_str("\n  --select-id: unavailable (no literal member token)"),
         }
         let _ = write!(
             text,

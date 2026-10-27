@@ -1,0 +1,41 @@
+xget 0.2 RC candidate archive
+
+This is an expiring, nonpublishing Actions candidate, not a published release.
+The adjacent build.json records the exact version, source, native target, feature
+set, compiler, Git dependency revisions and binary SHA-256. The aggregate bundle
+contains provenance.json, extracted-executable smoke receipts and SHA256SUMS.
+
+Verify SHA256SUMS before extraction (Linux: sha256sum -c SHA256SUMS;
+macOS: shasum -a 256 -c SHA256SUMS). These checks detect byte changes; they do not
+establish publisher authenticity, signing, notarization or reproducible builds.
+Extract the matching target archive into a NEW empty directory. Run ./xget
+--version and ./xget --help there. To install, copy xget to a caller-chosen new
+path on PATH; do not overwrite an existing executable without inspecting it.
+
+Compiled CLI features: s3 ipfs swisstransfer webdav github. Source defaults stay
+off. Source CI fixture tests support these capabilities; this does not mean live
+provider services were exercised on each archive host.
+
+Targets: GNU/glibc Ubuntu 24.04 x86_64 and ARM64, macOS 15 Intel and Apple Silicon.
+Only the named native hosts are tested by this candidate pipeline. Dynamic
+library and deployment commands are retained in build.json; no older OS floor,
+static/musl, universal macOS, Windows-native or Wasm runtime support is claimed.
+
+Native output requires Unix hardlinks, an existing suitable output parent and
+absent destinations, unless explicit guarded replacement is requested. Required
+checks precede publication. Live stdout cannot retract bytes already delivered.
+Ordinary redirects, HEAD 403 fallback, ignored-range fallback and automatic
+opening retry are unsupported. Raw native partial payloads remain private
+workspace data, not a supported destination-adjacent inspection interface. A
+saved aggregate state directory is not a payload path. No crash-durability,
+automatic cleanup or universal filesystem promise is made.
+
+Example, substituting an owned URL and its complete known SHA-256:
+  ./xget http://127.0.0.1:PORT/file -o new-file --expect sha256:HEX
+  ./xget info STATE --json
+  ./xget resume STATE --input KEY=ORIGINAL_REFERENCE
+Use actual state paths and binding keys from the command receipts and info.
+
+Project code is dual licensed MIT OR Apache-2.0; both license texts are included.
+Third-party dependencies retain their own licenses. This bundle does not claim
+a complete third-party notice inventory or SBOM.

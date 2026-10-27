@@ -4,39 +4,47 @@ xget is a Rust fetch library and command-line tool. It resolves bounded source m
 local output plan, fetches and checks file bytes, and by default publishes only to an absent
 destination. Explicit replacement requires `-f` and the native ownership checks.
 
-The workspace contains two packages:
+**0.2.0-rc.1 preparation:** this checkout is a candidate source tree, not evidence of a published
+release. The [release notes](CHANGELOG.md) describe the frozen 0.2 scope. Check the
+[GitHub releases](https://github.com/miraclx/xget-rs/releases) for actual published versions and assets;
+CI candidate artifacts alone are not releases. This is a breaking pre-1.0 API/CLI revision, not a 0.1.x
+patch or a 1.0 stability promise.
 
-- **`xget`**, the reusable Rust library at the repository root.
-- **`xget-cli`**, the command-line package in [`cli/`](cli/), which installs the **`xget`** executable.
-
-The library does not include the CLI's argument parser, terminal renderer or dotenv setup. Rust and CLI
-callers use the same Client coordinator for discovery, selection, checks, publication and continuation.
 Files execute serially; eligible exact HTTP uses up to four pinned ranges within one file. Live output
 uses a checked stream without native publication.
 
-This README describes the current working tree, not a tagged release. The compiled product uses the
-Client and Transfer entrances documented below, with no legacy CLI command or compatibility mode.
-Retired engine sources remain physically intact but are excluded from compilation and packaging,
-pending cleanup. Modern native V1/V2/V3/V4 state readers remain supported; old XGETCTL1 partials are
-not imported. Native publication requires Unix support; whole portable-engine Wasm support has not
-been established.
+> **Know before downloading:** ordinary HTTP redirects, automatic retries and decompression are not
+> supported. HEAD 403 fails; the existing 405/501 exception permits unknown-length, unpinned metadata
+> without a preview GET. A server that advertises but ignores ranges fails rather than falling back to
+> a whole response. Native file output requires Unix and a
+> suitable caller-owned parent. Incomplete payloads remain in private native workspaces, not a supported
+> destination-adjacent partial-file inspection interface. `.xget-runs` paths are metadata, not payloads.
+> HTTP interoperability and visible-partial enhancements are deferred beyond 0.2 stable.
 
 ## Install
 
-Install from a source checkout of this workspace:
+### Source checkout
+
+From this workspace, install the default HTTP CLI or run it without installing:
 
 ```console
-cargo install --path cli
+cargo install --locked --path cli
+cargo run -- https://raw.githubusercontent.com/rust-lang/rust/master/LICENSE-MIT -o rust-license.txt
 ```
 
-Provider features are off by default. Forward the features you need:
+Provider features are off by default in source builds and library dependencies. Forward the features
+you need, or use the same five-feature set planned for the CLI archives:
 
 ```console
-cargo install --path cli --features s3
-cargo install --path cli --features "s3 swisstransfer webdav github"
+cargo install --locked --path cli --features s3
+cargo install --locked --path cli --features "s3 ipfs swisstransfer webdav github"
 ```
 
-Include `ipfs` to use exact `ipfs://CID[/path]` references through the common Client and default command.
+These are the supported compiled adapters, not a promise to accept arbitrary delivery URLs. `ipfs`
+enables exact `ipfs://CID[/path]` inputs; other adapter limits are listed [below](#optional-providers).
+Use the candidate commit identified in its provenance when checking a particular artifact. `--locked`
+requires the committed lockfile; inspect Cargo configuration separately, because local path overrides
+can still apply. Distributed candidates use the locked Git graph without the workspace's local overrides.
 
 Build without installing:
 
@@ -47,9 +55,54 @@ cargo build --release --package xget-cli --bin xget
 Rust 1.97.1 is the pinned and exercised toolchain. Older compilers are not claimed. The executable is
 named `xget`; the Cargo package is `xget-cli`, and library imports remain `xget`.
 
+### Candidate archives
+
+The planned 0.2.0-rc.1 archive edition enables **`s3 ipfs swisstransfer webdav github`**. It does not
+change the source/library defaults. Each target must pass an extracted-archive smoke before acceptance:
+
+| target | native validation host |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | Ubuntu 24.04 x64 |
+| `aarch64-unknown-linux-gnu` | Ubuntu 24.04 ARM64 |
+| `x86_64-apple-darwin` | macOS 15 Intel |
+| `aarch64-apple-darwin` | macOS 15 Apple Silicon |
+
+This table is the candidate validation matrix, not a statement that all artifacts have passed yet.
+Build hosts are not minimum supported OS versions. No musl/static, older glibc/macOS, universal macOS,
+native Windows or Wasm artifact is promised. Windows compilation is not native publication proof.
+
+**After a release is published**, obtain its target archive, `SHA256SUMS` and provenance from the same
+release. For example, on Apple Silicon, in a new empty download directory with GitHub CLI installed:
+
+```console
+gh release download v0.2.0-rc.1 --repo miraclx/xget-rs \
+  --pattern 'xget-0.2.0-rc.1-aarch64-apple-darwin.tar.gz' \
+  --pattern SHA256SUMS --pattern provenance.json
+```
+
+Verify the archive's entry in `SHA256SUMS` with `shasum -a 256` on macOS or `sha256sum` on Linux before
+extracting into another new empty directory. Follow the enclosed install instructions, inspect
+`./xget --version`, and choose where to install it rather than overwriting an existing executable
+blindly. Checksums detect changed bytes; they are not publisher authentication, notarization or a
+reproducible-build claim. Registry installation and docs.rs publication are separate tracks and are
+not implied by a GitHub archive release.
+
 ## Quick start
 
-Replace the example URLs and expected digests with those for a resource you are authorized to fetch.
+Try a small public text file in a new directory:
+
+```console
+mkdir xget-try
+cd xget-try
+xget https://raw.githubusercontent.com/rust-lang/rust/master/LICENSE-MIT -o rust-license.txt
+```
+
+Success reports `saved rust-license.txt`, a measured SHA-256 and `done 1 file`. Measurement is not a
+required expected-content check. The public branch URL may change; use your own authorized reference
+and complete digest when the expected contents matter.
+
+For the remaining examples, replace URLs and expected digests with those for a resource you are
+authorized to fetch.
 
 Download one exact HTTP file to the current directory:
 
@@ -291,6 +344,22 @@ names; use `--dry-run` for the frozen plan. `--json` retains the versioned metad
 
 ### Inspect and continue unfinished work
 
+Choose the operation from the evidence you actually have:
+
+| situation | next step |
+| --- | --- |
+| interrupted request, same references and options | repeat the original command to match unique unfinished frozen work |
+| want to inspect a printed state path without network access | `xget info STATE`; metadata only, no content revalidation |
+| want a specific saved run | `xget resume STATE --input KEY=REFERENCE` for every key shown by `info` |
+| deliberately want fresh discovery | `--fresh`; old work remains, no overwrite authority |
+| pending receiving attempt needs a new attempt | `--restart`; frozen members/checks stay, old attempts remain |
+| deliberately want to replace an incumbent from fresh discovery | `--fresh --overwrite`; checked guarded replacement, not cleanup |
+| the expected digest was wrong | correct it with the trusted value and choose fresh work; replaying the frozen bad check cannot fix it |
+
+Not every failure is resumable. A missing native state, absent strong recovery anchor, changed version,
+closed stage or uncertain publication can prevent continuation. Follow the reported diagnosis rather
+than treating Restart or Fresh as a repair or deletion command.
+
 Owned file runs keep bounded frozen metadata under the designated output root's `.xget-runs` store.
 Repeating a matching request looks for one unfinished run before fresh discovery or HEAD requests. It
 reuses that run's members, assignments, versions and check policy. Multiple matches return the actual
@@ -394,15 +463,51 @@ Other inputs use ordered whole responses. S3 and SwissTransfer do not promise pa
 
 ## Library
 
-Depend on the root `xget` package; `xget-cli` is not needed for library use.
+The workspace contains two packages: root **`xget`** is the reusable library; **`xget-cli`** in
+[`cli/`](cli/) installs the **`xget`** executable. The library has no argument parser, terminal renderer
+or dotenv setup. Both consumers use the same Client coordinator; there is no legacy command or
+compatibility engine. Depend on `xget`, not `xget-cli`, for library use.
 
 ### Common Client
 
-Start with the [crate-level guide](src/lib.rs) for the authoritative rustdoc recipe combining a
+For rendered API documentation matching this checkout, run:
+
+```console
+cargo doc --locked --no-deps --package xget --open
+```
+
+Start with the rendered crate-level guide, then `client::Download`, `Input`, `Inventory` and `SavedRun`;
+advanced body/readers come afterward. A version-matched hosted rustdoc URL will require separate
+publication; the older docs.rs release is not a guide to this candidate API.
+The [crate-level source guide](src/lib.rs) also contains the authoritative recipe combining a
 required digest, optional measurement, input-scoped headers, metadata inspection, zero-file handling,
 exactly-one selection and consuming the selected `File`. It also links the deeper contracts and shows
 how an application supplies its configured S3 SDK client. The guide uses `no_run` examples so doctests
 compile them without contacting example URLs; the convenience call below omits required checks deliberately.
+
+For a complete external application, place a checkout named `xget-source` next to a new
+`xget-example` directory. Use the candidate commit identified in the artifact provenance when matching
+a candidate. Put this in `xget-example/Cargo.toml` and the Rust example below in
+`xget-example/src/main.rs`:
+
+```toml
+[package]
+name = "xget-example"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[dependencies]
+xget = { path = "../xget-source" }
+tokio = { version = "1", features = ["macros", "rt", "net", "time"] }
+```
+
+Tokio is a direct application dependency: the macro and current-thread runtime need `macros`/`rt`;
+`net`/`time` enable the I/O and timer drivers used by HTTP. xget does not create a runtime for you.
+Run `cargo run` in that new application directory with an absent `rust-license.txt` destination.
+The path form is usable before registry publication; it is not a crates.io installation recipe.
+An external application resolves and owns its own lockfile. Commit that lockfile for repeatable builds;
+a root Git revision alone does not pin unqualified transitive Git siblings for a new consumer.
 
 ```rust
 use xget::Client;
@@ -410,8 +515,8 @@ use xget::Client;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn core::error::Error>> {
     let client = Client::new()?;
-    let report = client.download("https://example.org/file.bin")
-        .to_file("file.bin")
+    let report = client.download("https://raw.githubusercontent.com/rust-lang/rust/master/LICENSE-MIT")
+        .to_file("rust-license.txt")
         .run().await?;
     assert_eq!(report.completed().len(), 1);
     Ok(())

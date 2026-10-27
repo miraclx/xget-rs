@@ -2,7 +2,7 @@
 # or a shell needs (argument parsing, progress rendering, tracing setup), so the library carries none of it.
 [package]
 name = "xget-cli"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 authors = ["Miraculous Owonubi <omiraculous@gmail.com>"]
 edition = "2024"
 rust-version = "1.97.1"

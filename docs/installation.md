@@ -85,5 +85,5 @@ this workspace's local sibling overrides. An external Rust application owns its 
 and lockfile; see the [library setup guide](library.md#application-setup).
 
 Build manifests, compiler/image details, dependency revisions and the complete acceptance procedure are
-maintainer material in the [release guide](../release/README.md). API/CLI migration notes are in the
+maintainer material in the [release guide](../scripts/release/README.md). API/CLI migration notes are in the
 [changelog](../CHANGELOG.md).

@@ -31,7 +31,7 @@ CASES = {
     "ignored_range_refused",
 }
 MEMBERS = {"xget", "LICENSE-MIT", "LICENSE-APACHE", "INSTALL.txt", "build.json"}
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 MAX_ARCHIVE = 512 * 1024 * 1024
 
 
@@ -191,13 +191,13 @@ def build_candidate(target, output):
         (staging / "xget").chmod(0o755)
         for license_name in ("LICENSE-MIT", "LICENSE-APACHE"):
             shutil.copyfile(ROOT / license_name, staging / license_name)
-        shutil.copyfile(ROOT / "release/INSTALL.txt", staging / "INSTALL.txt")
+        shutil.copyfile(ROOT / "scripts/release/INSTALL.txt", staging / "INSTALL.txt")
         write_json(staging / "build.json", build)
         with tarfile.open(archive, "w:gz", format=tarfile.USTAR_FORMAT) as bundle:
             for name in sorted(MEMBERS):
                 bundle.add(staging / name, arcname=name, recursive=False)
     smoke = output / (stem + ".smoke.json")
-    run_smoke_process([sys.executable, "-I", "-B", str(ROOT / "release/smoke.py"),
+    run_smoke_process([sys.executable, "-I", "-B", str(ROOT / "scripts/release/smoke.py"),
                        "--archive", str(archive), "--receipt", str(smoke), "--target", target,
                        "--version", source["version"], "--binary-sha256", build["binary_sha256"]],
                       output / (stem + ".timeout.json"))
@@ -434,7 +434,7 @@ def aggregate_candidates(inputs, ci_path, output):
             for name in ("LICENSE-MIT", "LICENSE-APACHE"):
                 if digest(extraction / name) != digest(ROOT / name):
                     raise ValueError("archive license differs from source")
-            if digest(extraction / "INSTALL.txt") != digest(ROOT / "release/INSTALL.txt"):
+            if digest(extraction / "INSTALL.txt") != digest(ROOT / "scripts/release/INSTALL.txt"):
                 raise ValueError("archive installation contract differs from source")
         manifests.append(manifest)
         payloads.extend((path, archive, smoke_path))

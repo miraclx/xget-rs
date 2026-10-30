@@ -390,7 +390,7 @@ Other inputs use ordered whole responses. S3 and SwissTransfer do not promise pa
 
 ## Historical harness and media
 
-The retained [fault harness](../harness/README.md), GIFs and [`media/download.tape`](../media/download.tape)
+The retained [fault harness](../scripts/harness/README.md), GIFs and [`docs/media/download.tape`](../docs/media/download.tape)
 describe the retired command surface. They are historical artifacts, not runnable modern CLI examples,
 a current reproducibility recipe or evidence for the current Client path. Do not run the old scenario
 suite or regenerate the recording against the modern executable; no flag-compatibility mode exists.

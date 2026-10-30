@@ -74,6 +74,6 @@ jobs:
     - uses: Swatinem/rust-cache@v2
     - run: cargo check --workspace --all-targets --all-features
 
-# Note: the docker harness under harness/ (go-httpbin + minio + toxiproxy) is a manual dev tool for
+# Note: the docker harness under scripts/harness/ (go-httpbin + minio + toxiproxy) is a manual dev tool for
 # fault-injection and real-object-store testing. It needs containers and is intentionally not run in
 # CI; the Rust integration tests above cover the engine and HttpSource without any of that.

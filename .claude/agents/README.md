@@ -15,7 +15,7 @@ for teaching clarity. The bar applies to library APIs, the binary and documentat
 
 ## Shared contract
 
-Read project AGENTS.md, STYLE.md and ../craft/REVIEW.md before judging source. Read the assigned actual
+Read project AGENTS.md, docs/STYLE.md and ../craft/REVIEW.md before judging source. Read the assigned actual
 files and evidence, not only an author's summary. Keep the scope and repository set explicit. Useful
 existing code earns GOOD findings with file:line, not automatic replacement.
 

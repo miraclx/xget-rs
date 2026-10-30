@@ -6,7 +6,7 @@ on:
     paths:
       - '.github/workflows/ci.yml'
       - '.github/workflows/release.yml'
-      - 'release/**'
+      - 'scripts/release/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -18,7 +18,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/release.yml'
-      - 'release/**'
+      - 'scripts/release/**'
   workflow_dispatch:
 
 # This workflow only reads source/CI and stores expiring Actions artifacts. It never publishes.
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python3 -I -B -m unittest discover -s release -p '*_tests.py' -v
+      - run: python3 -I -B -m unittest discover -s scripts/release -p '*_tests.py' -v
 
   build:
     needs: helpers
@@ -84,9 +84,9 @@ jobs:
           printf 'CARGO_HOME=%s/candidate-cargo\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           printf 'CARGO_TARGET_DIR=%s/candidate-target\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Helper tests
-        run: python3 -I -B -m unittest discover -s release -p '*_tests.py' -v
+        run: python3 -I -B -m unittest discover -s scripts/release -p '*_tests.py' -v
       - name: Build, package and smoke extracted final bytes
-        run: python3 -I -B release/artifact.py build --target '${{ matrix.target }}' --output '${{ runner.temp }}/candidate-output'
+        run: python3 -I -B scripts/release/artifact.py build --target '${{ matrix.target }}' --output '${{ runner.temp }}/candidate-output'
       - uses: actions/upload-artifact@v4
         with:
           name: candidate-${{ matrix.target }}
@@ -115,9 +115,9 @@ jobs:
       - name: Require successful CI for this exact source commit
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -I -B release/ci_gate.py --output '${{ runner.temp }}/ci.json' --deadline-seconds 5400
+        run: python3 -I -B scripts/release/ci_gate.py --output '${{ runner.temp }}/ci.json' --deadline-seconds 5400
       - name: Validate all four archives and receipts, assemble provenance and checksums
-        run: python3 -I -B release/artifact.py aggregate --input '${{ runner.temp }}/candidate-input' --ci '${{ runner.temp }}/ci.json' --output '${{ runner.temp }}/accepted-candidate'
+        run: python3 -I -B scripts/release/artifact.py aggregate --input '${{ runner.temp }}/candidate-input' --ci '${{ runner.temp }}/ci.json' --output '${{ runner.temp }}/accepted-candidate'
       - uses: actions/upload-artifact@v4
         with:
           name: accepted-rc-candidate-${{ github.sha }}

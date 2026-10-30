@@ -125,7 +125,7 @@ are not a release. No subsequent publication path is implemented.
 From the repository cwd, with an installed Python 3.11 or newer:
 
 ```console
-python3.11 -I -B -m unittest discover -s release -p '*_tests.py' -v
+python3.11 -I -B -m unittest discover -s scripts/release -p '*_tests.py' -v
 ```
 
 The validator tests intentionally package synthetic nonexecuted binary bytes.

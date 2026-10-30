@@ -17,9 +17,8 @@ autotests = false
 # Private review/harness material and the separately packaged CLI do not belong in the library.
 # Retired engine sources stay physically intact pending cleanup, not compiled or packaged as a mode.
 exclude = [
-    "notes",
-    "harness",
-    "release",
+    "scripts",
+    "docs/media",
     "AGENTS.md",
     ".claude",
     "src/bin",

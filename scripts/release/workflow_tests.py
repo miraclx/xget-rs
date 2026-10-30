@@ -4,12 +4,12 @@ import ast
 from pathlib import Path
 import unittest
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class WorkflowPolicyTests(unittest.TestCase):
     def test_python_helpers_parse_without_writing_bytecode(self):
-        files = sorted((ROOT / "release").glob("*.py"))
+        files = sorted((ROOT / "scripts/release").glob("*.py"))
         self.assertGreaterEqual(len(files), 6)
         for path in files:
             with self.subTest(path=path.name):
@@ -23,7 +23,7 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertNotIn(forbidden, workflow)
         for required in ("contents: read", "actions: read", "branches: [main]", "workflow_dispatch:",
                          "github.event.repository.default_branch", "persist-credentials: false",
-                         "needs: build", "release/ci_gate.py", "--deadline-seconds 5400",
+                         "needs: build", "scripts/release/ci_gate.py", "--deadline-seconds 5400",
                          "merge-multiple: false", "if-no-files-found: error", "CARGO_INCREMENTAL: '0'",
                          "CARGO_BUILD_JOBS: '2'", "max-parallel: 2"):
             with self.subTest(required=required):
@@ -57,7 +57,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertNotIn("${{ runner.temp }}", export_step)
 
     def test_owned_prose_and_code_have_no_em_dashes(self):
-        for path in (ROOT / "release").iterdir():
+        for path in (ROOT / "scripts/release").iterdir():
             if path.is_file():
                 with self.subTest(path=path.name):
                     self.assertNotIn(chr(0x2014), path.read_text())

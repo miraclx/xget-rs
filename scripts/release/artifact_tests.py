@@ -40,7 +40,7 @@ def write_candidate(directory, target):
     stem = f"xget-{SOURCE['version']}-{target}"
     archive = directory / (stem + ".tar.gz")
     data = {"xget": b"synthetic binary, never executed", "build.json": json.dumps(build).encode(),
-            "INSTALL.txt": (artifact.ROOT / "release/INSTALL.txt").read_bytes(),
+            "INSTALL.txt": (artifact.ROOT / "scripts/release/INSTALL.txt").read_bytes(),
             "LICENSE-MIT": (artifact.ROOT / "LICENSE-MIT").read_bytes(),
             "LICENSE-APACHE": (artifact.ROOT / "LICENSE-APACHE").read_bytes()}
     with tarfile.open(archive, "w:gz") as bundle:

@@ -327,6 +327,12 @@ API craft co-reviews contract accuracy.
 Slice reviews do not substitute for that final review. Fix findings, rerun gates and re-review before
 final acceptance. They are maintainer-inspired lenses, not endorsements by the named maintainers.
 
+The README is a product front page: explain what xget does and demonstrate useful tasks before
+implementation contracts. Keep consequential limits beside the relevant task, with full CLI, library,
+installation and release detail in linked guides. Review reader motivation, first-screen clarity and
+working examples separately from factual accuracy; a technically correct manual is not automatically
+an approachable introduction.
+
 Existing GIFs and media/download.tape are historical, not current runtime or reproducibility evidence.
 Do not regenerate the retained tape against the modern CLI. Do not ship new media without its tape and
 inspected frames. Errors remain lowercase, without trailing punctuation, and should tell the user what

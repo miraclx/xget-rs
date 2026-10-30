@@ -28,7 +28,7 @@ Registry publication is separate; do not infer that these versions are available
 The earlier root Source/get/from/Download/Output/Report/Probe/Progress/ByteRange/ByteStream/Error and
 control helpers are no longer compiled or exported. Use `Client` for remote references and `Transfer`
 for application-owned bodies or repeatable readers. `MemberToken` is non-Copy; ordinary whole-body
-failures use `client::SourceError`. See [API migration](README.md#pre-release-api-migration).
+failures use `client::SourceError`. See [API migration](docs/library.md#pre-release-api-migration).
 
 The Cargo library package is `xget`; the command-line package is `xget-cli`, installing `xget`. The CLI
 has no legacy command, positional output operand, remote checksum sidecar, old chunk/sequential flags
@@ -55,7 +55,7 @@ stdout prefixes cannot be retracted after a late failure.
 The candidate matrix is GNU Linux x64/ARM64 on Ubuntu 24.04 and macOS 15 Intel/Apple Silicon. A target
 is accepted only after its actual optimized archive is extracted and smoked on that native host. Host
 labels are not minimum OS support guarantees. No native Windows, musl/static, older OS floor, universal
-macOS or portable Wasm artifact is claimed. See [installation](README.md#install) and each accepted
+macOS or portable Wasm artifact is claimed. See [installation](docs/installation.md) and each accepted
 candidate's provenance for actual results, features and dependency revisions.
 
 ### RC feedback
